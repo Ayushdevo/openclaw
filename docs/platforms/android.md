@@ -260,6 +260,22 @@ Details and example CoreDNS config: [Bonjour](/gateway/bonjour).
 
 Create a setup code in the [Control UI](/web/control-ui) (**Devices → Pair device**) or with `openclaw qr`.
 
+On the Gateway machine, run:
+
+```bash
+openclaw qr
+```
+
+Scan the displayed QR with **Scan QR or setup code** in the Android app. To
+paste a code instead, print just the setup code:
+
+```bash
+openclaw qr --setup-code-only
+```
+
+Copy the command's output into **Enter setup code**. For all output and URL
+options, see [QR](/cli/qr).
+
 An explicit `--url` or `--public-url` override wins. Otherwise, setup-code URL selection uses this order:
 
 1. `plugins.entries.device-pair.config.publicUrl`, unless remote preference was requested.
