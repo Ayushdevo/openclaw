@@ -29,12 +29,13 @@ export function isDiscordAllowlistedDirectMessage(params: {
   guildId?: string;
   recipientIds?: string[];
 }): boolean {
+  const recipientIds = params.recipientIds;
   if (
     params.guildId ||
     params.channelType !== ChannelType.DM ||
-    params.recipientIds?.length !== 1
+    recipientIds?.length !== 1
   ) {
     return false;
   }
-  return allowFromContainsDiscordUserId(params.allowFrom, params.recipientIds[0]);
+  return allowFromContainsDiscordUserId(params.allowFrom, recipientIds[0]);
 }
