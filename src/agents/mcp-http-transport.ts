@@ -377,6 +377,7 @@ export class OpenClawStreamableHTTPClientTransport extends OpenClawMcpHttpTransp
       signal: AbortSignal.timeout(SESSION_TERMINATION_TIMEOUT_MS),
     });
     void response.body?.cancel().catch(() => undefined);
+
     if (!response.ok && response.status !== 404 && response.status !== 405) {
       throw new StreamableHTTPError(
         response.status,

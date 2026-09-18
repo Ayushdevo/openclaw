@@ -7,6 +7,7 @@ import {
   decodeWindowsOutputBuffer,
   resolveWindowsConsoleEncoding,
 } from "../infra/windows-encoding.js";
+import { createDeferredCore } from "../shared/deferred.js";
 import { releaseChildProcessOutputAfterExit } from "./child-process.js";
 import {
   appendCapturedOutput,
@@ -35,7 +36,13 @@ import {
   TIMEOUT_EXIT_CODE,
   type SpawnResult,
 } from "./exec-result.js";
-import { COMMAND_PROCESS_TREE_KILL_GRACE_MS, spawnCommandWithInvocation } from "./exec-spawn.js";
+import {
+  COMMAND_PROCESS_TREE_KILL_GRACE_MS,
+  resolveCommandProcessSignal,
+  retainCommandProcessCleanup,
+  spawnCommandWithInvocation,
+  waitForCommandSpawn,
+} from "./exec-spawn.js";
 import { createCommandTerminationController } from "./exec-termination.js";
 
 const WINDOWS_CLOSE_STATE_SETTLE_TIMEOUT_MS = 250;
@@ -47,8 +54,8 @@ export type CommandOptions = {
   timeoutMs?: number;
   cwd?: string;
   input?: string | Uint8Array;
-  /** Synchronous live-child admission. Input is withheld until this returns. */
-  beforeInput?: (pid: number) => void;
+  /** Synchronous admission with the spawned PID and argv, before input is released. */
+  beforeInput?: (pid: number, argv?: readonly string[]) => void;
   baseEnv?: NodeJS.ProcessEnv;
   env?: NodeJS.ProcessEnv;
   windowsVerbatimArguments?: boolean;
@@ -90,11 +97,37 @@ export async function runUtf8CommandWithTimeout(
   return await runCommandWithOutputEncoding(argv, optionsOrTimeout, true);
 }
 
+export type BufferSpawnResult = Omit<SpawnResult, "stdout" | "stderr"> & {
+  stdout: Buffer;
+  stderr: Buffer;
+  windowsEncoding: string | null;
+};
+
+/** Preserve the ordinary process lifecycle while deferring decoding to its consumer. */
+export async function runCommandBuffersWithTimeout(
+  argv: string[],
+  optionsOrTimeout: number | CommandOptions,
+): Promise<BufferSpawnResult> {
+  return await runCommandWithOutputEncoding(argv, optionsOrTimeout, false, true);
+}
+
 async function runCommandWithOutputEncoding(
   argv: string[],
   optionsOrTimeout: number | CommandOptions,
   forceUtf8: boolean,
-): Promise<SpawnResult> {
+): Promise<SpawnResult>;
+async function runCommandWithOutputEncoding(
+  argv: string[],
+  optionsOrTimeout: number | CommandOptions,
+  forceUtf8: boolean,
+  raw: true,
+): Promise<BufferSpawnResult>;
+async function runCommandWithOutputEncoding(
+  argv: string[],
+  optionsOrTimeout: number | CommandOptions,
+  forceUtf8: boolean,
+  raw = false,
+): Promise<SpawnResult | BufferSpawnResult> {
   const options: CommandOptions =
     typeof optionsOrTimeout === "number" ? { timeoutMs: optionsOrTimeout } : optionsOrTimeout;
   const {
@@ -104,11 +137,11 @@ async function runCommandWithOutputEncoding(
     baseEnv,
     env,
     noOutputTimeoutMs,
-    signal,
     killProcessTree,
     killSignal,
     killGraceMs,
   } = options;
+  const signal = resolveCommandProcessSignal(options.signal);
   const resolvedTimeoutMs =
     typeof timeoutMs === "number" ? resolveTimerTimeoutMs(timeoutMs, 1) : undefined;
   if (options.requireProcessTreeExtinction && !killProcessTree) {
@@ -125,16 +158,17 @@ async function runCommandWithOutputEncoding(
   );
 
   if (signal?.aborted) {
-    return {
-      stdout: "",
-      stderr: "",
+    const interrupted = {
       code: null,
       signal: null,
       killed: false,
-      termination: "signal",
-      cleanup: "normal",
+      termination: "signal" as const,
+      cleanup: "normal" as const,
       noOutputTimedOut: false,
     };
+    return raw
+      ? { ...interrupted, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), windowsEncoding: null }
+      : { ...interrupted, stdout: "", stderr: "" };
   }
 
   const stdoutCapture = createCapturedOutputBuffers();
@@ -179,6 +213,7 @@ async function runCommandWithOutputEncoding(
   const { child, invocation } = spawnCommandWithInvocation(argv, {
     buffer: false,
     cancelSignal: cancelController.signal,
+    inheritScopeCancellation: false,
     cwd,
     detached: Boolean(killProcessTree && process.platform !== "win32"),
     encoding: "buffer",
@@ -192,6 +227,9 @@ async function runCommandWithOutputEncoding(
     stripFinalNewline: false,
     windowsVerbatimArguments: options.windowsVerbatimArguments,
   });
+  const startupReady = child.pid === undefined ? waitForCommandSpawn(child) : undefined;
+  let waitingForSpawn = startupReady !== undefined;
+  const startupCanceled = createDeferredCore<Exclude<CommandTerminationReason, "exit">>();
   const nodeChild = child.nodeChildProcess;
   const ownsExitedProcessTree = Boolean(killProcessTree && process.platform !== "win32");
   const shouldTrackOutputTimeout =
@@ -207,6 +245,7 @@ async function runCommandWithOutputEncoding(
   let releaseOutput: (() => void) | undefined;
   const terminationController = createCommandTerminationController({
     child: nodeChild,
+    spawned: startupReady,
     cancelController,
     baseEnv,
     env,
@@ -216,6 +255,17 @@ async function runCommandWithOutputEncoding(
     killGraceMs: resolvedKillGraceMs,
     killSignal,
   });
+  const processCleanup = (async () => {
+    await child.then(
+      () => undefined,
+      () => undefined,
+    );
+    commandSettled = true;
+    await startupReady?.catch(() => {});
+    return await terminationController.settle();
+  })();
+  retainCommandProcessCleanup(processCleanup);
+  void processCleanup.catch(() => {});
   nodeChild.once("exit", (code, signalValue) => {
     childExitState = { code, signal: signalValue };
     // Successful tree output belongs to its command deadline, not the diagnostic
@@ -250,6 +300,9 @@ async function runCommandWithOutputEncoding(
       return;
     }
     termination = reason;
+    if (waitingForSpawn) {
+      startupCanceled.resolve(reason);
+    }
     if (childExitState) {
       // An escaped pipe holder can survive group termination; bound its final drain.
       releaseOutput ??= releaseChildProcessOutputAfterExit(nodeChild);
@@ -279,6 +332,48 @@ async function runCommandWithOutputEncoding(
   const onAbort = () => cancel("signal");
   signal?.addEventListener("abort", onAbort, { once: true });
   armNoOutputTimer();
+  const clearTimers = () => {
+    if (timeoutTimer) {
+      clearTimeout(timeoutTimer);
+    }
+    clearNoOutputTimer();
+    signal?.removeEventListener("abort", onAbort);
+  };
+  if (startupReady) {
+    let interrupted: Exclude<CommandTerminationReason, "exit"> | undefined;
+    try {
+      interrupted = await Promise.race([
+        startupReady.then(() => undefined),
+        startupCanceled.promise,
+      ]);
+    } catch (error) {
+      clearTimers();
+      throw error;
+    }
+    if (interrupted) {
+      clearTimers();
+      // The result cannot claim extinction before PID delivery. Keep the same
+      // termination owner through late readiness and final output drainage.
+      void processCleanup.finally(() => releaseOutput?.()).catch(() => {});
+      const stopped = {
+        pid: nodeChild.pid,
+        code:
+          interrupted === "timeout" || interrupted === "no-output-timeout"
+            ? TIMEOUT_EXIT_CODE
+            : null,
+        signal: null,
+        killed: nodeChild.killed,
+        cleanup: "uncertain" as const,
+        termination: interrupted === "output-limit" ? ("signal" as const) : interrupted,
+        noOutputTimedOut: interrupted === "no-output-timeout",
+        outputLimitExceeded: interrupted === "output-limit" || undefined,
+      };
+      return raw
+        ? { ...stopped, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), windowsEncoding }
+        : { ...stopped, stdout: "", stderr: "" };
+    }
+    waitingForSpawn = false;
+  }
 
   const captureOutput = (
     capture: CapturedOutputBuffers,
@@ -416,7 +511,7 @@ async function runCommandWithOutputEncoding(
       if (nodeChild.pid === undefined || !nodeChild.stdin) {
         throw new Error("Child input admission has no spawned process");
       }
-      const admitted: unknown = options.beforeInput(nodeChild.pid);
+      const admitted: unknown = options.beforeInput(nodeChild.pid, nodeChild.spawnargs);
       if (admitted !== undefined) {
         if (isPromiseLike(admitted)) {
           void Promise.resolve(admitted).catch(() => undefined);
@@ -433,14 +528,10 @@ async function runCommandWithOutputEncoding(
 
   const result = await child.finally(() => {
     commandSettled = true;
-    if (timeoutTimer) {
-      clearTimeout(timeoutTimer);
-    }
-    clearNoOutputTimer();
-    signal?.removeEventListener("abort", onAbort);
+    clearTimers();
     releaseOutput?.();
   });
-  let cleanup = await terminationController.settle();
+  let cleanup = await processCleanup;
   const resolvedSignal = result.signal ?? childExitState?.signal ?? nodeChild.signalCode ?? null;
   if (cleanup !== "forced" && resolvedSignal) {
     cleanup = "uncertain";
@@ -557,20 +648,10 @@ async function runCommandWithOutputEncoding(
     }
   }
 
-  const decodeCapturedOutput = (
-    capture: CapturedOutputBuffers,
-    captureMode: CommandOutputCaptureMode,
-  ): string => {
-    const buffer = finalizeCapturedOutput(capture, captureMode, forceUtf8);
-    return forceUtf8
-      ? buffer.toString("utf8")
-      : decodeWindowsOutputBuffer({ buffer, windowsEncoding });
-  };
-
-  return {
+  const stdout = finalizeCapturedOutput(stdoutCapture, stdoutCaptureMode, forceUtf8);
+  const stderr = finalizeCapturedOutput(stderrCapture, stderrCaptureMode, forceUtf8);
+  const settled = {
     pid: nodeChild.pid,
-    stdout: decodeCapturedOutput(stdoutCapture, stdoutCaptureMode),
-    stderr: decodeCapturedOutput(stderrCapture, stderrCaptureMode),
     stdoutTruncatedBytes: stdoutCapture.truncatedBytes || undefined,
     stderrTruncatedBytes: stderrCapture.truncatedBytes || undefined,
     preservedStdoutLines:
@@ -581,9 +662,20 @@ async function runCommandWithOutputEncoding(
     signal: resolvedSignal,
     killed: nodeChild.killed,
     cleanup,
-    termination: termination === "output-limit" ? "signal" : termination,
+    termination: termination === "output-limit" ? ("signal" as const) : termination,
     noOutputTimedOut: termination === "no-output-timeout",
     outputLimitExceeded: termination === "output-limit" || undefined,
     ...(outputErrorStream ? { outputErrorStream } : {}),
   };
+  return raw
+    ? { ...settled, stdout, stderr, windowsEncoding }
+    : {
+        ...settled,
+        stdout: forceUtf8
+          ? stdout.toString("utf8")
+          : decodeWindowsOutputBuffer({ buffer: stdout, windowsEncoding }),
+        stderr: forceUtf8
+          ? stderr.toString("utf8")
+          : decodeWindowsOutputBuffer({ buffer: stderr, windowsEncoding }),
+      };
 }

@@ -8,7 +8,7 @@
   },
   "type": "module",
   "dependencies": {
-    "zod": "4.4.3"
+    "zod": "4.5.4"
   },
   "devDependencies": {
     "@openclaw/plugin-sdk": "workspace:*",
@@ -28,6 +28,7 @@
     ],
     "setupEntry": "./setup-entry.ts",
     "install": {
+      "clawhubSpec": "clawhub:@openclaw/raft",
       "npmSpec": "@openclaw/raft",
       "defaultChoice": "npm",
       "minHostVersion": ">=2026.6.8"

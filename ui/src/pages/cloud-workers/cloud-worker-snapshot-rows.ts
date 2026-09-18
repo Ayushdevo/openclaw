@@ -2,7 +2,8 @@ import { html, nothing } from "lit";
 import type { EnvironmentSummary } from "../../../../packages/gateway-protocol/src/index.js";
 import { renderSettingsRow, renderSettingsStatus } from "../../components/settings-ui.ts";
 import { t } from "../../i18n/index.ts";
-import { formatDurationHuman, formatRelativeTimestamp } from "../../lib/format.ts";
+import { formatDurationHuman } from "../../lib/format-duration.ts";
+import { formatRelativeTimestamp } from "../../lib/format.ts";
 
 export type SnapshotImage = {
   profileKey: string;
@@ -219,8 +220,7 @@ export function renderSnapshotImage(image: SnapshotImage, options: SnapshotRowOp
 
 export function renderSnapshotBuildRow(
   environment: EnvironmentSummary,
-  cancelling: boolean,
-  onCancel?: () => void,
+  options: { busy: boolean; onCancel?: () => void; onDismiss?: () => void },
 ) {
   const worker = environment.worker;
   if (!worker) {
@@ -237,9 +237,24 @@ export function renderSnapshotBuildRow(
     ${t(`cloudWorkersPage.snapshots.buildStates.${worker.state}`)} ·
     ${t("cloudWorkersPage.snapshots.buildAge", { age: formatDurationHuman(worker.ageMs) })}
     ${failed && worker.error ? html`<div class="callout warning" role="alert">${worker.error}</div>` : nothing}`,
-    control:
-      onCancel && !failed
-        ? html`<button class="btn btn--sm" type="button" ?disabled=${cancelling} @click=${onCancel}>
+    control: failed
+      ? options.onDismiss
+        ? html`<button
+            class="btn btn--sm"
+            type="button"
+            ?disabled=${options.busy}
+            @click=${options.onDismiss}
+          >
+            ${t("cloudWorkersPage.snapshots.dismiss")}
+          </button>`
+        : nothing
+      : options.onCancel
+        ? html`<button
+            class="btn btn--sm"
+            type="button"
+            ?disabled=${options.busy}
+            @click=${options.onCancel}
+          >
             ${t("common.cancel")}
           </button>`
         : nothing,

@@ -8,7 +8,7 @@
   },
   "type": "module",
   "dependencies": {
-    "@anthropic-ai/sdk": "0.120.0",
+    "@anthropic-ai/sdk": "0.124.0",
     "@aws/bedrock-token-generator": "1.1.0"
   },
   "devDependencies": {
@@ -19,6 +19,7 @@
       "./index.ts"
     ],
     "install": {
+      "clawhubSpec": "clawhub:@openclaw/amazon-bedrock-mantle-provider",
       "npmSpec": "@openclaw/amazon-bedrock-mantle-provider",
       "defaultChoice": "npm",
       "minHostVersion": ">=2026.5.12-beta.1"

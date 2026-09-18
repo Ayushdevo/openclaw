@@ -14,6 +14,7 @@ import type {
   ChatInputReceipts,
   ChatPendingInputsPage,
 } from "../../../../packages/gateway-protocol/src/schema/logs-chat.js";
+import type { GatewaySessionRow } from "../../api/types.ts";
 import type {
   ApplicationChatSubmissions,
   RetainedChatSubmission,
@@ -26,13 +27,18 @@ import {
   resolveUiConversationIdentity,
 } from "../../lib/sessions/session-key.ts";
 import { matchesCompactionOperation } from "./chat-progress.ts";
-import type { CompactionStatus } from "./tool-stream-contract.ts";
+import type { CompactionStatus, ProviderPolicyNotice } from "./tool-stream-contract.ts";
 
 const chatSessionProjections = new WeakMap<
   object,
   {
     projection?: SessionProjectionState;
     runId?: string;
+    modelObservation?: {
+      runId: string;
+      model: string | undefined;
+      provider: string | undefined;
+    };
   }
 >();
 // Display ownership outlives active-state cleanup. It is not the foreground
@@ -53,6 +59,7 @@ type ChatSessionProjectionOwner = ChatComposerScope & {
   chatDisplayedLeafEntryId?: string | null;
   compactionStatus?: CompactionStatus | null;
   compactionClearTimer?: number | null;
+  providerPolicyNotice?: ProviderPolicyNotice | null;
 };
 
 function resetCompactionProjection(owner: ChatSessionProjectionOwner): void {
@@ -105,6 +112,16 @@ function readChatSubmissionBatch(owner: ChatSessionProjectionOwner, scope: Sessi
       const receipt = persisted || identity.id !== null || identity.sequence !== null;
       if (receipt) {
         retire(runId);
+      }
+      const delivered = submissions.readDelivered(key + runId, client ?? owner);
+      if (
+        !receipt &&
+        !identity.isImported &&
+        delivered?.kind === "delivered" &&
+        !delivered.pending &&
+        (!delivered.sessionId || !scope.sessionId || delivered.sessionId === scope.sessionId)
+      ) {
+        return undefined;
       }
       if (!handoff || identity.isImported || runId !== handoff.pendingRunId) {
         return message;
@@ -195,8 +212,46 @@ export function getChatRunOwner(owner: object): string | undefined {
   return chatSessionProjections.get(owner)?.runId;
 }
 
+export function getChatRunOwnerSessionKey(owner: object): string | undefined {
+  const current = chatSessionProjections.get(owner);
+  return current?.runId ? current.projection?.scope.sessionKey : undefined;
+}
+
 export function setChatRunOwner(owner: object, runId: string | undefined): void {
-  chatSessionProjections.set(owner, { ...chatSessionProjections.get(owner), runId });
+  const current = chatSessionProjections.get(owner);
+  chatSessionProjections.set(owner, {
+    ...current,
+    runId,
+    modelObservation:
+      current?.modelObservation && current.modelObservation.runId === runId
+        ? current.modelObservation
+        : undefined,
+  });
+}
+
+export function observeChatRunModel(
+  owner: object,
+  runId: string | undefined,
+  row?: GatewaySessionRow,
+): void {
+  chatSessionProjections.set(owner, {
+    ...chatSessionProjections.get(owner),
+    modelObservation:
+      runId && row
+        ? { runId, model: row.activeModel, provider: row.activeModelProvider }
+        : undefined,
+  });
+}
+
+export function getChatModelObservedRunId(
+  owner: object,
+  row: GatewaySessionRow | undefined,
+): string | undefined {
+  const observation = chatSessionProjections.get(owner)?.modelObservation;
+  return observation?.model === row?.activeModel &&
+    observation?.provider === row?.activeModelProvider
+    ? observation?.runId
+    : undefined;
 }
 
 /** The only mutation boundary for the reducer and its rendered message array. */
@@ -206,19 +261,20 @@ export function publishChatSessionProjection(
 ): void {
   const current = chatSessionProjections.get(owner);
   const runId = current?.runId;
-  if (
-    current?.projection &&
-    chatProjectionScopeChanged(current.projection.scope, projection.scope)
-  ) {
+  const previousScope = current?.projection?.scope;
+  const scopeChanged = previousScope && chatProjectionScopeChanged(previousScope, projection.scope);
+  if (scopeChanged) {
     const status = owner.compactionStatus;
     const sessionKeys = ["sessionKey", "sessionId", "agentId"] as const;
-    const previousScope = current.projection.scope;
     const sessionChanged = sessionKeys.some(
       (key) =>
         Object.hasOwn(projection.scope, key) &&
         previousScope[key] !== undefined &&
         previousScope[key] !== projection.scope[key],
     );
+    if (sessionChanged) {
+      owner.providerPolicyNotice = null;
+    }
     // Appending the completed marker advances the active leaf. Retain its live
     // identity through that refresh, but never carry it into another session or branch.
     if (
@@ -229,15 +285,15 @@ export function publishChatSessionProjection(
       resetCompactionProjection(owner);
     }
   }
+  const retainedRunId =
+    runId && Object.hasOwn(projection.runs, runId) && !scopeChanged ? runId : undefined;
   chatSessionProjections.set(owner, {
     projection,
-    runId:
-      runId &&
-      Object.hasOwn(projection.runs, runId) &&
-      (!current.projection ||
-        !chatProjectionScopeChanged(current.projection.scope, projection.scope))
-        ? runId
-        : undefined,
+    modelObservation:
+      scopeChanged || (current?.modelObservation?.runId === runId && !retainedRunId)
+        ? undefined
+        : current?.modelObservation,
+    runId: retainedRunId,
   });
   // Run-only transitions share the transcript array. Preserve their ownership
   // updates above without traversing or republishing every displayed row.
@@ -349,14 +405,26 @@ export function reconcileChatInputCustody(
   page: ChatPendingInputsPage | undefined,
   receipts: ChatInputReceipts = [],
 ) {
-  const scope = readChatSessionProjectionScope(owner, {
-    agentId: resolveUiSelectedSessionAgentId(owner),
-  });
   const acceptedRunIds = new Set(
     [...(page?.items ?? []), ...receipts]
       .map((item) => item.runId)
       .filter((runId) => typeof runId === "string"),
   );
+  retireChatSubmissionDisplay(owner, acceptedRunIds);
+  return {
+    acceptedRunIds,
+    page: page ?? { items: [], total: 0 },
+  };
+}
+
+/** Canonical custody retires local display ownership even outside the loaded history page. */
+export function retireChatSubmissionDisplay(
+  owner: ChatSessionProjectionOwner,
+  acceptedRunIds: ReadonlySet<string>,
+): void {
+  const scope = readChatSessionProjectionScope(owner, {
+    agentId: resolveUiSelectedSessionAgentId(owner),
+  });
   const submissions = readChatSubmissionBatch(owner, scope);
   submissions?.accept(acceptedRunIds);
   if (acceptedRunIds.size) {
@@ -379,10 +447,6 @@ export function reconcileChatInputCustody(
       });
     }
   }
-  return {
-    acceptedRunIds,
-    page: page ?? { items: [], total: 0 },
-  };
 }
 
 export function shouldDisplayChatSubmission(
@@ -471,6 +535,7 @@ export function reduceChatSessionProjection(
   projection = reduceSessionProjection(projection, { ...preparedEvent, scope });
   if (event.type === "sessionReset" && projection !== current) {
     resetCompactionProjection(owner);
+    owner.providerPolicyNotice = null;
   }
   // Without a transcript anchor this is best-effort display chronology, assuming
   // comparable browser/Gateway clocks. Never assign a sequence or reorder canonical

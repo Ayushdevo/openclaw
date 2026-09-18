@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } fr
 import { isUsableNode, recoverNodeRuntime } from "../../node-runtime-recovery.mjs";
 import { SQLITE_CAPABILITY_PROBE } from "../../node-sqlite.mjs";
 import { buildTaskScript } from "../daemon/schtasks-layout.js";
+import { resolveTestNodeExecPath } from "../test-utils/node-process.js";
 import { withTempDir } from "../test-utils/temp-dir.js";
 import { mockProcessPlatform } from "../test-utils/vitest-spies.js";
 import { encodeWindowsLauncherScript } from "./windows-launcher-encoding.js";
@@ -47,7 +48,7 @@ vi.mock("node:fs", async (importOriginal) => {
 });
 vi.mock("../../node-sqlite.mjs", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../node-sqlite.mjs")>()),
-  detectCurrentSqliteCapabilities: () => ({
+  detectCurrentSqliteCapabilities: async () => ({
     available: true,
     version: "3.51.3",
     text: mocks.currentAdmitted,
@@ -63,6 +64,10 @@ vi.mock("./windows-encoding.js", async (importOriginal) => ({
 
 const originalArgv = process.argv;
 const originalExecArgv = process.execArgv;
+// Exercise the Node-only recovery branch when Bun owns Vitest; process-boundary cases still launch Node.
+const bunVersionDescriptor = Object.getOwnPropertyDescriptor(process.versions, "bun");
+const execPathDescriptor = Object.getOwnPropertyDescriptor(process, "execPath")!;
+const testNodeExecPath = resolveTestNodeExecPath();
 const hostPlatform = process.platform;
 const windowsPath = {
   isAbsolute: path.win32.isAbsolute.bind(path.win32),
@@ -76,6 +81,10 @@ let exitSpy: MockInstance<typeof process.exit>;
 let stderrSpy: MockInstance<typeof process.stderr.write>;
 
 beforeEach(() => {
+  if (bunVersionDescriptor) {
+    Object.defineProperty(process.versions, "bun", { value: undefined, configurable: true });
+    Object.defineProperty(process, "execPath", { value: testNodeExecPath, configurable: true });
+  }
   mockProcessPlatform("linux");
   mocks.currentAdmitted = false;
   mocks.encoding = "utf-8";
@@ -132,6 +141,10 @@ afterEach(() => {
   }
   process.argv = originalArgv;
   process.execArgv = originalExecArgv;
+  if (bunVersionDescriptor) {
+    Object.defineProperty(process.versions, "bun", bunVersionDescriptor);
+    Object.defineProperty(process, "execPath", execPathDescriptor);
+  }
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
@@ -319,7 +332,7 @@ describe("runtime recovery discovery", () => {
       );
       const { spawnSync } =
         await vi.importActual<typeof import("node:child_process")>("node:child_process");
-      const result = spawnSync(process.execPath, [driver, "doctor", "--fix", "--non-interactive"], {
+      const result = spawnSync(testNodeExecPath, [driver, "doctor", "--fix", "--non-interactive"], {
         cwd,
         env: {
           ...process.env,
@@ -922,6 +935,20 @@ describe("candidate admission probe", () => {
                 probe: { available: true, version: "3.51.3", text: true, blob: true, json: true },
               }),
         stderr: "",
+      });
+
+      expect(isUsableNode(candidate)).toBe(false);
+    });
+  });
+
+  it("rejects candidates when the permission model denies child processes", async () => {
+    await withRecoveryHome(async (home) => {
+      const candidate = await writeFixture(path.join(home, "bin/node"));
+      mocks.admissible.add(candidate);
+      mocks.probe.mockImplementation(() => {
+        throw Object.assign(new Error("Access to this API has been restricted"), {
+          code: "ERR_ACCESS_DENIED",
+        });
       });
 
       expect(isUsableNode(candidate)).toBe(false);

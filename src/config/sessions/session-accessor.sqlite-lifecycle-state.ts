@@ -1,5 +1,6 @@
 import { toUSVString } from "node:util";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import { sql } from "kysely";
 import {
   executeSqliteQuerySync,
   iterateSqliteQuerySync,
@@ -14,7 +15,7 @@ import { persistSessionTranscriptArchive } from "./session-accessor.sqlite-archi
 import type {
   MaterializedSessionStateDeletePlan,
   SessionStateDeletePlan,
-} from "./session-accessor.sqlite-archive.js";
+} from "./session-accessor.sqlite-archive-types.js";
 import type {
   SessionEntryLifecycleRemoval,
   SessionEntryLifecycleUpsert,
@@ -48,6 +49,10 @@ import {
   parseSessionEntryJson as parseSessionEntryRow,
   sessionEntryMetadataJson,
 } from "./session-accessor.sqlite-status.js";
+import {
+  assertSessionTranscriptHot,
+  readSessionColdTranscript,
+} from "./session-cold-storage-state.js";
 import { deleteSessionTranscriptIndexInTransaction } from "./session-transcript-index.js";
 import type { SessionEntry } from "./types.js";
 
@@ -93,7 +98,7 @@ export function shouldRemoveSessionEntry(
 
 /** Session ids protected by live node state. */
 export function readReferencedSessionIds(
-  database: OpenClawAgentDatabase,
+  database: Pick<OpenClawAgentDatabase, "db">,
   excludedSessionKeys: ReadonlySet<string> = new Set(),
   candidateSessionIds?: readonly string[],
   diskBudget?: { preserveRecentMs?: number | null },
@@ -103,15 +108,32 @@ export function readReferencedSessionIds(
   const excludedKeys = [...excludedSessionKeys].filter(
     (key) => toUSVString(key) === key && !key.includes("\0") && !/[\uFFFE\uFFFF]/u.test(key),
   );
-  const rows = iterateSqliteQuerySync(
-    database.db,
-    db
-      .selectFrom("session_nodes")
-      .select([sessionEntryMetadataJson, "current_session_id", "session_key"])
-      .$if(excludedKeys.length > 0, (query) =>
-        query.where("session_key", "not in", sqliteStringSet(excludedKeys)),
-      ),
-  );
+  let query = db
+    .selectFrom("session_nodes")
+    .select([sessionEntryMetadataJson, "current_session_id", "session_key"])
+    .$if(excludedKeys.length > 0, (builder) =>
+      builder.where("session_key", "not in", sqliteStringSet(excludedKeys)),
+    );
+  const candidate = candidateSessionIds?.length === 1 ? candidateSessionIds[0] : undefined;
+  // Singleton reclamation probes need no unrelated metadata. Keep parsing every optional
+  // reference row; presence checks preserve escaped/duplicate keys and malformed values.
+  // Replacement characters can come from raw invalid SQLite bytes that instr cannot match.
+  if (
+    candidate !== undefined &&
+    toUSVString(candidate) === candidate &&
+    !/[\0\uFFFD-\uFFFF]/u.test(candidate)
+  ) {
+    query =
+      query.where(/* kysely-allow-raw: narrow hydration without replacing the reference parser or its raw-text fallbacks. */ sql<boolean>`CASE
+        WHEN instr(current_session_id, ${candidate}) > 0 THEN 1
+        WHEN NOT json_valid(entry_json) THEN 1
+        WHEN length(CAST(entry_json AS BLOB)) != length(CAST(printf('%s', entry_json) AS BLOB)) THEN 1
+        ELSE json_type(entry_json, '$.previousSessionId') IS NOT NULL
+          OR json_type(entry_json, '$.usageFamilySessionIds') IS NOT NULL
+          OR json_type(entry_json, '$.compactionCheckpoints') IS NOT NULL
+      END`);
+  }
+  const rows = iterateSqliteQuerySync(database.db, query);
   const sessionIds = new Set<string>();
   for (const row of rows) {
     if (excludedSessionKeys.has(row.session_key)) {
@@ -165,7 +187,10 @@ export function planSessionStateDeleteIfUnreferenced(params: {
   referencedSessionIds: ReadonlySet<string>;
   sessionId: string;
 }): SessionStateDeletePlan | null {
-  if (params.referencedSessionIds.has(params.sessionId)) {
+  if (
+    params.referencedSessionIds.has(params.sessionId) ||
+    readSessionColdTranscript(params.database.db, params.sessionId)
+  ) {
     return null;
   }
   return {
@@ -203,7 +228,10 @@ export function deleteMaterializedSessionStatePlans(
     referencedSessionIds.add(sessionId);
   }
   for (const plan of plans) {
-    if (referencedSessionIds.has(plan.sessionId)) {
+    if (
+      referencedSessionIds.has(plan.sessionId) ||
+      readSessionColdTranscript(database.db, plan.sessionId)
+    ) {
       continue;
     }
     const currentSnapshot = readSessionStateDeleteSnapshot(database.db, plan.sessionId);
@@ -450,6 +478,7 @@ export function collectProjectedReferencedSessionIds(params: {
 export { collectSessionStateIdsForEntry };
 
 function deleteSqliteSessionStateRows(database: OpenClawAgentDatabase, sessionId: string): boolean {
+  assertSessionTranscriptHot(database.db, sessionId);
   const db = getSessionKysely(database.db);
   // The window row cascades canonical transcript tables, but FTS is virtual;
   // clear its projection before dropping the owner row.

@@ -10,6 +10,7 @@ import {
 import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
+import { validReview, writeReviewArtifacts } from "./pr-review-artifact-fixture.js";
 import { copyPrWrapperSources } from "./pr-wrapper.test-support.js";
 
 const temps = useAutoCleanupTempDirTracker(afterEach);
@@ -70,6 +71,12 @@ function fixture() {
   const capture = join(worktree, ".local/merge-output.log");
   writeFileSync(capture, "retained capture\n");
   const repo = { id: 123, nameWithOwner: "fixture/repo", url: "https://github.com/fixture/repo" };
+  const repoAuthority = {
+    id: repo.id,
+    node_id: "fixture-repo",
+    full_name: repo.nameWithOwner,
+    html_url: repo.url,
+  };
   const record = {
     version: 1,
     repo,
@@ -93,6 +100,8 @@ function fixture() {
     data: {
       repository: {
         ...repo,
+        id: repoAuthority.node_id,
+        databaseId: repo.id,
         ref: { target: { oid: landed } },
         pullRequest: {
           id: record.prId,
@@ -120,6 +129,11 @@ function fixture() {
 printf '%s\\t%s\\n' "$(git rev-parse --show-toplevel)" "$*" >> '${calls}'
 case "$1 $2" in
   "repo view") printf '%s\\n' '${JSON.stringify(repo)}' ;;
+  "api --hostname")
+    [ "$*" = 'api --hostname github.com repos/fixture/repo -H Cache-Control: max-age=0' ] || {
+      echo "Unexpected GitHub operation: $*" >&2; exit 99;
+    }
+    printf '%s\\n' '${JSON.stringify(repoAuthority)}' ;;
   "api graphql") printf '%s\\n' '${JSON.stringify(response)}' ;;
   "pr view")
     if [ "$(git rev-parse --show-toplevel)" = '${owner}' ]; then
@@ -187,7 +201,11 @@ describePosix("native PR wrapper repository ownership", () => {
       expect(readFileSync(f.capture, "utf8")).toBe("retained capture\n");
       expect(f.git(f.caller, ["show-ref"])).toBe(callerRefs);
       expect(f.git(f.owner, ["for-each-ref", "--format=%(refname)", lockRef])).toBe("");
-      expect(f.readCalls()).toHaveLength(3);
+      expect(f.readCalls()).toHaveLength(4);
+      expect(f.readCalls().slice(0, 2)).toEqual([
+        `${f.owner}\trepo view --json nameWithOwner,url`,
+        `${f.owner}\tapi --hostname github.com repos/fixture/repo -H Cache-Control: max-age=0`,
+      ]);
       expect(f.readCalls().every((call) => call.startsWith(`${f.owner}\t`))).toBe(true);
       expect(f.readCalls().some((call) => call.includes("pr merge") || call.includes("POST"))).toBe(
         false,
@@ -215,13 +233,23 @@ describePosix("native PR wrapper repository ownership", () => {
     expect(f.git(f.owner, ["rev-parse", outcomeRef])).toBe(f.head);
     expect(f.git(f.caller, ["rev-parse", outcomeRef])).toBe(f.intent);
     expect(readFileSync(f.capture, "utf8")).toBe("retained capture\n");
-    expect(f.readCalls()).toEqual([`${f.owner}\trepo view --json id,nameWithOwner,url`]);
+    expect(f.readCalls()).toEqual([
+      `${f.owner}\trepo view --json nameWithOwner,url`,
+      `${f.owner}\tapi --hostname github.com repos/fixture/repo -H Cache-Control: max-age=0`,
+    ]);
   });
 
   it.each(["prepare-run", "merge-recover", "ci-dispatch", "review-init"])(
     "uses owner repository metadata for early %s validation",
     (command) => {
       const f = fixture();
+      if (command === "prepare-run") {
+        const review = validReview(f.head);
+        review.pr.number = 123;
+        review.recommendation = "READY FOR /prepare-pr";
+        review.issueValidation.status = "valid";
+        writeReviewArtifacts(f.worktree, review, { prNumber: 123, headSha: f.head });
+      }
       const result = f.run(f.caller, [
         command,
         "123",
@@ -235,8 +263,12 @@ describePosix("native PR wrapper repository ownership", () => {
             ? "did not include a head SHA"
             : "targets owner-release",
       );
-      expect(f.readCalls()).toHaveLength(1);
-      expect(f.readCalls()[0]).toContain(`${f.owner}\tpr view 123 --json `);
+      const metadataCall = command === "review-init" ? 1 : 0;
+      expect(f.readCalls()).toHaveLength(metadataCall + 1);
+      if (command === "review-init") {
+        expect(f.readCalls()[0]).toBe(`${f.owner}\trepo view --json nameWithOwner,url`);
+      }
+      expect(f.readCalls()[metadataCall]).toContain(`${f.owner}\tpr view 123 --json `);
       expect(f.git(f.owner, ["rev-parse", outcomeRef])).toBe(f.intent);
       expect(f.git(f.owner, ["for-each-ref", "--format=%(refname)", lockRef])).toBe("");
       expect(f.git(f.caller, ["for-each-ref", "--format=%(refname)", "refs/openclaw"])).toBe("");

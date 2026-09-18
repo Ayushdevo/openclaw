@@ -24,6 +24,8 @@ const { AsyncWorkScope, getAsyncWorkSignal, trackAsyncWork } =
 const { validateAgentRunDelegatedAuthority } = await import("../infra/agent-run-registry.js");
 const { mintSecretSentinel } = await import("../secrets/sentinel.js");
 const { getAdmittedRunDelegatedAuthority } = await import("./admitted-run-context.js");
+const { resolveModelFallbackError } = await import("./failover-error.js");
+const { PROVIDER_FAILURE_WITH_OUTPUT_ERROR_CODE } = await import("../llm/types.js");
 
 beforeEach(resetIsolatedCompletionTestState);
 
@@ -77,7 +79,7 @@ describe("runIsolatedCompletion", () => {
     if (stage === "runtime") {
       mocks.acquireAgentRunPreparedModelRuntime.mockImplementationOnce(async () => {
         await pause();
-        return { snapshot: preparedModelRuntime, release: releaseRuntimeLease };
+        return { snapshot: preparedModelRuntime, [Symbol.asyncDispose]: releaseRuntimeLease };
       });
     } else if (stage === "plugin") {
       mocks.ensureSelectedAgentHarnessPlugin.mockImplementationOnce(pause);
@@ -122,8 +124,8 @@ describe("runIsolatedCompletion", () => {
       mocks.resolveCliRuntimeCanonicalProvider.mockReturnValue(
         provider === "claude-cli" ? "anthropic" : undefined,
       );
-      mocks.resolveEffectiveAgentRuntime.mockReturnValue(
-        provider === "anthropic" ? "claude-cli" : "codex",
+      mocks.resolveCliRuntimeExecutionProvider.mockReturnValue(
+        provider === "anthropic" ? "claude-cli" : undefined,
       );
       mocks.isCliRuntimeAliasForProvider.mockImplementation(
         ({ runtime, provider: modelProvider }) =>
@@ -172,7 +174,7 @@ describe("runIsolatedCompletion", () => {
       mocks.acquireAgentRunPreparedModelRuntime.mockImplementationOnce(async () => {
         entered.resolve();
         await release.promise;
-        return { snapshot: preparedModelRuntime, release: releaseRuntimeLease };
+        return { snapshot: preparedModelRuntime, [Symbol.asyncDispose]: releaseRuntimeLease };
       });
       const mutableRequest = {
         ...isolatedRequest(),
@@ -204,6 +206,7 @@ describe("runIsolatedCompletion", () => {
           await expect(completion).resolves.toMatchObject({ text: "done" });
           expect(mocks.prepareSimpleCompletionModel).toHaveBeenCalledWith(
             expect.objectContaining({ modelId: "gpt-test", profileId: "openai:original" }),
+            expect.any(Function),
           );
           expect(dispatch).toHaveBeenCalledOnce();
           expect(dispatch).toHaveBeenCalledWith(
@@ -261,6 +264,7 @@ describe("runIsolatedCompletion", () => {
             provider: "openai",
             modelId: "gpt-test",
           }),
+          expect.any(Function),
         );
       }
       expect(releaseRuntimeLease).toHaveBeenCalledOnce();
@@ -289,6 +293,7 @@ describe("runIsolatedCompletion", () => {
         preparedModelRuntime,
         workspaceDir: "/tmp/workspace",
       }),
+      expect.any(Function),
     );
     expect(mocks.acquireAgentRunPreparedModelRuntime).toHaveBeenCalledOnce();
     expect(releaseRuntimeLease).toHaveBeenCalledOnce();
@@ -418,6 +423,45 @@ describe("runIsolatedCompletion", () => {
         code: "output-rejected",
         message: expect.stringContaining(`stop reason ${stopReason}`),
       });
+    },
+  );
+
+  it.each([
+    { errorMessage: "529 Overloaded", errorCode: undefined, reason: "overloaded" },
+    {
+      errorMessage: "429 Too many requests. Retry after 90 seconds.",
+      errorCode: undefined,
+      reason: "rate_limit",
+      retryAfterMs: 90_000,
+    },
+    {
+      errorMessage: "529 Overloaded after output started",
+      errorCode: PROVIDER_FAILURE_WITH_OUTPUT_ERROR_CODE,
+      reason: undefined,
+    },
+  ])(
+    "preserves retry classification without replaying terminal output: $errorMessage",
+    async ({ errorMessage, errorCode, reason, retryAfterMs }) => {
+      registerIsolatedHarness({
+        runIsolatedCompletion: vi.fn(async () => ({
+          assistant: {
+            ...isolatedAssistant([], "error"),
+            errorMessage,
+            errorCode,
+          },
+        })),
+      });
+      const error = await runIsolatedCompletion(isolatedRequest()).catch(
+        (failure: unknown) => failure,
+      );
+      expect(error).toMatchObject({ code: "output-rejected" });
+      expect(resolveModelFallbackError(error)).toMatchObject(
+        reason ? { kind: "failover", error: { reason } } : { kind: "unknown" },
+      );
+      if (retryAfterMs !== undefined) {
+        expect(error).toMatchObject({ cause: { retryAfterMs } });
+      }
+      expect(releaseRuntimeLease).toHaveBeenCalledOnce();
     },
   );
 
@@ -663,7 +707,7 @@ describe("isolated completion work ownership", () => {
       if (stage === "acquisition") {
         mocks.acquireAgentRunPreparedModelRuntime.mockImplementationOnce(async () => {
           await pause();
-          return { snapshot: preparedModelRuntime, release: releaseRuntimeLease };
+          return { snapshot: preparedModelRuntime, [Symbol.asyncDispose]: releaseRuntimeLease };
         });
       } else {
         mocks.prepareSimpleCompletionModel.mockImplementationOnce(async () => {

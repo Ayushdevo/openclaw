@@ -96,7 +96,11 @@ describe("renderAgents", () => {
     expect(
       container.querySelector<HTMLInputElement>(".agent-identity-editor__fields input")?.value,
     ).toBe("Fetched Beta");
-    expect(container.querySelector(".agent-identity-editor__avatar-text")?.textContent).toBe("🦊");
+    expect(
+      container
+        .querySelector(".agent-identity-editor__avatar .identity-avatar__text")
+        ?.getAttribute("data-avatar"),
+    ).toBe("🦊");
   });
 
   it("renders and counts a server-scoped default-agent cron job without an explicit agentId", () => {
@@ -238,28 +242,6 @@ describe("renderAgents", () => {
       "openclaw-agent-memory-panel",
     );
     expect(panel?.agentId).toBe("beta");
-  });
-
-  it("renders the custom agent select with the provided agents and selected label", async () => {
-    const container = document.createElement("div");
-    document.body.append(container);
-
-    try {
-      render(renderAgents(createProps()), container);
-      const select = container.querySelector("openclaw-agent-select") as
-        | (HTMLElement & {
-            options: Array<{ value: string }>;
-            updateComplete: Promise<boolean>;
-          })
-        | null;
-      expect(select).not.toBeNull();
-      await select?.updateComplete;
-
-      expect(select?.options.map((option) => option.value)).toEqual(["alpha", "beta"]);
-      expect(select?.querySelector(".agent-select__label")?.textContent?.trim()).toBe("Beta");
-    } finally {
-      container.remove();
-    }
   });
 
   it("selects the configured primary model on initial render", async () => {

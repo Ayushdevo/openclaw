@@ -19,6 +19,14 @@ function renderPortUsageDiagnostics(snapshot: GatewayPortHealthSnapshot): string
 
 export function renderRestartDiagnostics(snapshot: GatewayRestartSnapshot): string[] {
   const lines: string[] = [];
+  if (snapshot.waitOutcome === "timeout" && snapshot.startupPhase) {
+    lines.push(
+      `Readiness budget exhausted after ${Math.round((snapshot.elapsedMs ?? 0) / 1000)}s. Last observed startup phase: ${snapshot.startupPhase}.`,
+    );
+  }
+  if (snapshot.waitOutcome === "generation-changed") {
+    lines.push("Gateway process generation changed before readiness could be confirmed.");
+  }
   if (snapshot.versionMismatch) {
     const actual = snapshot.versionMismatch.actual ?? "unavailable";
     lines.push(

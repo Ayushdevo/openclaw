@@ -8,6 +8,7 @@ import * as triageUpdate from "../../commands/triage-update.js";
 import * as config from "../../config/config.js";
 import * as launchd from "../../daemon/launchd.js";
 import * as gatewayService from "../../daemon/service.js";
+import { createMockGatewayService } from "../../daemon/service.test-helpers.js";
 import { resolvePackageActivationAnchor } from "../../infra/package-update-activation-journal.js";
 import * as temporaryState from "../../infra/tmp-openclaw-dir.js";
 import * as updateCheck from "../../infra/update-check.js";
@@ -131,7 +132,10 @@ function pendingPackageInvocation(
   const manager = vi
     .spyOn(updateShared, "resolveGlobalManager")
     .mockResolvedValue(params.manager ?? "npm");
-  const service = gatewayService.resolveGatewayService();
+  const service = createMockGatewayService({
+    isLoaded: async () => true,
+    readRuntime: async () => ({ status: "running", systemd: { managerUid: 2001 } }),
+  });
   const readCommand = vi.fn(async () =>
     params.redirected
       ? { programArguments: [process.execPath, path.join(target, "dist", "entry.js"), "gateway"] }
@@ -235,78 +239,87 @@ describe.skipIf(process.platform === "win32")("pending package activation admiss
     }
   });
 
-  it("reports pending after lease acquisition without housekeeping or changing retained material", async () => {
-    const f = pendingPackageInvocation();
-    const withExecutor = updateExecutor.withUpdateCommandExecutor;
-    let anchor: string | undefined;
-    let record: ReturnType<typeof ledger.getUpdateRun> | undefined;
-    const retainedMaterial = () => ({
-      source: materialSnapshot(f.source),
-      target: materialSnapshot(f.target),
-      anchor: anchor ? materialSnapshot(anchor) : undefined,
-      config: fs.readFileSync(path.join(f.state, "openclaw.json")),
-      triage: fs.readFileSync(path.join(f.home, "triage.json")),
-      sentinel: fs.readFileSync(path.join(f.home, "sentinel.json")),
-    });
-    let before: ReturnType<typeof retainedMaterial> | undefined;
-    vi.spyOn(updateConfig, "readUpdateChannelConfig").mockResolvedValue({
-      configSnapshot: await config.readConfigFileSnapshot({
-        skipPluginValidation: true,
-        observe: false,
-      }),
-      legacyConfigPlan: undefined,
-      storedChannel: null,
-    });
-    const metadata = vi
-      .spyOn(updateGlobal, "createGlobalInstallEnv")
-      .mockRejectedValue(new Error("package metadata must not run after pending lease admission"));
-    vi.spyOn(updateExecutor, "withUpdateCommandExecutor").mockImplementation(
-      (runId, operation, options) =>
-        withExecutor(
-          runId,
-          async (executor) =>
-            operation({
-              async enter(root, enterOptions) {
-                const fence = await executor.enter(root, enterOptions);
-                if (!anchor) {
-                  anchor = f.addPending();
-                  record = ledger.getUpdateRun(runId);
-                  before = retainedMaterial();
-                }
-                return fence;
-              },
-            }),
-          options,
-        ),
-    );
-    try {
-      await expect(updateCommand({ json: true, yes: true })).rejects.toMatchObject({ code: 1 });
-      expect(anchor).toBeDefined();
-      expect(record).toMatchObject({ status: "running" });
-      expect(defaultRuntime.writeJson).toHaveBeenCalledWith(
-        expect.objectContaining({
-          status: "error",
-          reason: "update-recovery-pending",
-          recovery: { serviceRestartSafe: false, reason: "runtime-verification-failed" },
+  it.each([false, true])(
+    "reports pending after lease acquisition with existing history=%s without changing retained material",
+    async (existingRun) => {
+      const f = pendingPackageInvocation({ existingRun });
+      const withExecutor = updateExecutor.withUpdateCommandExecutor;
+      let anchor: string | undefined;
+      let record: ReturnType<typeof ledger.getUpdateRun> | undefined;
+      const retainedMaterial = () => ({
+        source: materialSnapshot(f.source),
+        target: materialSnapshot(f.target),
+        anchor: anchor ? materialSnapshot(anchor) : undefined,
+        config: fs.readFileSync(path.join(f.state, "openclaw.json")),
+        triage: fs.readFileSync(path.join(f.home, "triage.json")),
+        sentinel: fs.readFileSync(path.join(f.home, "sentinel.json")),
+      });
+      let before: ReturnType<typeof retainedMaterial> | undefined;
+      vi.spyOn(updateConfig, "readUpdateChannelConfig").mockResolvedValue({
+        configSnapshot: await config.readConfigFileSnapshot({
+          skipPluginValidation: true,
+          observe: false,
         }),
+        legacyConfigPlan: undefined,
+        storedChannel: null,
+      });
+      const metadata = vi
+        .spyOn(updateGlobal, "createGlobalInstallEnv")
+        .mockRejectedValue(
+          new Error("package metadata must not run after pending lease admission"),
+        );
+      vi.spyOn(updateExecutor, "withUpdateCommandExecutor").mockImplementation(
+        (runId, operation, options) =>
+          withExecutor(
+            runId,
+            async (executor) =>
+              operation({
+                async enter(root, enterOptions) {
+                  const fence = await executor.enter(root, enterOptions);
+                  if (!anchor) {
+                    anchor = f.addPending();
+                    record = ledger.getUpdateRun(runId);
+                    before = retainedMaterial();
+                  }
+                  return fence;
+                },
+              }),
+            options,
+          ),
       );
-      expect(metadata).not.toHaveBeenCalled();
-      expect(f.writers.disableAutoStart).not.toHaveBeenCalled();
-      expect(f.writers.cleanupHandoffs).not.toHaveBeenCalled();
-      expect(f.writers.loadPlugins).not.toHaveBeenCalled();
-      expect(f.writers.writeTriage).not.toHaveBeenCalled();
-      expect(f.writers.runTriage).not.toHaveBeenCalled();
-      expect(retainedMaterial()).toEqual(before);
-      if (!record) {
-        throw new Error("The race did not reach an admitted update");
+      try {
+        await expect(updateCommand({ json: true, yes: true })).rejects.toMatchObject({ code: 1 });
+        expect(anchor).toBeDefined();
+        if (existingRun) {
+          expect(record).toMatchObject({ status: "running" });
+        } else {
+          expect(record).toBeUndefined();
+          expect(f.writers.createRun).not.toHaveBeenCalled();
+          expect(fs.existsSync(path.join(f.state, "state", "openclaw.sqlite"))).toBe(false);
+        }
+        expect(defaultRuntime.writeJson).toHaveBeenCalledWith(
+          expect.objectContaining({
+            status: "error",
+            reason: "update-recovery-pending",
+            recovery: { serviceRestartSafe: false, reason: "runtime-verification-failed" },
+          }),
+        );
+        expect(metadata).not.toHaveBeenCalled();
+        expect(f.writers.disableAutoStart).not.toHaveBeenCalled();
+        expect(f.writers.cleanupHandoffs).not.toHaveBeenCalled();
+        expect(f.writers.loadPlugins).not.toHaveBeenCalled();
+        expect(f.writers.writeTriage).not.toHaveBeenCalled();
+        expect(f.writers.runTriage).not.toHaveBeenCalled();
+        expect(retainedMaterial()).toEqual(before);
+        if (record) {
+          // Pending reporting must retain an already-admitted attempt.
+          expect(ledger.getUpdateRun(record.runId)).toMatchObject({ runId: record.runId });
+        }
+      } finally {
+        f.restore();
       }
-      // Admission legitimately created this attempt before the anchor appeared.
-      // Pending reporting may record its outcome, but must not erase the attempt.
-      expect(ledger.getUpdateRun(record.runId)).toMatchObject({ runId: record.runId });
-    } finally {
-      f.restore();
-    }
-  });
+    },
+  );
 });
 
 async function fixture() {

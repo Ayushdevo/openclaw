@@ -283,9 +283,11 @@ export async function runCopilotExecution(context: {
             yieldDetected = true;
             yieldAcknowledgment = acknowledgment;
           },
-          onToolCompleted: async ({ args, error, result, startedAt, toolCallId, toolName }) => {
+          onToolCompleted: async (completion) => {
+            bridge?.completeTool(completion);
+            const { args, error, result, startedAt, toolCallId, toolName } = completion;
             const acceptedSessionSpawnDetails =
-              toolName === "sessions_spawn" && !error
+              toolName === "sessions_spawn" && !completion.isError
                 ? asOptionalRecord(asOptionalRecord(result)?.details)
                 : undefined;
             const runId = normalizeOptionalString(acceptedSessionSpawnDetails?.runId);
@@ -418,7 +420,7 @@ export async function runCopilotExecution(context: {
     }
     if (sdkSessionId && deps.onSessionEstablished && !settledToolFinalization) {
       try {
-        deps.onSessionEstablished({
+        await deps.onSessionEstablished({
           compactionSessionConfig,
           sdkSessionId,
           pooledClient: handle,
@@ -436,6 +438,8 @@ export async function runCopilotExecution(context: {
       sdkSessionId,
     });
     bridge = attachEventBridge(session, {
+      runId: input.runId,
+      sessionKey: input.sessionKey,
       onAssistantDelta: settledToolFinalization ? undefined : input.onAssistantDelta,
       onAgentEvent: settledToolFinalization ? undefined : input.onAgentEvent,
       onNativeSubagentEvent: (event) => nativeSubagentTaskMirror?.handleEvent(event),
@@ -614,7 +618,7 @@ export async function runCopilotExecution(context: {
         .catch(() => undefined);
       if (sdkSessionId && !settledToolFinalization) {
         try {
-          deps.onDeferredCompaction?.({
+          await deps.onDeferredCompaction?.({
             abort: () => cleanupAbort.abort(),
             cleanup,
             sdkSessionId,
@@ -625,7 +629,11 @@ export async function runCopilotExecution(context: {
     } else {
       await bridge?.awaitCompactionChain();
       await bridge?.awaitAgentEventChain();
-      nativeSubagentTaskMirror?.finalizeActiveRuns();
+      try {
+        nativeSubagentTaskMirror?.finalizeActiveRuns();
+      } catch (error) {
+        promptError ??= toCopilotError(error);
+      }
       cleanupToolBridge?.();
       await cleanupByokProxy?.();
       bridge?.detach();

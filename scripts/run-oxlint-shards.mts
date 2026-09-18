@@ -19,9 +19,13 @@ import {
   terminateManagedChild,
   waitForManagedProcessGroupExit,
 } from "./lib/managed-child-process.mts";
+import { readProcessMemoryCapacity } from "./lib/process-memory.mts";
 import { shouldPrepareExtensionPackageBoundaryArtifacts } from "./run-oxlint.mts";
 
 const DEFAULT_EXTENSION_CHUNK_SIZE = 8;
+const LARGE_CI_EXTENSION_CHUNK_SIZE = 16;
+const LARGE_CI_EXTENSION_MIN_MEMORY_BYTES = 15 * 1024 ** 3;
+const DEFAULT_CONSTRAINED_CORE_STRIPES = 5;
 const DEFAULT_SHARD_HEARTBEAT_MS = 30_000;
 const DEFAULT_SHARD_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_SHARD_KILL_GRACE_MS = 5_000;
@@ -36,7 +40,11 @@ const PARENT_TERMINATION_SIGNALS = ["SIGINT", "SIGTERM"] satisfies NodeJS.Signal
 
 type OxlintShard = { name: string; args: string[] };
 type ShardStripe = { index: number; total: number };
-type HostResources = { logicalCpuCount: number; totalMemoryBytes: number };
+type HostResources = {
+  logicalCpuCount: number;
+  totalMemoryBytes: number;
+  memoryCapacityBytes?: number | null;
+};
 type ReadDirectoryEntries = (target: string, options: { withFileTypes: true }) => Dirent[];
 type DirectoryOptions = { cwd?: string; readDir?: ReadDirectoryEntries };
 type DirectoryLookup = Required<DirectoryOptions>;
@@ -86,16 +94,38 @@ export function createOxlintShards({
   splitCore = false,
   splitExtensions = false,
 }: PlatformShardOptions = {}) {
-  const coreShards = splitCore ? createCoreOxlintShards({ cwd, readDir }) : [CORE_SHARD];
+  const constrainedSerial =
+    hostResources.totalMemoryBytes < CI_PARALLEL_MIN_MEMORY_BYTES &&
+    shouldRunOxlintShardsSerial({ env, platform, hostResources });
+  const coreGroups =
+    splitCore || constrainedSerial ? createCoreOxlintShards({ cwd, readDir }) : [CORE_SHARD];
+  // Bound semantic checker caches without rebuilding the full type graph for every directory.
+  const coreShards =
+    constrainedSerial && !splitCore
+      ? Array.from({ length: DEFAULT_CONSTRAINED_CORE_STRIPES }, (_, index) =>
+          selectCoreOxlintStripe(coreGroups, {
+            index: index + 1,
+            total: DEFAULT_CONSTRAINED_CORE_STRIPES,
+          }),
+        ).flat()
+      : coreGroups;
   // Unsplit plugin lint can exceed small-host RAM even with a single lint thread.
   // Chunk serial runs; explicit stripes use independently bounded Programs that stay serial.
-  const chunkExtensions =
-    splitExtensions ||
-    platform === "win32" ||
-    (hostResources.totalMemoryBytes < CI_PARALLEL_MIN_MEMORY_BYTES &&
-      shouldRunOxlintShardsSerial({ env, platform, hostResources }));
+  const chunkExtensions = splitExtensions || platform === "win32" || constrainedSerial;
+  // Larger serial Programs amortize type-graph startup on the measured Linux CI
+  // class. Unknown/ancestor-constrained memory and explicit stripes retain eight.
+  const extensionChunkSize =
+    platform === "linux" &&
+    (env.CI === "true" || env.GITHUB_ACTIONS === "true") &&
+    constrainedSerial &&
+    !splitExtensions &&
+    !env.OPENCLAW_OXLINT_SHARDS_SERIAL?.trim() &&
+    hostResources.logicalCpuCount >= 4 &&
+    (hostResources.memoryCapacityBytes ?? 0) >= LARGE_CI_EXTENSION_MIN_MEMORY_BYTES
+      ? LARGE_CI_EXTENSION_CHUNK_SIZE
+      : DEFAULT_EXTENSION_CHUNK_SIZE;
   const extensionShards = chunkExtensions
-    ? createExtensionOxlintShards({ cwd, env, platform, readDir })
+    ? createExtensionOxlintShards({ cwd, env, platform, readDir, chunkSize: extensionChunkSize })
     : [EXTENSIONS_SHARD];
 
   return [...coreShards, ...extensionShards, SCRIPTS_SHARD];
@@ -132,14 +162,15 @@ export function createExtensionOxlintShards({
   env = process.env,
   platform = process.platform,
   readDir = fs.readdirSync,
-}: ShardOptions & PlatformOptions = {}) {
+  chunkSize: requestedChunkSize = DEFAULT_EXTENSION_CHUNK_SIZE,
+}: ShardOptions & PlatformOptions & { chunkSize?: number } = {}) {
   const entries = listExtensionEntries({ cwd, readDir });
   if (entries.dirs.length === 0 && entries.rootFiles.length === 0) {
     return [EXTENSIONS_SHARD];
   }
 
   const chunkSize =
-    platform === "win32" ? resolveWindowsExtensionChunkSize(env) : DEFAULT_EXTENSION_CHUNK_SIZE;
+    platform === "win32" ? resolveWindowsExtensionChunkSize(env) : requestedChunkSize;
   const shards: OxlintShard[] = [];
 
   if (entries.rootFiles.length > 0) {
@@ -288,6 +319,7 @@ export async function main(
     if (needsArtifacts) {
       const code = await runManagedCommand({
         bin: process.execPath,
+        shell: false,
         args: distArtifactEntryArgs(
           path.resolve("scripts/prepare-extension-package-boundary-artifacts.mts"),
           ["--mode=package-boundary"],
@@ -337,6 +369,7 @@ function resolveHostResources(hostResources?: HostResources) {
 
   return {
     totalMemoryBytes: os.totalmem(),
+    memoryCapacityBytes: readProcessMemoryCapacity({}).capacityBytes,
     logicalCpuCount:
       typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length,
   };

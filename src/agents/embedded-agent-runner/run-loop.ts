@@ -1,4 +1,3 @@
-/** Prepared embedded-agent loop. */
 import { OPENCLAW_EMBEDDED_CONTEXT_ENGINE_HOST } from "../../context-engine/host-compat.js";
 import { resolveContextEngineOwnerPluginId } from "../../context-engine/registry.js";
 import { buildContextEngineRuntimeSettings } from "../../context-engine/runtime-settings.js";
@@ -19,6 +18,7 @@ import { drainPendingContextEngineTurnsBeforeRun } from "../harness/context-engi
 import { resolveToolLoopDetectionConfig } from "../tool-loop-detection-config.js";
 import { normalizeUsage } from "../usage.js";
 import { log } from "./logger.js";
+import type { EmbeddedPluginRuntimeRefresh } from "./plugin-runtime-refresh.js";
 import {
   createPostCompactionLoopGuard,
   PostCompactionLoopPersistedError,
@@ -65,6 +65,7 @@ import type { EmbeddedAgentRunResult, TraceAttempt } from "./types.js";
 import { createUsageAccumulator } from "./usage-accumulator.js";
 
 export async function runPreparedEmbeddedLoop(
+  refresh: EmbeddedPluginRuntimeRefresh,
   input: PreparedEmbeddedRunInput,
 ): Promise<EmbeddedAgentRunResult> {
   let { runParams: params, provider, modelId } = input;
@@ -77,7 +78,6 @@ export async function runPreparedEmbeddedLoop(
     fallbackConfigured,
     isProbeSession,
     resolvedSessionKey,
-    resolvedToolResultFormat,
     startedAtMs: started,
     startupStages,
     lifecycleGeneration,
@@ -145,37 +145,12 @@ export async function runPreparedEmbeddedLoop(
     } = preparedRuntime.snapshot());
   };
   const traceAttempts: TraceAttempt[] = [];
-  const traceAttemptUsesFallback = (attempt: TraceAttempt): boolean =>
-    attempt.result === "rotate_profile" || attempt.result === "fallback_model";
-  const resolveRuntimeFallbackReason = (): string | null => {
-    const fallbackAttempt = traceAttempts.findLast(
+  const resolveRuntimeFallbackReason = (): string | null =>
+    traceAttempts.findLast(
       (attempt) => attempt.result === "fallback_model" && typeof attempt.reason === "string",
-    );
-    return fallbackAttempt?.reason ?? lastRetryFailoverReason ?? null;
-  };
-  const buildEmbeddedContextEngineRuntimeSettings = (settingsParams: {
-    tokenBudget?: number | null;
-    maxOutputTokens?: number | null;
-    degradedReason?: string | null;
-  }) => {
-    return buildContextEngineRuntimeSettings({
-      contextEngineHost: OPENCLAW_EMBEDDED_CONTEXT_ENGINE_HOST,
-      provider,
-      requestedModel: preparedRuntime.requestedModelId,
-      resolvedModel: modelId,
-      selectedContextEngineId: contextEngine.info.id,
-      contextEngineSelectionSource: contextEngine.info.id === "legacy" ? "default" : "configured",
-      promptTokenBudget: settingsParams.tokenBudget,
-      maxOutputTokens: settingsParams.maxOutputTokens,
-      fallbackReason: resolveRuntimeFallbackReason(),
-      degradedReason: settingsParams.degradedReason,
-    });
-  };
-  const { sessionAgentId } = resolveSessionAgentIds({
-    sessionKey: params.sessionKey,
-    config: params.config,
-    agentId: params.agentId,
-  });
+    )?.reason ?? lastRetryFailoverReason;
+  const { sessionKey, config, agentId } = params;
+  const { sessionAgentId } = resolveSessionAgentIds({ sessionKey, config, agentId });
   const strictAgenticActive = isStrictAgenticExecutionContractActive({
     config: params.config,
     sessionKey: params.sessionKey,
@@ -239,12 +214,14 @@ export async function runPreparedEmbeddedLoop(
   // for errored turns; stopReason="stop" empty zero-token turns use the
   // visible-answer retry instruction instead.
   let emptyErrorRetries = 0;
-  const sessionPromptState = createEmbeddedRunSessionPromptState({
+  const sessionPromptState = await createEmbeddedRunSessionPromptState({
     runParams: params,
     sessionAgentId,
     resolvedSessionKey,
     lifecycleGeneration,
+    onInterrupt: (reason) => input.laneController.laneTaskAbortController.abort(reason),
   });
+  input.onInitialWriterPrepared(sessionPromptState);
   const originalCompactionTarget = { ...sessionPromptState.sessionTarget };
   const durableCompactionAccounting =
     params.sessionPersistence !== "detached" &&
@@ -279,9 +256,6 @@ export async function runPreparedEmbeddedLoop(
         }),
       { config: params.config },
     ));
-  const ownedContextEngineLease = ownsContextEngineLogicalTurnLease
-    ? contextEngineLogicalTurnLease
-    : undefined;
   selectContextEngineForTranscriptHost({
     lease: contextEngineLogicalTurnLease,
     host: {
@@ -300,9 +274,6 @@ export async function runPreparedEmbeddedLoop(
     sessionTarget: params.sessionTarget,
   });
   const contextEngine = contextEngineLogicalTurnLease.begin().engine;
-  const resolveContextEnginePluginId = () =>
-    contextEngineLogicalTurnLease.effectiveEnginePluginId ??
-    resolveContextEngineOwnerPluginId(contextEngine);
   startupStages.mark("context-engine");
   notifyExecutionPhase("context_engine", { provider, model: modelId });
   try {
@@ -359,6 +330,7 @@ export async function runPreparedEmbeddedLoop(
       }
       params.assistantErrorTranscript?.clear();
       beginRunAttempt(runRetryBudget);
+      params.onAttemptStart?.();
       const runtimeAuthRetry: boolean = authRetryPending;
       authRetryPending = false;
       attemptedThinking.add(thinkLevel);
@@ -434,11 +406,9 @@ export async function runPreparedEmbeddedLoop(
       }
       startupStagesEmitted = dispatch.startupStagesEmitted;
       const { dispatchedAttempt, runtimePlan } = dispatch;
-      failoverRetryController.setTransientRetryBudget(
-        dispatchedAttempt.rawAttempt.providerRetryMaxRetries,
-      );
-      attemptCarryover.apply(dispatchedAttempt.rawAttempt);
-      const normalizedAttempt = await normalizeEmbeddedRunAttempt({
+      failoverRetryController.observeAttempt(dispatchedAttempt.rawAttempt);
+      attemptCarryover.apply(refresh.applyDeliveryState(dispatchedAttempt.rawAttempt));
+      const normalization = {
         runInput: admittedRunInput,
         preparedRuntime,
         dispatchedAttempt,
@@ -453,7 +423,16 @@ export async function runPreparedEmbeddedLoop(
         contextRecoveryState,
         replayState: accumulatedReplayState,
         lastRetryFailoverReason,
-      });
+      };
+      const normalizedAttempt = await normalizeEmbeddedRunAttempt(normalization);
+      const continuation = refresh.continueAfterAttempt(
+        normalization,
+        assertAdmittedActive,
+        turnTaintState.isTainted,
+      );
+      if (continuation) {
+        return continuation;
+      }
       if (normalizedAttempt.action === "complete") {
         return normalizedAttempt.result;
       }
@@ -499,8 +478,22 @@ export async function runPreparedEmbeddedLoop(
         compactionRuntime,
         contextEngine,
         contextRecoveryState,
-        resolveContextEnginePluginId,
-        buildRuntimeSettings: buildEmbeddedContextEngineRuntimeSettings,
+        resolveContextEnginePluginId: () =>
+          contextEngineLogicalTurnLease.effectiveEnginePluginId ??
+          resolveContextEngineOwnerPluginId(contextEngine),
+        buildRuntimeSettings: (settingsParams) =>
+          buildContextEngineRuntimeSettings({
+            contextEngineHost: OPENCLAW_EMBEDDED_CONTEXT_ENGINE_HOST,
+            provider,
+            requestedModel: preparedRuntime.requestedModelId,
+            resolvedModel: modelId,
+            selectedContextEngineId: contextEngine.info.id,
+            contextEngineSelectionSource:
+              contextEngine.info.id === "legacy" ? "default" : "configured",
+            promptTokenBudget: settingsParams.tokenBudget,
+            fallbackReason: resolveRuntimeFallbackReason(),
+            degradedReason: settingsParams.degradedReason,
+          }),
         armPostCompactionGuard: () => postCompactionGuard.armPostCompaction(),
         usageAccumulator,
         lastRunPromptUsage,
@@ -576,6 +569,7 @@ export async function runPreparedEmbeddedLoop(
             attemptCompactionCount,
           },
           terminalBase: {
+            mergeToolMedia: refresh.mergeToolMedia,
             runParams: params,
             provider,
             providerOwner: preparedRuntime.snapshot().providerRuntimeHandle.plugin,
@@ -586,7 +580,7 @@ export async function runPreparedEmbeddedLoop(
             outerContextTokenMeta,
             usageAccumulator,
             contextRecoveryState,
-            resolvedToolResultFormat,
+            resolvedToolResultFormat: input.resolvedToolResultFormat,
           },
           lastRunPromptUsage,
           finalization: {
@@ -698,7 +692,8 @@ export async function runPreparedEmbeddedLoop(
         pluginHarnessOwnsAuthBootstrap,
         reportedModelRef,
         traceAttempts,
-        traceAttemptUsesFallback,
+        traceAttemptUsesFallback: (traceAttempt) =>
+          traceAttempt.result === "rotate_profile" || traceAttempt.result === "fallback_model",
         thinkLevel,
         contextRecoveryState,
       });
@@ -722,7 +717,9 @@ export async function runPreparedEmbeddedLoop(
         durable: durableCompactionAccounting,
         authority: accountingAuthority,
       },
-      ownedContextEngineLease,
+      ownedContextEngineLease: ownsContextEngineLogicalTurnLease
+        ? contextEngineLogicalTurnLease
+        : undefined,
     });
   }
 }

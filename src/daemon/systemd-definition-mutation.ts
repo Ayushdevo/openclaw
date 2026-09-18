@@ -15,7 +15,10 @@ import {
   type GatewayServiceEnv,
   type ServiceDefinitionMutationArtifact,
   type ServiceDefinitionMutationCapability,
+  type SystemdServiceReadBinding,
+  type SystemdServiceReadTarget,
 } from "./service-types.js";
+import { assertGatewayServiceUpdateCurrent } from "./service-update-authority.js";
 import {
   readSystemdServiceExecStart,
   resolveSystemdEnvironmentFilePath,
@@ -87,14 +90,19 @@ async function inspect(
   environment: GatewayServiceEnv,
   timeoutMs?: number,
   requireLoaded = false,
+  systemdReadBinding?: SystemdServiceReadBinding,
 ) {
   const { unit, generated } = resolveMutationTargets(env, environment);
   const snapshots = new Map<string, Snapshot>();
   const fingerprint = new Map<string, string>();
   let shared = new Set<string>();
   let sourcePath: string | undefined;
+  let artifactPath: string | undefined;
   const result = (capability: ServiceDefinitionMutationCapability) => ({
-    capability,
+    capability:
+      capability.kind !== "writable" && capability.artifact === "service-file" && artifactPath
+        ? { ...capability, path: artifactPath }
+        : capability,
     snapshots,
     fingerprint,
     shared,
@@ -105,6 +113,7 @@ async function inspect(
     const command = await readSystemdServiceExecStart(env, {
       requireEffective: true,
       timeoutMs,
+      ...(systemdReadBinding ? { systemdReadBinding } : {}),
       ...(requireLoaded ? { requireLoaded: true } : {}),
     });
     sourcePath = command?.sourcePath;
@@ -137,6 +146,7 @@ async function inspect(
             : "definition-directory";
       const inspected =
         directory && !required ? ((await findExistingAncestor(file)) ?? file) : file;
+      artifactPath = inspected;
       const stat = await fs.lstat(inspected).catch((error: unknown) => {
         if (required || !hasErrnoCode(error, "ENOENT")) {
           throw error;
@@ -183,8 +193,17 @@ async function inspect(
 
 export async function readSystemdDefinitionMutationCapability(
   env: GatewayServiceEnv,
-  options?: { environment?: GatewayServiceEnv; timeoutMs?: number; requireLoaded?: boolean },
+  options?: {
+    environment?: GatewayServiceEnv;
+    timeoutMs?: number;
+    requireLoaded?: boolean;
+    systemdReadBinding?: SystemdServiceReadBinding;
+    systemdReadTarget?: SystemdServiceReadTarget;
+  },
 ): Promise<ServiceDefinitionMutationCapability> {
+  if (options?.systemdReadTarget?.scope === "system") {
+    return { kind: "sealed", reason: "system-owned" };
+  }
   const selected = path.basename(resolveSystemdUnitPath(env));
   const names =
     selected === "openclaw-gateway.service" ? [selected, "openclaw.service"] : [selected];
@@ -221,8 +240,15 @@ export async function readSystemdDefinitionMutationCapability(
     }
   }
   try {
-    return (await inspect(env, options?.environment ?? env, remaining(), options?.requireLoaded))
-      .capability;
+    return (
+      await inspect(
+        env,
+        options?.environment ?? env,
+        remaining(),
+        options?.requireLoaded,
+        options?.systemdReadBinding,
+      )
+    ).capability;
   } catch {
     return { kind: "unknown", reason: "inspection-failed" };
   }
@@ -242,7 +268,9 @@ export async function withSystemdDefinitionMutation<T>(
   assertServiceDefinitionWritable(initial.capability);
   const { unit, generated } = resolveMutationTargets(env, environment);
   // Group-writable umasks must not create directories that inspect() would reject.
+  assertGatewayServiceUpdateCurrent();
   await fs.mkdir(path.dirname(unit), { recursive: true, mode: 0o755 });
+  assertGatewayServiceUpdateCurrent();
   await fs.mkdir(path.dirname(generated), { recursive: true, mode: 0o700 });
   const canonicalTargets = () =>
     Promise.all([unit, generated].map(canonicalPathFromExistingAncestor));
@@ -295,6 +323,7 @@ export async function withSystemdDefinitionMutation<T>(
       try {
         // Keep owner-write during preparation so the descriptor can be reopened
         // even when the final snapshot mode is read-only.
+        assertGatewayServiceUpdateCurrent();
         await fs.writeFile(temporary, contents, { flag: "wx", mode: mode | 0o200 });
         const temporaryHandle = await fs.open(temporary, constants.O_WRONLY | constants.O_NOFOLLOW);
         try {
@@ -308,6 +337,7 @@ export async function withSystemdDefinitionMutation<T>(
         await refresh(true);
         // Locks coordinate OpenClaw writers, not external editors: POSIX rename
         // has no expected-inode check. Quiesce administrative edits during installation.
+        assertGatewayServiceUpdateCurrent();
         await fs.rename(temporary, file);
         // Re-read every artifact against this inode/payload. Canonical temp paths
         // keep cleanup in the original directory even if the publication alias moves.
@@ -357,6 +387,7 @@ export async function withSystemdDefinitionMutation<T>(
         await publish(file, snapshot.contents, snapshot.mode, false);
       } else {
         await refresh(true);
+        assertGatewayServiceUpdateCurrent();
         await fs.unlink(file);
         initial.fingerprint.set(file, "missing");
         await refresh(true);

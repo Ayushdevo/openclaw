@@ -31,6 +31,7 @@ import {
   tryAcquireCronRunSlots,
 } from "./run-admission.js";
 import { skipCronJobsWithoutOwners } from "./run-owner.js";
+import { emitInterruptedCronRun } from "./run-recovery-events.js";
 import {
   recomputeUnownedCronSchedules,
   recoverNonTerminalCronRunReceipts,
@@ -203,6 +204,9 @@ async function onAdmittedTimer(state: CronServiceState) {
       }
       if (leaseRecovery.repaired) {
         await ensureLoaded(state, { forceReload: true, skipRecompute: true });
+      }
+      for (const interrupted of leaseRecovery.interruptedRuns) {
+        emitInterruptedCronRun(state, interrupted);
       }
       const dueCheckNow = state.deps.nowMs();
       const due = skipCronJobsWithoutOwners(
@@ -556,14 +560,6 @@ async function onAdmittedTimer(state: CronServiceState) {
         if (reaperAgentIds.size > 0) {
           const nowMs = state.deps.nowMs();
           for (const agentId of reaperAgentIds) {
-            if (state.deps.isAgentAvailable?.(agentId) === false) {
-              if (!state.reportedUnavailableReaperAgentIds.has(agentId)) {
-                state.reportedUnavailableReaperAgentIds.add(agentId);
-                state.deps.log.debug({ agentId }, "cron-reaper: skipped unavailable agent");
-              }
-              continue;
-            }
-            state.reportedUnavailableReaperAgentIds.delete(agentId);
             const storePath = state.deps.resolveSessionStorePath
               ? state.deps.resolveSessionStorePath(agentId)
               : state.deps.sessionStorePath;
@@ -575,6 +571,7 @@ async function onAdmittedTimer(state: CronServiceState) {
                 agentId,
                 cronConfig: state.deps.cronConfig,
                 sessionStorePath: storePath,
+                isAgentAvailable: state.deps.isAgentAvailable,
                 nowMs,
                 log: state.deps.log,
               });

@@ -20,6 +20,22 @@ This directory owns Control UI-specific guidance that should not live in the rep
 - Background updates may refresh their own scoped cache; they must not replace
   the foreground selection or publish another context's state into its view.
 
+## Session Roster Refresh
+
+- The session capability applies nested Gateway row snapshots to existing active
+  primary-roster members through the shared reconciler. Lifecycle snapshots do
+  not create membership; mutation reasons, archive changes, missing snapshots,
+  and Gateway-owned membership filters still require an authoritative list read.
+- `lib/sessions/event-refresh-coordinator.ts` owns automatic refresh pacing:
+  debounce the first event after idle by 200 ms, coalesce continuous events within
+  one second, and after each automatic refresh wait three times its duration
+  (at least one second, at most 15 seconds) before the next automatic read.
+  Trailing invalidation stays with that owner, including while a request is pending.
+- Explicit refreshes, filter/agent changes, reconnects, and foreground replacements
+  bypass event backoff and absorb pending invalidation. Recheck visibility and
+  current intent after background admission; hidden pages retain one catch-up
+  refresh until visible.
+
 ## i18n Rules
 
 - Foreign-language files in `ui/src/i18n/locales/*.ts` are stable, source-owned lazy-module adapters; their translations are generated from canonical grouped memory in `ui/src/i18n/.i18n/*.tm.jsonl`.
@@ -76,4 +92,5 @@ This directory owns Control UI-specific guidance that should not live in the rep
 
 ## Visual Proof
 
+- For substantial UI design changes, follow the [Control UI E2E skill's UI stress test](../.agents/skills/control-ui-e2e/SKILL.md#ui-stress-test) to review states in an HTML gallery and collect feedback per example.
 - Visual proofs never include the Discord invitation card: the mock and E2E harness seed its canonical browser dismissal before rendering. Dedicated invitation behavior tests may opt into a fresh visitor with `communityInviteDismissed: false`, but do not capture invitation screenshots or videos.

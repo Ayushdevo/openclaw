@@ -35,7 +35,12 @@ function runGatesBash(
         `source '${repoRoot}/scripts/pr-lib/common.sh'`,
         `source '${repoRoot}/scripts/pr-lib/gates.sh'`,
         "mark_pr_operation_side_effects_started() { :; }",
-        ...(options.sourcePush ? [`source '${repoRoot}/scripts/pr-lib/push.sh'`] : []),
+        ...(options.sourcePush
+          ? [
+              `source '${repoRoot}/scripts/pr-lib/worktree.sh'`,
+              `source '${repoRoot}/scripts/pr-lib/push.sh'`,
+            ]
+          : []),
         ...(options.sourcePrepareCore
           ? [`source '${repoRoot}/scripts/pr-lib/prepare-core.sh'`]
           : ["refresh_prep_branch_for_reviewed_head() { :; }"]),
@@ -261,12 +266,14 @@ function runPublisher(
   return runGatesBash(
     [
       `remote='${f.remote}'`,
+      'repo_root() { printf "%s\\n" "$PWD"; }',
       `enter_worktree() { PR_MAIN_SHA=${f.base}; }`,
       'resolve_head_push_url() { printf "%s\\n" "$remote"; }',
       'resolve_contributor_coauthor_email() { printf "fixture@example.invalid\\n"; }',
       'remote_head() { command git --git-dir="$remote" rev-parse refs/heads/topic; }',
       "gh() {",
       '  case "$*" in',
+      '    *headRepository*) jq -nc --arg sha "$(remote_head)" \'{headRefName:"topic",headRefOid:$sha,headRepository:{nameWithOwner:"fixture/repo"},headRepositoryOwner:{login:"fixture"}}\';;',
       '    *headRefName*) printf \'{"headRefName":"topic"}\\n\';;',
       "    *headRefOid*) remote_head;;",
       '    *) echo "unexpected GitHub request" >&2; return 98;;',
@@ -371,9 +378,11 @@ describe("PR publication ownership", () => {
           : [
               "git() {",
               '  if [ "$1" = push ]; then echo push >> .local/events; fi',
-              '  if [ "$1" = fetch ]; then',
-              `    command git --git-dir="$remote" update-ref refs/heads/topic ${f.sameTree}`,
-              "  fi",
+              '  for arg in "$@"; do',
+              '    if [ "$arg" = fetch ]; then',
+              `      command git --git-dir="$remote" update-ref refs/heads/topic ${f.sameTree}`,
+              "    fi",
+              "  done",
               '  command git "$@"',
               "}",
             ],
@@ -753,6 +762,7 @@ describe("prepare gate changed-file plan", () => {
         "  PREPARE_GATE_CHANGED_FILES=$'CHANGELOG.md\\nchangelog/fragments/stale.md'",
         "  PREPARE_GATE_DOCS_ONLY=true",
         "  PREPARE_GATE_CHANGELOG_ONLY=false",
+        "  PREPARE_GATE_CHANGELOG_UPDATE=true",
         "  PREPARE_GATE_CHANGELOG_REQUIRED=false",
         "}",
         "prepare_gates 4242",
@@ -856,50 +866,6 @@ describe("remote testbox gate delegation", () => {
     const result = runGatesBash(`require_remote_testbox_gate_stamp '${log}'`);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("no successful blacksmith-testbox timing stamp");
-  });
-});
-
-describe("prepare review readiness", () => {
-  it("rejects invalid review artifacts before any preparation side effects", () => {
-    const repoDir = tempDirs.make("openclaw-pr-prepare-invalid-review-");
-    mkdirSync(join(repoDir, ".local"));
-    const result = runGatesBash(
-      [
-        "review_validate_artifacts() { echo 'invalid review artifacts'; return 1; }",
-        "require_ready_review_recommendation() { touch .local/readiness-called; }",
-        "mark_pr_operation_side_effects_started() { touch .local/side-effects; }",
-        "enter_worktree() { touch .local/worktree-entered; }",
-        "prepare_init 4242",
-      ].join("\n"),
-      { cwd: repoDir, sourcePrepareCore: true },
-    );
-
-    expect(result.status).toBe(1);
-    expect(result.stdout).toContain("invalid review artifacts");
-    expect(existsSync(join(repoDir, ".local", "readiness-called"))).toBe(false);
-    expect(existsSync(join(repoDir, ".local", "side-effects"))).toBe(false);
-    expect(existsSync(join(repoDir, ".local", "worktree-entered"))).toBe(false);
-  });
-
-  it("rejects a non-ready review before taking the operation lock past validation", () => {
-    const repoDir = tempDirs.make("openclaw-pr-prepare-not-ready-");
-    mkdirSync(join(repoDir, ".local"));
-    const result = runGatesBash(
-      [
-        "review_validate_artifacts() { touch .local/review-validated; }",
-        "require_ready_review_recommendation() { echo 'review is not ready'; return 1; }",
-        "mark_pr_operation_side_effects_started() { touch .local/side-effects; }",
-        "enter_worktree() { touch .local/worktree-entered; }",
-        "prepare_init 4242",
-      ].join("\n"),
-      { cwd: repoDir, sourcePrepareCore: true },
-    );
-
-    expect(result.status).toBe(1);
-    expect(result.stdout).toContain("review is not ready");
-    expect(existsSync(join(repoDir, ".local", "review-validated"))).toBe(true);
-    expect(existsSync(join(repoDir, ".local", "side-effects"))).toBe(false);
-    expect(existsSync(join(repoDir, ".local", "worktree-entered"))).toBe(false);
   });
 });
 
@@ -1214,6 +1180,161 @@ describe("fork publication transport", () => {
 
 describe("prepare gate stamp transitions", () => {
   it.each([
+    {
+      name: "exact-head proof",
+      evidence: "exact",
+      incorporated: true,
+      mainPath: "src/subject.ts",
+      readable: true,
+      expected: 0,
+      diagnostic: "",
+    },
+    {
+      name: "scheduled recent-parent evidence",
+      evidence: "recent-parent",
+      incorporated: false,
+      mainPath: "src/subject.ts",
+      readable: true,
+      expected: 0,
+      diagnostic: "",
+    },
+    {
+      name: "unchanged base despite relevant later main changes",
+      evidence: "reuse",
+      incorporated: false,
+      mainPath: "src/subject.ts",
+      readable: true,
+      expected: 0,
+      diagnostic: "",
+    },
+    {
+      name: "incorporated disjoint main changes",
+      evidence: "reuse",
+      incorporated: true,
+      mainPath: "src/unrelated.ts",
+      readable: true,
+      expected: 0,
+      diagnostic: "",
+    },
+    {
+      name: "incorporated overlapping source changes",
+      evidence: "reuse",
+      incorporated: true,
+      mainPath: "src/subject.ts",
+      readable: true,
+      expected: 1,
+      diagnostic: "Hosted CI reuse declined",
+    },
+    {
+      name: "incorporated test shard ownership changes",
+      evidence: "reuse",
+      incorporated: true,
+      mainPath: "test/tsconfig/tsconfig.core.test.agents-tools.json",
+      readable: true,
+      expected: 1,
+      diagnostic: "Hosted CI reuse declined",
+    },
+    {
+      name: "unreadable incorporated change facts",
+      evidence: "reuse",
+      incorporated: true,
+      mainPath: "src/unrelated.ts",
+      readable: false,
+      expected: 1,
+      diagnostic: "unable to evaluate mainline input changes",
+    },
+  ])(
+    "qualifies selected hosted CI reuse: $name",
+    ({ evidence, incorporated, mainPath, readable, expected, diagnostic }) => {
+      const dir = tempDirs.make("openclaw-pr-reuse-context-");
+      mkdirSync(join(dir, ".local"));
+      const currentHead = "1".repeat(40);
+      const reusedHead = "2".repeat(40);
+      const reusedBase = "3".repeat(40);
+      const mainSha = "4".repeat(40);
+      const currentBase = incorporated ? "5".repeat(40) : reusedBase;
+      const remote = { headRefName: "topic", headRefOid: currentHead, isCrossRepository: false };
+      writeFileSync(
+        join(dir, ".local", "gates-hosted-checks.json"),
+        JSON.stringify({
+          headSha: currentHead,
+          ...(evidence === "reuse" ? { reusedFromSha: reusedHead } : {}),
+          ...(evidence === "recent-parent" ? { evidenceHeadSha: reusedHead } : {}),
+        }),
+      );
+      writeFileSync(join(dir, "main-paths.txt"), mainPath + "\n");
+      writeFileSync(join(dir, "incorporated-paths.txt"), incorporated ? mainPath + "\n" : "");
+      writeFileSync(join(dir, "prepared-paths.txt"), "src/subject.ts\n");
+      const result = runGatesBash(
+        `
+source '${repoRoot}/scripts/pr-lib/merge.sh'
+PR_MAIN_SHA=${mainSha}
+gh() { printf '%s\\n' 'example/project'; }
+run_quiet_logged() { return 0; }
+git() {
+  case "$*" in
+    "rev-parse ${currentHead}^") return 1 ;;
+    "merge-base ${mainSha} ${reusedHead}") printf '%s\\n' ${reusedBase} ;;
+    "merge-base ${mainSha} ${currentHead}") printf '%s\\n' ${currentBase} ;;
+    "cat-file -e ${reusedBase}^{commit}"|"cat-file -e ${reusedHead}^{commit}") return 0 ;;
+    "diff --name-only ${reusedBase}..${mainSha}") cat main-paths.txt; return ${readable ? 0 : 1} ;;
+    "diff --name-only ${reusedBase}..${currentBase}") cat incorporated-paths.txt; return ${readable ? 0 : 1} ;;
+    "diff --name-only ${reusedBase}..${reusedHead}") cat prepared-paths.txt ;;
+    *) echo "unexpected fixture Git query: $*" >&2; return 99 ;;
+  esac
+}
+if run_hosted_prepare_gates 42 ${currentHead} false '${JSON.stringify(remote)}'; then
+  exit 0
+else
+  exit 1
+fi
+`,
+        { cwd: dir, env: { TMPDIR: dir } },
+      );
+      const output = result.stdout + result.stderr;
+      expect(result.status, output).toBe(expected);
+      if (diagnostic) {
+        expect(output).toContain(diagnostic);
+      }
+    },
+  );
+
+  it("does not stamp declined hosted proof in a conditional caller", () => {
+    const dir = tempDirs.make("openclaw-pr-declined-proof-");
+    mkdirSync(join(dir, ".local"));
+    writeFileSync(join(dir, ".local", "pr-meta.env"), "PR_AUTHOR=fixture\n");
+    const result = runGatesBash(
+      `
+enter_worktree() { PR_MAIN_SHA=fixture-main; }
+checkout_prep_branch() { :; }
+derive_prepare_gate_change_plan() {
+  PREPARE_GATE_CHANGED_FILES=src/subject.ts
+  PREPARE_GATE_DOCS_ONLY=false
+  PREPARE_GATE_CHANGELOG_ONLY=false
+  PREPARE_GATE_CHANGELOG_UPDATE=false
+  PREPARE_GATE_CHANGELOG_REQUIRED=false
+}
+git() {
+  case "$*" in
+    "rev-parse HEAD") printf '%s\\n' fixture-head ;;
+    *) echo "unexpected fixture Git query: $*" >&2; return 99 ;;
+  esac
+}
+run_hosted_prepare_gates() { echo 'fixture context declined'; return 1; }
+if prepare_gates 42; then
+  exit 0
+else
+  exit 1
+fi
+`,
+      { cwd: dir, env: { OPENCLAW_TESTBOX: "1" } },
+    );
+    expect(result.status, result.stdout + result.stderr).toBe(1);
+    expect(result.stdout).toContain("fixture context declined");
+    expect(existsSync(join(dir, ".local", "gates.env"))).toBe(false);
+  });
+
+  it.each([
     ["CHANGELOG.md", true],
     ["changed.ts", false],
   ])("derives recent parent evidence for a %s commit: %s", (path, expected) => {
@@ -1229,6 +1350,10 @@ describe("prepare gate stamp transitions", () => {
       cwd: repoDir,
       encoding: "utf8",
     }).stdout.trim();
+    writeFileSync(
+      join(repoDir, ".local", "gates-hosted-checks.json"),
+      JSON.stringify({ headSha: currentHead }),
+    );
     const result = runGatesBash(
       [
         `gh() { if [ "$1" = pr ]; then printf '{"headRefName":"topic","headRefOid":"${currentHead}","isCrossRepository":false}\\n'; else printf 'openclaw/openclaw\\n'; fi; }`,

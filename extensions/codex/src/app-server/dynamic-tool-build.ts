@@ -4,10 +4,12 @@
  * and provider allowlist normalization.
  */
 import {
+  applyEmbeddedAttemptToolsAllow,
   buildAgentHookContextChannelFields,
   buildEmbeddedAttemptToolRunContext,
   embeddedAgentLog,
   filterProviderNormalizableTools,
+  getPluginToolMeta,
   isHostScopedAgentToolActive,
   isSubagentSessionKey,
   normalizeAgentRuntimeTools,
@@ -29,6 +31,7 @@ import {
   formatStageTimings,
   type StageTimingSummary,
 } from "openclaw/plugin-sdk/time-runtime";
+import { CODEX_NATIVE_TOOL_REQUIREMENTS } from "../../native-tool-policy.js";
 import {
   isCodexRemoteExecPlacementSandbox,
   readCodexPluginConfig,
@@ -76,14 +79,6 @@ type OpenClawSandboxContext = Awaited<ReturnType<typeof resolveSandboxContext>>;
 type CodexDynamicToolBuildEvent = Parameters<
   NonNullable<EmbeddedRunAttemptParams["onAgentEvent"]>
 >[0];
-const CODEX_NATIVE_SANDBOX_TOOL_REQUIREMENTS = [
-  "exec",
-  "process",
-  "read",
-  "write",
-  "edit",
-  "apply_patch",
-] as const;
 const CODEX_MEMORY_FLUSH_DYNAMIC_TOOL_ALLOW = new Set(["read", "write"]);
 const CODEX_DISABLED_NATIVE_SHELL_DYNAMIC_TOOLS = new Set([
   "exec",
@@ -260,6 +255,7 @@ export async function buildDynamicTools(
     nativeToolSurfaceEnabled: input.nativeToolSurfaceEnabled,
     nativeProviderWebSearchSupport: input.nativeProviderWebSearchSupport,
   });
+  const messageToolProvider = resolveCodexMessageToolProvider(params);
   const webFetchHostnameAllowlistRef: { value?: string[] } = {};
   const toolConstructionPlan = resolveCodexNodePlacementToolConstructionPlan(
     input.sandbox,
@@ -281,16 +277,13 @@ export async function buildDynamicTools(
       : undefined,
     sandbox: input.sandbox,
     ...(toolConstructionPlan ? { toolConstructionPlan } : {}),
-    messageProvider: resolveCodexMessageToolProvider(params),
+    messageProvider: messageToolProvider,
     toolPolicyMessageProvider: params.messageProvider ?? params.messageChannel,
     // Codex dispatches dynamic tools itself, so no tool-start handler reserves a
     // blocking question's prompt. Hand the tools this run's own way to show one.
     ...(params.onToolResult
       ? {
-          questionPrompt: {
-            send: params.onToolResult,
-            ...(params.messageChannel ? { messageChannel: params.messageChannel } : {}),
-          },
+          questionPrompt: { send: params.onToolResult, messageChannel: messageToolProvider },
         }
       : {}),
     inputProvenance: params.inputProvenance,
@@ -460,7 +453,7 @@ export async function buildDynamicTools(
       agentId: input.policyAgentId,
       sessionKey: input.sandboxSessionKey,
       sandboxToolPolicy: input.sandbox?.tools,
-      messageProvider: resolveCodexMessageToolProvider(params),
+      messageProvider: messageToolProvider,
       agentAccountId: params.agentAccountId,
       groupId: params.groupId,
       groupChannel: params.groupChannel,
@@ -701,9 +694,7 @@ function canCodexAppServerNativeToolSurfaceHonorSandbox(
 function canSandboxToolPolicyExposeCodexNativeToolSurface(sandbox: {
   tools: Parameters<typeof isToolAllowed>[0];
 }): boolean {
-  return CODEX_NATIVE_SANDBOX_TOOL_REQUIREMENTS.every((toolName) =>
-    isToolAllowed(sandbox.tools, toolName),
-  );
+  return CODEX_NATIVE_TOOL_REQUIREMENTS.every((toolName) => isToolAllowed(sandbox.tools, toolName));
 }
 function isCodexMemoryFlushRun(
   params?: Pick<EmbeddedRunAttemptParams, "trigger" | "memoryFlushWritePath">,
@@ -908,33 +899,22 @@ function placeDisabledNativeShellToolsInDirectNamespace<
   return tools;
 }
 /** Applies a normalized tool allowlist while preserving shell aliases for exec/process. */
-function filterCodexDynamicToolsForAllowlist<T extends { name: string }>(
+function filterCodexDynamicToolsForAllowlist<T extends OpenClawDynamicTool>(
   tools: T[],
   toolsAllow?: string[],
 ): T[] {
-  if (!toolsAllow) {
-    return tools;
-  }
-  if (toolsAllow.length === 0) {
-    return [];
-  }
-  if (hasWildcardCodexToolsAllow(toolsAllow)) {
-    return tools;
-  }
-  const allowSet = new Set(
-    toolsAllow.map((name) => normalizeCodexDynamicToolName(name)).filter(Boolean),
-  );
-  return tools.filter((tool) => {
-    const normalized = normalizeCodexDynamicToolName(tool.name);
-    return (
-      allowSet.has(normalized) ||
-      (normalized === "sandbox_exec" && allowSet.has("exec")) ||
-      (normalized === "sandbox_process" && (allowSet.has("exec") || allowSet.has("process"))) ||
-      (normalized === CODEX_GATEWAY_EXEC_DYNAMIC_TOOL_NAME && allowSet.has("exec")) ||
-      (normalized === CODEX_GATEWAY_PROCESS_DYNAMIC_TOOL_NAME &&
-        (allowSet.has("exec") || allowSet.has("process"))) ||
-      (normalized === CODEX_NODE_EXEC_DYNAMIC_TOOL_NAME && allowSet.has("exec"))
-    );
+  return applyEmbeddedAttemptToolsAllow(tools, toolsAllow, {
+    toolMeta: getPluginToolMeta,
+    toolAliases: (tool) => {
+      const normalized = normalizeCodexDynamicToolName(tool.name);
+      return normalized === "sandbox_exec" ||
+        normalized === CODEX_GATEWAY_EXEC_DYNAMIC_TOOL_NAME ||
+        normalized === CODEX_NODE_EXEC_DYNAMIC_TOOL_NAME
+        ? ["exec"]
+        : normalized === "sandbox_process" || normalized === CODEX_GATEWAY_PROCESS_DYNAMIC_TOOL_NAME
+          ? ["exec", "process"]
+          : [];
+    },
   });
 }
 /** Detects the wildcard allowlist marker after Codex tool-name normalization. */

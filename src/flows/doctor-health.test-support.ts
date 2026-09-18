@@ -160,6 +160,37 @@ vi.mock("./doctor-health-contributions.js", () => ({
 
 export { mocks };
 
+export const doctorServiceInspectionCases = [
+  "inspection-failed",
+  "runtime-only",
+  "owned-unknown",
+  "foreign-running",
+  "foreign-unknown",
+  "foreign-stopped",
+  "foreign-stopped-loaded",
+  "foreign-stopped-loaded-disabled",
+  "foreign-stopped-loaded-unknown",
+  "foreign-respawning",
+  "unresolved-running",
+  "unresolved-unknown",
+  "unresolved-stopped",
+  "unresolved-stopped-loaded",
+  "unresolved-respawning",
+  "absent",
+  "absent-unknown",
+  "absent-busy-port",
+  "absent-unknown-port",
+  "windows-ready",
+  "windows-disabled",
+  "windows-queued",
+  "windows-running",
+  "windows-startup-stopped",
+  "windows-startup-unknown",
+].flatMap((kind) => [
+  { kind, updateParent: false },
+  { kind, updateParent: true },
+]);
+
 export function seedMaintenanceStartupFailure(openDatabase: () => OpenClawStateDatabase) {
   openDatabase().db.exec(
     "INSERT INTO gateway_boot_lifecycle (boot_id, pid, started_at_ms, completed_at_ms, outcome, startup_reason) VALUES ('maintenance', 1, 1, 2, 'startup_failed', 'gateway.maintenance_required')",
@@ -220,6 +251,21 @@ export function registerDoctorConfigReceiptTests(
               ? postInstallAdvisory
               : { status: outcome === "error" ? "error" : "ok" }),
             configHash: expectedHash,
+            ...(outcome === "error"
+              ? {
+                  failureFacts: [
+                    { check: "doctor", code: "doctor-failed", message: failure.message },
+                  ],
+                }
+              : {}),
+            ...(outcome === "unchanged"
+              ? {}
+              : {
+                  configChanges: [
+                    { kind: "key", key: "gateway" },
+                    { kind: "key", key: "meta" },
+                  ],
+                }),
             ...(outcome === "unchanged" || outcome === "interleaved"
               ? {}
               : { configInputHash: expectedInputHash }),
@@ -279,4 +325,44 @@ export function registerDoctorConfigReceiptTests(
       }
     },
   );
+  it("reports a cron ownership refusal instead of a recoverable post-install advisory", async () => {
+    mocks.runContributions.mockImplementation(async (ctx) => {
+      ctx.configWriteRefusal = "cron-owner-safety";
+      ctx.postInstallDoctorResult = postInstallAdvisory;
+    });
+    const runtime = {
+      log: vi.fn(),
+      error: vi.fn(),
+      exit: vi.fn(),
+    };
+    vi.stubEnv(
+      "OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH",
+      "/tmp/openclaw-update-doctor-result.json",
+    );
+
+    try {
+      await runDoctorHealthFlow(runtime, {});
+    } finally {
+      vi.unstubAllEnvs();
+    }
+
+    expect(mocks.outro).toHaveBeenCalledWith("Doctor finished, but config fixes were not applied.");
+    expect(mocks.outro).not.toHaveBeenCalledWith("Doctor complete.");
+    expect(runtime.exit).toHaveBeenCalledWith(1);
+    expect(runtime.exit).not.toHaveBeenCalledWith(86);
+    expect(mocks.writeUpdatePostInstallDoctorResult).toHaveBeenCalledWith({
+      resultPath: "/tmp/openclaw-update-doctor-result.json",
+      result: {
+        status: "error",
+        configHash: "unchanged",
+        failureFacts: [
+          {
+            check: "config-write",
+            code: "cron-owner-safety",
+            message: "Doctor config fixes were not applied.",
+          },
+        ],
+      },
+    });
+  });
 }

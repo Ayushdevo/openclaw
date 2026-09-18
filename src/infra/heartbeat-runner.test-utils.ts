@@ -16,7 +16,10 @@ import { writeCronJobScratch } from "../cron/scratch-store.js";
 import { CronService } from "../cron/service.js";
 import { resolveCronJobsStorePath } from "../cron/store.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
-import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
+import {
+  closeOpenClawStateDatabaseAsync,
+  closeOpenClawStateDatabaseForTest,
+} from "../state/openclaw-state-db.js";
 import { createTestRegistry } from "../test-utils/channel-plugins.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import { withTempDir } from "../test-utils/temp-dir.js";
@@ -181,6 +184,7 @@ export async function withTempHeartbeatSandbox<T>(
         return await fn({ tmpDir, storePath, replySpy });
       } finally {
         replySpy.mockReset();
+        await closeOpenClawStateDatabaseAsync();
         closeOpenClawStateDatabaseForTest();
       }
     });
@@ -233,3 +237,22 @@ export const getFirstReplyContext = (replySpy: ReturnType<typeof vi.fn>): Heartb
   }
   return ctx as HeartbeatReplyContext;
 };
+
+/** Create the five-minute, wildcard-channel fixture shared by heartbeat tests. */
+export function heartbeatTestConfig(
+  workspace: string,
+  target: "whatsapp" | "telegram" | "last" | "none",
+  channel: "whatsapp" | "telegram",
+  storePath: string,
+): OpenClawConfig {
+  return {
+    agents: {
+      defaults: {
+        workspace,
+        heartbeat: { every: "5m", target },
+      },
+    },
+    channels: { [channel]: { allowFrom: ["*"] } },
+    session: { store: storePath },
+  };
+}

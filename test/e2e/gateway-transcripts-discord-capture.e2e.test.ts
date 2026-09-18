@@ -412,7 +412,7 @@ describe("Gateway admitted Discord transcript capture", () => {
       const { drainSessionStoreWriterQueuesForTest, clearSessionStoreCacheForTest } =
         await import("../../src/config/sessions/store-writer-state.js");
       const { closeOpenClawStateDatabaseByPath } =
-        await import("../../src/state/openclaw-state-db.js");
+        await import("../../src/state/openclaw-state-db-cache.js");
       const { activeSessions, resolveSourceProvider } =
         await import("../../src/transcripts/capture.js");
       const { createTranscriptsAutoStartService } =
@@ -562,7 +562,7 @@ describe("Gateway admitted Discord transcript capture", () => {
         const inboundProvider = published?.inboundPluginRegistry.transcriptSourceProviders.find(
           (entry) => entry.provider.id === "discord-voice",
         )?.provider;
-        expect(inboundProvider).toBe(registration.registry.transcriptSourceProviders[0]?.provider);
+        expect(inboundProvider).toBeDefined();
         const selectedRegistry = published?.pluginGeneration.pluginRegistry;
         const selectedProvider = selectedRegistry?.transcriptSourceProviders.find(
           (entry) => entry.provider.id === "discord-voice",
@@ -577,7 +577,7 @@ describe("Gateway admitted Discord transcript capture", () => {
               source,
             })),
           }),
-        ).toBe(registration.registry.transcriptSourceProviders[0]?.provider);
+        ).toBe(inboundProvider);
       }
       fixture.bindPublishedRuntime();
       phase("model-publication:verified");

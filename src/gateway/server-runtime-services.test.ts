@@ -20,7 +20,6 @@ import {
   createLog,
   createMaintenanceHandles,
   createPostReadyMaintenanceScheduleParams,
-  createTestCron,
   createTestCronReconciliation,
   createTestCronState,
   runtimeServiceMocks as hoisted,
@@ -92,9 +91,7 @@ describe("server-runtime-services", () => {
       cfgAtStart,
       deps: {} as never,
       sessionDeliveryRecoveryMaxEnqueuedAt: 123,
-      cronState: createTestCronState(createTestCron(), false),
-      cronReconciliation: createTestCronReconciliation(),
-      logCron: { error: vi.fn() },
+      cronEnabled: false,
       log: {
         child: vi.fn(() => ({ info: vi.fn(), warn, error: vi.fn() })),
         error: vi.fn(),
@@ -252,17 +249,16 @@ describe("server-runtime-services", () => {
     await waitForFast(() => expect(getActiveGatewayRootWorkCount()).toBe(0));
   });
 
-  it("activates heartbeat, cron, and delivery recovery after sidecars are ready", async () => {
+  it("activates heartbeat and delivery recovery after sidecars are ready", async () => {
     vi.useFakeTimers();
     const log = createLog();
     const resolveGatewayContext = () => undefined;
-    const { cronStart, services } = activateScheduledServicesForTest({
+    const { services } = activateScheduledServicesForTest({
       log,
       resolveGatewayContext,
     });
 
     expect(hoisted.startHeartbeatRunner).toHaveBeenCalledTimes(1);
-    expect(cronStart).toHaveBeenCalledTimes(1);
     expect(services.heartbeatRunner.updateConfig).toBe(hoisted.heartbeatRunner.updateConfig);
     await vi.advanceTimersByTimeAsync(1_250);
     await vi.dynamicImportSettled();
@@ -273,37 +269,50 @@ describe("server-runtime-services", () => {
     if (!deliveryLog || !sessionDeliveryLog) {
       throw new Error("Expected delivery recovery log children");
     }
-    expect(hoisted.recoverPendingDeliveries).toHaveBeenCalledWith({
-      deliver: expect.any(Function),
-      cfg: {},
-      log: deliveryLog,
-      shouldContinue: expect.any(Function),
-    });
+    expect(hoisted.recoverPendingDeliveries).toHaveBeenCalledWith(
+      {
+        deliver: expect.any(Function),
+        cfg: {},
+        log: deliveryLog,
+        shouldContinue: expect.any(Function),
+      },
+      expect.any(Function),
+    );
+    const runtimeParams = hoisted.startSessionDeliveryRuntime.mock.calls[0]?.[0];
+    if (!runtimeParams) {
+      throw new Error("Expected the session delivery runtime to start");
+    }
     expect(hoisted.recoverPendingRestartContinuationDeliveries).toHaveBeenCalledWith({
       deps: {},
       maxEnqueuedAt: 123,
+      queueContext: runtimeParams.queueContext,
       log: sessionDeliveryLog,
       resolveGatewayContext,
     });
-    const runtimeParams = hoisted.startSessionDeliveryRuntime.mock.calls[0]?.[0] as
-      | {
-          onSettled?: (
-            entry: { id: string; sessionKey: string },
-            outcome: "recovered",
-          ) => Promise<void>;
-        }
-      | undefined;
     expect(runtimeParams?.onSettled).toBe(hoisted.settleQueuedSessionDelivery);
     await runtimeParams?.onSettled?.(
       {
         id: "settled-delivery-1",
+        kind: "systemEvent",
         sessionKey: "agent:main:cron:job:run:run-1",
+        text: "settled delivery",
+        enqueuedAt: 1,
+        retryCount: 0,
       },
       "recovered",
+      runtimeParams.queueContext,
     );
     expect(hoisted.settleQueuedSessionDelivery).toHaveBeenCalledWith(
-      { id: "settled-delivery-1", sessionKey: "agent:main:cron:job:run:run-1" },
+      {
+        id: "settled-delivery-1",
+        kind: "systemEvent",
+        sessionKey: "agent:main:cron:job:run:run-1",
+        text: "settled delivery",
+        enqueuedAt: 1,
+        retryCount: 0,
+      },
       "recovered",
+      runtimeParams.queueContext,
     );
     expect(hoisted.schedulePendingSessionDeliveries).toHaveBeenCalledTimes(1);
   });
@@ -436,7 +445,7 @@ describe("server-runtime-services", () => {
     if (!fence) {
       throw new Error("Expected restart signal admission fence");
     }
-    const { services, log } = activateScheduledServicesForTest({ startCron: false });
+    const { services, log } = activateScheduledServicesForTest();
     let stopping: Promise<void> | undefined;
     try {
       await vi.advanceTimersByTimeAsync(1_250);
@@ -465,7 +474,7 @@ describe("server-runtime-services", () => {
     if (!fence) {
       throw new Error("Expected restart signal admission fence");
     }
-    const { services } = activateScheduledServicesForTest({ startCron: false });
+    const { services } = activateScheduledServicesForTest();
     try {
       await vi.advanceTimersByTimeAsync(1_250);
       expect(hoisted.startSessionDeliveryRuntime).not.toHaveBeenCalled();
@@ -497,7 +506,7 @@ describe("server-runtime-services", () => {
           ? hoisted.recoverPendingRestartContinuationDeliveries
           : hoisted.schedulePendingSessionDeliveries;
       operation.mockReturnValueOnce(pending.promise);
-      const { services, log } = activateScheduledServicesForTest({ startCron: false });
+      const { services, log } = activateScheduledServicesForTest();
       let stopPromise: Promise<void> | undefined;
       try {
         await vi.advanceTimersByTimeAsync(1_250);
@@ -555,7 +564,7 @@ describe("server-runtime-services", () => {
       await releaseImport.promise;
       return exports;
     });
-    const { services, log } = activateScheduledServicesForTest({ startCron: false });
+    const { services, log } = activateScheduledServicesForTest();
     let stopPromise: Promise<void> | undefined;
     try {
       vi.advanceTimersByTime(1_250);
@@ -604,87 +613,47 @@ describe("server-runtime-services", () => {
     );
   });
 
-  it("can defer cron startup while activating other scheduled services", async () => {
-    vi.useFakeTimers();
-    const cron = { start: vi.fn(async () => undefined) };
-    const log = createLog();
-
-    activateGatewayScheduledServices({
-      minimalTestGateway: false,
-      cfgAtStart: {} as never,
-      deps: {} as never,
-      sessionDeliveryRecoveryMaxEnqueuedAt: 123,
-      cronState: createTestCronState(cron),
-      cronReconciliation: createTestCronReconciliation(),
-      startCron: false,
-      logCron: { error: vi.fn() },
-      log,
-    });
-
-    expect(hoisted.startHeartbeatRunner).toHaveBeenCalledTimes(1);
-    expect(cron.start).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1_250);
-    await vi.dynamicImportSettled();
-    expect(hoisted.recoverPendingDeliveries).toHaveBeenCalledTimes(1);
-  });
-
-  it("runs legacy migration once while clean periodic ticks keep draining canonical work", async () => {
-    vi.useFakeTimers();
-    const { services } = activateScheduledServicesForTest({ startCron: false });
-
-    await vi.dynamicImportSettled();
-    expect(hoisted.migrateLegacyPendingOutboundDeliveries).toHaveBeenCalledOnce();
-    expect(hoisted.recoverPendingDeliveries).toHaveBeenCalledOnce();
-
-    await vi.advanceTimersByTimeAsync(15_000);
-
-    expect(hoisted.migrateLegacyPendingOutboundDeliveries).toHaveBeenCalledOnce();
-    expect(hoisted.recoverPendingDeliveries).toHaveBeenCalledOnce();
-    expect(hoisted.drainPendingDeliveries).toHaveBeenCalledTimes(3);
-    services.heartbeatRunner.stop();
-  });
-
-  it.each([
-    {
-      name: "the pass skipped work",
-      firstPass: { moved: 0, skipped: 1, remaining: 0 },
+  it.each(["clean", "legacy rows", "legacy files"])(
+    "keeps current delivery recovery running with %s while diagnosing legacy state once",
+    async (condition) => {
+      vi.useFakeTimers();
+      const log = createLog();
+      const recoveryLog = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+      log.child.mockReturnValue(recoveryLog);
+      hoisted.countPendingDeliveryQueueEntries.mockReturnValue(condition === "legacy rows" ? 2 : 0);
+      hoisted.listLegacyDeliveryQueueArtifacts.mockReturnValue(
+        condition === "legacy files" ? ["legacy.json"] : [],
+      );
+      const { services } = activateScheduledServicesForTest({ log });
+      await vi.dynamicImportSettled();
+      expect(hoisted.recoverPendingDeliveries).toHaveBeenCalledOnce();
+      if (condition === "clean") {
+        expect(recoveryLog.warn).not.toHaveBeenCalled();
+      } else {
+        expect(recoveryLog.warn).toHaveBeenCalledWith(
+          expect.stringContaining("openclaw doctor --fix"),
+        );
+      }
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(hoisted.countPendingDeliveryQueueEntries).toHaveBeenCalledOnce();
+      expect(hoisted.listLegacyDeliveryQueueArtifacts).toHaveBeenCalledOnce();
+      expect(hoisted.recoverPendingDeliveries).toHaveBeenCalledOnce();
+      expect(hoisted.drainPendingDeliveries).toHaveBeenCalledTimes(3);
+      await services.stopDeliveryRecovery();
+      services.heartbeatRunner.stop();
     },
-    {
-      name: "retired work remains",
-      firstPass: { moved: 0, skipped: 0, remaining: 1 },
-    },
-  ])("retries legacy migration when $name until a clean pass completes", async ({ firstPass }) => {
-    vi.useFakeTimers();
-    hoisted.migrateLegacyPendingOutboundDeliveries
-      .mockResolvedValueOnce(firstPass)
-      .mockResolvedValueOnce({ moved: 1, skipped: 0, remaining: 0 });
-    const { services } = activateScheduledServicesForTest({ startCron: false });
+  );
 
+  it("runs initial recovery again for the next scheduled-service lifecycle", async () => {
+    vi.useFakeTimers();
+    const first = activateScheduledServicesForTest();
     await vi.dynamicImportSettled();
-    expect(hoisted.migrateLegacyPendingOutboundDeliveries).toHaveBeenCalledOnce();
     expect(hoisted.recoverPendingDeliveries).toHaveBeenCalledOnce();
-
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(hoisted.migrateLegacyPendingOutboundDeliveries).toHaveBeenCalledTimes(2);
-    expect(hoisted.recoverPendingDeliveries).toHaveBeenCalledTimes(2);
-    expect(hoisted.drainPendingDeliveries).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(hoisted.migrateLegacyPendingOutboundDeliveries).toHaveBeenCalledTimes(2);
-    expect(hoisted.drainPendingDeliveries).toHaveBeenCalledOnce();
-    services.heartbeatRunner.stop();
-  });
-
-  it("resets legacy migration completion with the scheduled-service lifecycle", async () => {
-    vi.useFakeTimers();
-    const first = activateScheduledServicesForTest({ startCron: false });
-    await vi.dynamicImportSettled();
-    expect(hoisted.migrateLegacyPendingOutboundDeliveries).toHaveBeenCalledOnce();
     await first.services.stopDeliveryRecovery();
-
-    const second = activateScheduledServicesForTest({ startCron: false });
+    const second = activateScheduledServicesForTest();
     await vi.dynamicImportSettled();
-    expect(hoisted.migrateLegacyPendingOutboundDeliveries).toHaveBeenCalledTimes(2);
+    expect(hoisted.recoverPendingDeliveries).toHaveBeenCalledTimes(2);
+    await second.services.stopDeliveryRecovery();
     second.services.heartbeatRunner.stop();
   });
 
@@ -705,7 +674,7 @@ describe("server-runtime-services", () => {
       skippedMaxRetries: 0,
       deferredBackoff,
     });
-    const { services } = activateScheduledServicesForTest({ startCron: false });
+    const { services } = activateScheduledServicesForTest();
 
     await vi.advanceTimersByTimeAsync(4_999);
     expect(hoisted.recoverPendingDeliveries).toHaveBeenCalledOnce();
@@ -728,7 +697,7 @@ describe("server-runtime-services", () => {
 
   it("reconstructs conversation route authorization for a recovered delivery attempt", async () => {
     vi.useFakeTimers();
-    const { services } = activateScheduledServicesForTest({ startCron: false });
+    const { services } = activateScheduledServicesForTest();
     await vi.dynamicImportSettled();
     const recovery = hoisted.recoverPendingDeliveries.mock.calls[0]?.[0];
     if (!recovery) {
@@ -760,11 +729,11 @@ describe("server-runtime-services", () => {
 
     expect(hoisted.assertQueuedConversationDeliveryAttemptAuthorized).toHaveBeenCalledWith(
       expect.objectContaining({
-        agentId: "main",
+        readCurrentConfig: expect.any(Function),
         operationId: "operation-recovery",
-        storePath: "/tmp/agent.sqlite",
         routeFingerprint: "route-recovery",
       }),
+      expect.objectContaining({ agentId: "main", storePath: "/tmp/agent.sqlite" }),
     );
     services.heartbeatRunner.stop();
   });
@@ -777,7 +746,6 @@ describe("server-runtime-services", () => {
       .spyOn(configModule, "getRuntimeConfig")
       .mockReturnValue(reloadedConfig as never);
     const { services } = activateScheduledServicesForTest({
-      startCron: false,
       cfgAtStart: { channels: { discord: { enabled: true } } } as never,
     });
 
@@ -786,6 +754,7 @@ describe("server-runtime-services", () => {
 
       expect(hoisted.drainPendingDeliveries).toHaveBeenCalledWith(
         expect.objectContaining({ cfg: reloadedConfig }),
+        expect.any(Function),
       );
       expect(runtimeConfig).toHaveBeenCalledOnce();
     } finally {
@@ -803,7 +772,7 @@ describe("server-runtime-services", () => {
           finishDrain = resolve;
         }),
     );
-    const { services } = activateScheduledServicesForTest({ startCron: false });
+    const { services } = activateScheduledServicesForTest();
 
     await vi.advanceTimersByTimeAsync(1_250);
     expect(getActiveGatewayRootWorkCount()).toBe(0);
@@ -830,7 +799,7 @@ describe("server-runtime-services", () => {
 
   it("stops outbound delivery retry timers with the gateway lifecycle", async () => {
     vi.useFakeTimers();
-    const { services } = activateScheduledServicesForTest({ startCron: false });
+    const { services } = activateScheduledServicesForTest();
 
     await vi.advanceTimersByTimeAsync(5_000);
     expect(hoisted.drainPendingDeliveries).toHaveBeenCalledOnce();
@@ -845,7 +814,7 @@ describe("server-runtime-services", () => {
 
   it("skips outbound retry ticks while gateway work admission is suspended", async () => {
     vi.useFakeTimers();
-    const { services } = activateScheduledServicesForTest({ startCron: false });
+    const { services } = activateScheduledServicesForTest();
     await vi.advanceTimersByTimeAsync(1_250);
 
     const suspension = tryBeginGatewaySuspendAdmission(() => {});
@@ -1058,21 +1027,16 @@ describe("server-runtime-services", () => {
   });
 
   it("keeps scheduled services disabled for minimal test gateways", () => {
-    const cron = { start: vi.fn(async () => undefined) };
-
     const services = activateGatewayScheduledServices({
       minimalTestGateway: true,
       cfgAtStart: {} as never,
       deps: {} as never,
       sessionDeliveryRecoveryMaxEnqueuedAt: 123,
-      cronState: createTestCronState(cron),
-      cronReconciliation: createTestCronReconciliation(),
-      logCron: { error: vi.fn() },
+      cronEnabled: true,
       log: createLog(),
     });
 
     expect(hoisted.startHeartbeatRunner).not.toHaveBeenCalled();
-    expect(cron.start).not.toHaveBeenCalled();
     expect(hoisted.recoverPendingDeliveries).not.toHaveBeenCalled();
     expect(hoisted.recoverPendingRestartContinuationDeliveries).not.toHaveBeenCalled();
 
@@ -1082,14 +1046,8 @@ describe("server-runtime-services", () => {
 });
 
 function activateScheduledServicesForTest(
-  overrides: Omit<
-    Partial<Parameters<typeof activateGatewayScheduledServices>[0]>,
-    "cronState"
-  > = {},
+  overrides: Partial<Parameters<typeof activateGatewayScheduledServices>[0]> = {},
 ) {
-  const cron = createTestCron();
-  const cronState = createTestCronState(cron);
-  const cronStart = cron.start;
   const log = overrides.log ?? createLog();
   const cfgAtStart = overrides.cfgAtStart ?? ({} as never);
   const services = activateGatewayScheduledServices({
@@ -1097,11 +1055,9 @@ function activateScheduledServicesForTest(
     cfgAtStart,
     deps: {} as never,
     sessionDeliveryRecoveryMaxEnqueuedAt: 123,
-    cronReconciliation: createTestCronReconciliation(),
-    logCron: { error: vi.fn() },
+    cronEnabled: true,
     ...overrides,
-    cronState,
     log,
   });
-  return { cron, cronStart, log, services };
+  return { log, services };
 }

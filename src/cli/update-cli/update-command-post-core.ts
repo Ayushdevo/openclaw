@@ -62,6 +62,19 @@ const POST_CORE_CONFIG_WRITER_MIN_VERSION = "2026.4.29";
 
 type PostCoreUpdateFailure = { status: "failed"; error: string };
 
+export async function postCoreUpdateParentOwnsCompletion(
+  resultPath: string | undefined,
+): Promise<boolean> {
+  if (!resultPath) {
+    return false;
+  }
+  // Transient handoff only; absent preserves the shipped child-owned completion contract.
+  const handoff = await readJsonIfExists<{ completionOwner?: string }>(
+    path.join(path.dirname(resultPath), "handoff.json"),
+  );
+  return handoff?.completionOwner === "parent";
+}
+
 export async function writePostCoreUpdateFailureFile(
   filePath: string | undefined,
   error: unknown,
@@ -77,7 +90,7 @@ export async function writePostCoreUpdateFailureFile(
     await writeJson(
       filePath,
       { status: "failed", error: failure.error },
-      { trailingNewline: true },
+      { trailingNewline: true, dirMode: 0o700 },
     );
   }
 }
@@ -89,7 +102,7 @@ export async function writePostCorePluginUpdateResultFile(
   if (!filePath) {
     return;
   }
-  await writeJson(filePath, result, { trailingNewline: true });
+  await writeJson(filePath, result, { trailingNewline: true, dirMode: 0o700 });
 }
 
 /** @internal exported for focused handoff contract tests. */
@@ -316,9 +329,8 @@ export async function continuePostCoreUpdateInFreshProcess(params: {
   if (params.opts.acceptCapabilities) {
     argv.push("--accept-capabilities");
   }
-  if (params.opts.timeout) {
-    argv.push("--timeout", params.opts.timeout);
-  }
+  // This child only finalizes plugins; it must retain the owning step allowance.
+  argv.push("--timeout", params.opts.timeout ?? String(Math.ceil(params.timeoutMs / 1000)));
   const resultDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-update-post-core-"));
   const resultPath = path.join(resultDir, "plugins.json");
   const installRecordsPath = path.join(resultDir, "plugin-install-records.json");
@@ -359,6 +371,11 @@ export async function continuePostCoreUpdateInFreshProcess(params: {
     }
     await writePostCorePluginInstallRecordsFile(installRecordsPath, pluginInstallRecords);
     await writePostCoreSourceConfigFile(sourceConfigPath, params.preUpdateConfig);
+    await writeJson(
+      path.join(resultDir, "handoff.json"),
+      { completionOwner: "parent" },
+      { dirMode: 0o700 },
+    );
     const jsonMode = params.opts.json === true;
     const childStdio = resolvePostCoreUpdateChildStdio(process.platform, jsonMode);
     const handoffEnv = buildPostCoreHandoffEnv({

@@ -164,6 +164,8 @@ result; use **Copy result** in the Control UI or `openclaw tasks show <lookup>`.
 
 Agent run completion is authoritative for active task records. A successful detached run finalizes as `succeeded`, ordinary run errors finalize as `failed`, timeouts finalize as `timed_out`, and cancel/abort outcomes finalize as `cancelled`. Once a task is terminal, later lifecycle signals do not downgrade it - an operator-cancelled or already-`failed`/`timed_out`/`lost` task stays that way even if a success signal arrives afterwards.
 
+Distinct ACP executions receive separate task and flow IDs even when they share a request ID. Repeated status mirrors of the same execution keep its original task ID. A run-ID lookup selects the latest execution within that ACP session; an exact task-ID lookup still returns the older task and its terminal result. Cancelling one execution does not cancel a queued successor with the same request ID.
+
 `lost` is runtime-aware:
 
 - ACP tasks: only a live in-process ACP turn in the Gateway proves the run is alive; persisted session metadata alone does not. Offline CLI audit stays conservative and never reclaims ACP tasks.
@@ -243,7 +245,9 @@ openclaw tasks cancel <lookup>
 
 For ACP and subagent tasks, this kills the child session; ACP and automation cancellations route through the running Gateway (`tasks.cancel`). Ordinary Gateway-owned CLI tasks also require the owning Gateway to be running. Cancellation aborts only the selected live run and its pending approvals, and reports success only after that run settles as `cancelled`. Background `exec` tasks keep their process-control cancellation path. Delivery notifications are sent when applicable.
 
-Missing, already-terminal, ownerless, or unconfirmed runs do not report a new cancellation success. If a crash or restart removed the live owner, keep the Gateway running so its existing maintenance can reconcile the task as `lost`. Use `openclaw tasks audit` and `openclaw tasks maintenance` to inspect the record; offline maintenance cannot establish Gateway liveness. See [task maintenance](/cli/tasks#maintenance).
+Native harness subagents, such as Codex children, are observation-only task records. Cancellation is refused and leaves their task state unchanged. Use the parent session's native collaboration tools to stop them; their harness owns execution and reports the result.
+
+Missing, already-terminal, ownerless, or unconfirmed runs do not report a new cancellation success. On restore, a running task with a recorded local execution process that has exited is marked `cancelled`, with the interruption reason retained. It no longer delays the next Gateway drain. Settling an older task preserves the result of a newer task linked to the same flow. A live matching process remains running. Tasks without a recorded process identity retain normal maintenance grace, including 30 minutes for childless native subagents. Use `openclaw tasks audit` and `openclaw tasks maintenance` to inspect the record; offline maintenance cannot infer Gateway liveness from an empty local run registry. See [task maintenance](/cli/tasks#maintenance).
 
 <a id="tasks-retry-dismiss" />
 
@@ -308,7 +312,7 @@ Use this to preview or apply reconciliation, cleanup stamping, and pruning for t
 
 Reconciliation is runtime-aware:
 
-- ACP tasks require a live in-process turn in the Gateway; subagent tasks check their backing child session.
+- ACP tasks require a live in-process turn in the Gateway. Registry-backed subagent tasks require an owning subagent run, not merely a retained child session. Gateway maintenance marks previously stranded tasks lost when neither a live run nor a current or durable subagent owner remains; standalone CLI checks and failed ownership reads do not establish that absence. Yielded, queued, recovering, and replacement runs retain ownership.
 - Subagent tasks whose child session has a restart-recovery tombstone are marked lost instead of being treated as recoverable backing sessions.
 - Automation tasks check whether the automations runtime still owns the job, then recover terminal status from persisted run logs/job state before falling back to `lost`. Only the Gateway process is authoritative for the in-memory active-job set; offline CLI audit uses durable history but does not mark an automation task lost solely because that local set is empty.
 - CLI tasks with run identity check the owning live run context, not just child-session or chat-session rows. Only Gateway maintenance owns that liveness check; standalone CLI audit and maintenance retain active CLI tasks because their local run registry cannot prove that the Gateway run has ended.
@@ -347,11 +351,15 @@ For the full operator ledger, use the CLI: `openclaw tasks list`.
 
 The web Control UI has a **Tasks** page in the sidebar with live active and recent background tasks. Use it to inspect progress, open linked sessions, refresh the ledger, cancel queued and running tasks, or retry/dismiss a blocked completion delivery. Task detail keeps execution status and delivery status separate and exposes the retained result for copying.
 
-Chat panes also have a collapsible **Background tasks** rail scoped to the pane's agent, with running work, stop controls, and a finished section. Open it from the activity toggle in the pane header (or the floating activity button in single-pane chat).
+Chat panes also have a collapsible **Background tasks** rail scoped to the current conversation, with active work, stop controls, and a finished section. Open it from the pane's **Tasks** panel action. Subagent activity below the parent conversation also opens the selected child's details.
 
 Running work stays in creation order so progress updates do not move rows while you monitor them. Finished work is selected and displayed by completion time, newest first. Transient list conflicts retry silently; if retries are exhausted, use **Refresh** in the Tasks panel header. Session label and category edits preserve task pagination when session access stays the same. Sharing, role, and session identity changes can still require a fresh page.
 
-Select a task to replace the list with a compact detail view inside the rail; use the back button to return to the list. The detail view shows the bounded input prompt, latest output or error summary, timing, and current tool activity. Subagent details stay in the rail rather than opening their child conversation in the main chat pane; linked-session actions remain available for task runtimes intended for direct inspection. On iOS, open **Chat actions → Background Tasks**; on Android, open the Chat overflow menu and select **Background tasks**. Both mobile views use the same Running and Finished grouping and open task details on selection.
+Select a task to open its **Review** panel beside the parent conversation; the **Tasks** tab keeps the list available. The inspector shows the child's transcript when available, or its bounded input and output, plus timing and tool usage. Current tool activity and the age of the last activity appear separately from the last completed tool. Explicit waits identify children, external results, agent messages, approval, or user input; unavailable runtime detail stays unknown.
+
+Execution and delivery remain separate in the inspector. **Result ready** with **Queued for parent** means the child finished but its result has not been delivered. **Delivered to parent** confirms that handoff. Failed or dismissed delivery keeps the execution result visible, and cancellation and timeout retain their own labels. Stop controls address the selected active task through its execution owner. Child conversations remain view-only with **Open parent session** navigation.
+
+On iOS, open **Chat actions → Background Tasks**; on Android, open the Chat overflow menu and select **Background tasks**. Both mobile views use Running and Finished grouping and open task details on selection.
 
 ## Status integration (task pressure)
 

@@ -192,7 +192,7 @@ describe("buildDeveloperInstructions delegation guidance", () => {
 });
 
 describe("buildDeveloperInstructions UI presentation guidance", () => {
-  const uiTools = ["show_widget", "dashboard", "portal", "message"].map(
+  const uiTools = ["screen", "show_widget", "dashboard", "portal", "message"].map(
     (name): CodexDynamicToolFunctionSpec => ({
       type: "function",
       name,
@@ -226,13 +226,18 @@ describe("buildDeveloperInstructions UI presentation guidance", () => {
       const instructions = buildDeveloperInstructions(createParams(), { dynamicTools });
 
       expect(instructions).toContain("## UI Presentation");
+      expect(instructions).toContain(`\`${prefix}screen(action="browser_show")\``);
+      expect(instructions).toContain("Do not create or expand a dashboard to open a panel");
       for (const tool of uiTools) {
         expect(instructions).toContain(`\`${prefix}${tool.name}\``);
       }
       expect(instructions).toContain("pin=true");
       expect(instructions).toContain("publicUrl");
       expect(instructions).toContain("result.presentation");
-      expect(instructions).toContain("inline support varies by surface");
+      expect(instructions).toContain("this turn's schema");
+      expect(instructions).toContain("status=pinned means the widget is on the session dashboard");
+      expect(instructions).toContain('action="focus_tab" with its tabId');
+      expect(instructions).toContain("do not open hosting URLs as browser pages");
       expect(instructions).toContain(
         `\`${prefix}message(action="send", clawhub={query:"capability"})\``,
       );
@@ -243,7 +248,7 @@ describe("buildDeveloperInstructions UI presentation guidance", () => {
 
   it("distinguishes unavailable custom authoring from dashboard and portal support", () => {
     const instructions = buildDeveloperInstructions(createParams(), {
-      dynamicTools: uiTools.filter((tool) => tool.name !== "show_widget"),
+      dynamicTools: uiTools.filter((tool) => tool.name !== "show_widget" && tool.name !== "screen"),
     });
 
     expect(instructions).toContain("`dashboard`");
@@ -252,6 +257,7 @@ describe("buildDeveloperInstructions UI presentation guidance", () => {
       "Custom authoring is unavailable this turn, not unsupported by dashboards.",
     );
     expect(instructions).not.toContain("`show_widget`");
+    expect(instructions).not.toContain('action="browser_show"');
   });
 
   it("does not advertise ClawHub for a message schema without that capability", () => {

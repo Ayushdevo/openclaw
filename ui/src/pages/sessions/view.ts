@@ -14,6 +14,7 @@ import type {
   SessionsListResult,
 } from "../../api/types.ts";
 import "../../styles/sessions.css";
+import { renderAgentRowChip } from "../../components/agent-row-chip.ts";
 import { renderCapacityMeter } from "../../components/capacity-meter.ts";
 import { icons } from "../../components/icons.ts";
 import {
@@ -32,12 +33,8 @@ import {
   normalizeThinkingOptionValue,
   resolveChatThinkingSelectState,
 } from "../../lib/chat/thinking.ts";
-import {
-  formatDurationCompact,
-  formatMs,
-  formatRelativeTimestamp,
-  formatCompactTokenCount,
-} from "../../lib/format.ts";
+import { formatDurationCompact } from "../../lib/format-duration.ts";
+import { formatMs, formatRelativeTimestamp, formatCompactTokenCount } from "../../lib/format.ts";
 import { handleContextMenuEvent } from "../../lib/keyboard-shortcuts.ts";
 import { shouldHandleNavigationClick } from "../../lib/navigation-click.ts";
 import { presenceViewerLabel } from "../../lib/presence-users.ts";
@@ -60,7 +57,7 @@ import {
   sessionNavigationTarget,
 } from "../../lib/sessions/route-navigation.ts";
 import { formatSessionArchiveReason } from "../../lib/sessions/session-archive-reason.ts";
-import { parseSessionKeyParts } from "../../lib/sessions/session-key.ts";
+import { parseAgentSessionKey, parseSessionKeyParts } from "../../lib/sessions/session-key.ts";
 import { SESSIONS_PAGE_DEFAULT_LIMIT } from "../../lib/sessions/session-requests.ts";
 
 type TranscriptSearchState =
@@ -69,9 +66,11 @@ type TranscriptSearchState =
   | { status: "error"; message: string }
   | {
       status: "results";
+      sessions: GatewaySessionRow[];
       results: SessionsSearchHit[];
       indexing: boolean;
       truncated: boolean;
+      archivedTranscriptsExcluded: number;
     };
 
 export type SessionsProps = {
@@ -378,10 +377,11 @@ function transcriptSearchSessionLabel(hit: SessionsSearchHit, rows: GatewaySessi
   );
 }
 
-function renderTranscriptSearch(props: SessionsProps, rows: GatewaySessionRow[]) {
+function renderTranscriptSearch(props: SessionsProps) {
   const hasQuery = props.transcriptSearchQuery.trim().length > 0;
   const state = props.transcriptSearch;
   const results = state.status === "results" ? state.results : [];
+  const rows = state.status === "results" ? state.sessions : [];
   const loading = state.status === "loading";
   return html`
     <section
@@ -480,6 +480,15 @@ function renderTranscriptSearch(props: SessionsProps, rows: GatewaySessionRow[])
                   </button>
                 </div>
               `
+            : nothing
+        }
+        ${
+          state.status === "results" && state.archivedTranscriptsExcluded > 0
+            ? html`<div class="sessions-transcript-search__notice">
+                ${t("sessionsView.transcriptSearchArchivedExcluded", {
+                  count: String(state.archivedTranscriptsExcluded),
+                })}
+              </div>`
             : nothing
         }
         ${
@@ -1032,7 +1041,7 @@ export function renderSessions(props: SessionsProps) {
       {
         title: t("sessionsView.transcriptSearchTitle"),
       },
-      renderTranscriptSearch(props, rawRows),
+      renderTranscriptSearch(props),
     ),
     renderSettingsSection(
       {
@@ -1429,7 +1438,6 @@ function renderRows(row: GatewaySessionRow, props: SessionsProps) {
         basePath: props.basePath,
         row,
         mainKey: props.mainKey,
-        preferenceDerivedFace: true,
       }).href
     : null;
   const displayKind = resolveSessionDisplayKind(row);
@@ -1550,6 +1558,7 @@ function renderRows(row: GatewaySessionRow, props: SessionsProps) {
                     : nothing
                 }
               </span>
+              ${row.kind === "global" && !row.agentId ? nothing : renderAgentRowChip(parseAgentSessionKey(row.key)?.agentId ?? row.agentId)}
               ${
                 showDisplayName
                   ? html`<span class="muted session-key-display-name">${displayName}</span>`

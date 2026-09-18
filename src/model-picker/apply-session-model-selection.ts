@@ -1,6 +1,6 @@
 import { resolveAgentDir, type AgentModelPrimaryWriteTarget } from "../agents/agent-scope.js";
 import type { ModelCatalogEntry } from "../agents/model-catalog.js";
-import { modelKey } from "../agents/model-selection.js";
+import { modelKey, resolveDefaultModelForAgent } from "../agents/model-selection.js";
 import {
   createModelVisibilityPolicy,
   type ModelVisibilityPolicy,
@@ -44,6 +44,7 @@ export type SessionModelSelectionRequest = {
   provider: string;
   model: string;
   isDefault: boolean;
+  resetToDefault?: true;
   alias?: string;
   profileOverride?: string;
   runtime: { kind: "unchanged" } | { kind: "clear" } | { kind: "set"; runtime: string };
@@ -61,7 +62,7 @@ export type ApplySessionModelSelectionParams = {
   defaultModel: string;
   currentProvider: string;
   currentModel: string;
-  modelPolicy?: ModelVisibilityPolicy;
+  modelPolicy?: Omit<ModelVisibilityPolicy, "catalog">;
   modelCatalog: readonly ModelCatalogEntry[];
   thinkingCatalog?: readonly ModelCatalogEntry[];
   canPersistStickyModelSelection?: boolean;
@@ -197,23 +198,31 @@ export async function applySessionModelSelection(
     return { status: "rejected", reason: "locked", message: MODEL_SELECTION_LOCKED_MESSAGE };
   }
 
-  const normalizedModelKey = modelKey(params.request.provider, params.request.model);
+  const resetToDefault = params.request.resetToDefault === true;
+  const selectedRef = resetToDefault
+    ? resolveDefaultModelForAgent({ cfg: params.cfg, agentId: params.agentId })
+    : params.request;
+  const normalizedModelKey = modelKey(selectedRef.provider, selectedRef.model);
+  const request: SessionModelSelectionRequest = {
+    ...params.request,
+    provider: selectedRef.provider,
+    model: selectedRef.model,
+    isDefault:
+      resetToDefault ||
+      normalizedModelKey === modelKey(params.defaultProvider, params.defaultModel),
+  };
   const policy =
     params.modelPolicy ??
     createModelVisibilityPolicy({
       cfg: params.cfg,
       catalog: [...params.modelCatalog],
       defaultProvider: params.defaultProvider,
-      defaultModel: params.defaultModel,
+      defaultModel: { provider: params.defaultProvider, model: params.defaultModel },
       agentId: params.agentId,
     });
-  if (!policy.allows(params.request)) {
-    return rejectNotAllowed(params.request.provider, params.request.model);
+  if (!resetToDefault && !policy.allows(request)) {
+    return rejectNotAllowed(request.provider, request.model);
   }
-  const request: SessionModelSelectionRequest = {
-    ...params.request,
-    isDefault: normalizedModelKey === modelKey(params.defaultProvider, params.defaultModel),
-  };
 
   const prepared = await prepareModelSelectionRuntime({
     cfg: params.cfg,
@@ -409,6 +418,7 @@ export async function applySessionModelSelection(
       sessionKey: params.sessionKey,
       agentId: params.agentId,
       reason: "patch",
+      catalogChanged: true,
     });
     triggerSessionPatchHook({
       cfg: params.cfg,

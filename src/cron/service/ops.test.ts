@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { AgentDeletionCommitUncertainError } from "../../agents/agent-lifecycle-registry.js";
 import {
+  closeOpenClawStateDatabaseAsync,
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "../../state/openclaw-state-db.js";
@@ -21,6 +22,7 @@ import * as cronStoreModule from "../store.js";
 import { loadCronJobsStoreWithConfigJobs, loadCronStore } from "../store.js";
 import { cronStoreKey } from "../store/key.js";
 import * as runReceiptStore from "../store/run-receipt-store.js";
+import { inspectActiveCronRunReceipt } from "../store/run-receipt-store.test-support.js";
 import type { CronJob } from "../types.js";
 import { start, stop } from "./ops-lifecycle.js";
 import {
@@ -491,12 +493,16 @@ async function withStateDirForStorePath<T>(
   runWithStateDir: () => Promise<T>,
 ): Promise<T> {
   const stateRoot = path.dirname(path.dirname(storePath));
+  await closeOpenClawStateDatabaseAsync();
   resetTaskRegistryForTests();
-  try {
-    return await withEnvAsync({ OPENCLAW_STATE_DIR: stateRoot }, runWithStateDir);
-  } finally {
-    resetTaskRegistryForTests();
-  }
+  return await withEnvAsync({ OPENCLAW_STATE_DIR: stateRoot }, async () => {
+    try {
+      return await runWithStateDir();
+    } finally {
+      await closeOpenClawStateDatabaseAsync();
+      resetTaskRegistryForTests();
+    }
+  });
 }
 
 function createTimedOutIsolatedCronState(params: { storePath: string; now: number }) {
@@ -824,7 +830,7 @@ describe("cron service ops seam coverage", () => {
       ).toEqual({ name: "cron_run_receipts" });
     } finally {
       stop(state);
-      runReceiptStore.inspectActiveCronRunReceipt({ storePath, jobId: job.id });
+      inspectActiveCronRunReceipt({ storePath, jobId: job.id });
     }
   });
 
@@ -2358,7 +2364,7 @@ describe("cron service ops persist rollback", () => {
     const previousRevision = cronStoreModule.getCronJobsStoreRevision(storePath);
     const originalTimer = state.timer;
     onEvent.mockClear();
-    const persist = vi.spyOn(cronStoreModule, "saveCronJobsStore");
+    const persist = vi.spyOn(cronStoreModule, "saveCronJobsStoreWithRevision");
     persist.mockClear();
 
     await expect(remove(state, "missing-job")).resolves.toEqual({ ok: true, removed: false });
@@ -2385,7 +2391,9 @@ describe("cron service ops persist rollback", () => {
     const now = Date.parse("2026-06-09T00:00:00.000Z");
     const state = createOkIsolatedCronState({ storePath, now });
 
-    vi.spyOn(cronStoreModule, "saveCronJobsStore").mockRejectedValueOnce(new Error("disk full"));
+    vi.spyOn(cronStoreModule, "saveCronJobsStoreWithRevision").mockRejectedValueOnce(
+      new Error("disk full"),
+    );
 
     await expect(add(state, makeCreateInput("daily cleanup"))).rejects.toThrow("disk full");
 
@@ -2410,7 +2418,9 @@ describe("cron service ops persist rollback", () => {
       clearTimeout(state.timer);
     }
 
-    vi.spyOn(cronStoreModule, "saveCronJobsStore").mockRejectedValueOnce(new Error("disk full"));
+    vi.spyOn(cronStoreModule, "saveCronJobsStoreWithRevision").mockRejectedValueOnce(
+      new Error("disk full"),
+    );
 
     await expect(update(state, job.id, { name: "renamed cleanup" })).rejects.toThrow("disk full");
 
@@ -2451,7 +2461,9 @@ describe("cron service ops persist rollback", () => {
       clearTimeout(state.timer);
     }
 
-    vi.spyOn(cronStoreModule, "saveCronJobsStore").mockRejectedValueOnce(new Error("disk full"));
+    vi.spyOn(cronStoreModule, "saveCronJobsStoreWithRevision").mockRejectedValueOnce(
+      new Error("disk full"),
+    );
 
     await expect(remove(state, job.id)).rejects.toThrow("disk full");
 
@@ -2471,7 +2483,9 @@ describe("cron service ops persist rollback", () => {
     }
     job.state.startupCatchupAtMs = now + 5_000;
 
-    vi.spyOn(cronStoreModule, "saveCronJobsStore").mockRejectedValueOnce(new Error("disk full"));
+    vi.spyOn(cronStoreModule, "saveCronJobsStoreWithRevision").mockRejectedValueOnce(
+      new Error("disk full"),
+    );
 
     await expect(remove(state, job.id)).rejects.toThrow("disk full");
 
@@ -2484,7 +2498,9 @@ describe("cron service ops persist rollback", () => {
     const now = Date.parse("2026-06-09T00:00:00.000Z");
     const state = createOkIsolatedCronState({ storePath, now });
 
-    vi.spyOn(cronStoreModule, "saveCronJobsStore").mockRejectedValueOnce(new Error("disk full"));
+    vi.spyOn(cronStoreModule, "saveCronJobsStoreWithRevision").mockRejectedValueOnce(
+      new Error("disk full"),
+    );
     await expect(add(state, makeCreateInput("daily cleanup"))).rejects.toThrow("disk full");
 
     const job = await add(state, makeCreateInput("daily cleanup"));
@@ -2536,14 +2552,15 @@ describe("cron service ops persist rollback", () => {
         return computeNextRunAtMs(schedule, nowMs);
       });
 
-      const saveCronJobsStore = cronStoreModule.saveCronJobsStore;
-      vi.spyOn(cronStoreModule, "saveCronJobsStore")
+      const saveCronJobsStoreWithRevision = cronStoreModule.saveCronJobsStoreWithRevision;
+      vi.spyOn(cronStoreModule, "saveCronJobsStoreWithRevision")
         .mockRejectedValueOnce(new Error("disk full"))
         .mockImplementationOnce(async (...args) => {
           expect(enqueueSystemEvent).not.toHaveBeenCalled();
           expect(requestHeartbeat).not.toHaveBeenCalled();
-          await saveCronJobsStore(...args);
+          const committed = await saveCronJobsStoreWithRevision(...args);
           order.push("persist");
+          return committed;
         });
       const trigger = () => add(state, makeCreateInput(`trigger ${triggerPath}`));
       await expect(trigger()).rejects.toThrow("disk full");

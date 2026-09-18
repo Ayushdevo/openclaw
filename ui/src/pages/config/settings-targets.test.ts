@@ -28,6 +28,7 @@ describe("settings search target manifest", () => {
         target.hash,
       ]),
     ).toEqual([
+      ["sessionStorage", "/settings/ai-agents", "?section=session", "#settings-session-storage"],
       [
         "meetingCapture",
         "/settings/communications",
@@ -65,6 +66,12 @@ describe("settings search target manifest", () => {
         "#settings-appearance-accent",
       ],
       [
+        "appearanceTypography",
+        "/settings/appearance",
+        "?section=__appearance__",
+        "#settings-appearance-typography",
+      ],
+      [
         "appearanceTextSize",
         "/settings/appearance",
         "?section=__appearance__",
@@ -75,6 +82,12 @@ describe("settings search target manifest", () => {
         "/settings/appearance",
         "?section=__appearance__",
         "#settings-appearance-sidebar",
+      ],
+      [
+        "sessionSources",
+        "/settings/appearance",
+        "?section=__appearance__",
+        "#settings-session-sources",
       ],
       [
         "appearanceChat",

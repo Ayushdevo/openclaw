@@ -6,9 +6,15 @@ import {
   createServiceRuntimeInspectionFailure,
   type GatewayServiceRuntime,
 } from "./service-runtime.js";
-import type { GatewayServiceEnv, GatewayServiceUnitInspection } from "./service-types.js";
-import { execBusctlUser } from "./systemd-exec.js";
+import type {
+  GatewayServiceEnv,
+  GatewayServiceUnitInspection,
+  SystemdServiceReadBinding,
+  SystemdServiceReadTarget,
+} from "./service-types.js";
+import { execBusctlSystem, execBusctlUser, systemdInspectionError } from "./systemd-exec.js";
 import { resolveSystemdServiceName } from "./systemd-service-files.js";
+import { readSystemdUserTransport } from "./systemd-user-transport.js";
 
 const MANAGER = "org.freedesktop.systemd1";
 const BUS = "org.freedesktop.DBus";
@@ -22,13 +28,16 @@ const isInt32 = (value: unknown): value is number =>
 const optionalCounter = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 
-/** Update admission already selects the user manager; missing/changed objects remain unknown. */
+/** The selected manager must retain the same loaded unit throughout inspection. */
 export async function readLoadedSystemdServiceRuntime(
   env: GatewayServiceEnv,
   timeoutMs?: number,
   inspection?: GatewayServiceUnitInspection,
+  binding?: SystemdServiceReadBinding,
+  target?: SystemdServiceReadTarget,
 ): Promise<GatewayServiceRuntime> {
-  const unitName = `${resolveSystemdServiceName(env)}.service`;
+  const unitName = target?.unitName ?? `${resolveSystemdServiceName(env)}.service`;
+  const scope = target?.scope ?? "user";
   const budget =
     timeoutMs !== undefined && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 5000;
   const deadline = performance.now() + budget;
@@ -45,15 +54,30 @@ export async function readLoadedSystemdServiceRuntime(
     if (remaining <= 0 || remainingQueries <= 0) {
       throw unavailable();
     }
-    const result = await execBusctlUser(
-      env,
-      ["--auto-start=no", "--json=short", ...args],
-      Math.max(1, Math.floor(remaining / remainingQueries--)),
-      assertCurrent,
-    );
+    if (binding) {
+      if (scope === "system" || binding.unit !== unitName) {
+        throw unavailable();
+      }
+      remainingQueries--;
+      const values = await binding.query(args, signatures, deadline, inspection);
+      if (!values) {
+        throw unavailable();
+      }
+      assertCurrent?.();
+      if (performance.now() >= deadline) {
+        throw unavailable();
+      }
+      return values;
+    }
+    const queryArgs = ["--auto-start=no", "--json=short", ...args];
+    const callTimeout = Math.max(1, Math.floor(remaining / remainingQueries--));
+    const result =
+      scope === "system"
+        ? await execBusctlSystem(queryArgs, callTimeout)
+        : await execBusctlUser(env, queryArgs, callTimeout, assertCurrent);
     assertCurrent?.();
     if (result.code !== 0 || result.termination !== "exit" || performance.now() >= deadline) {
-      throw unavailable();
+      throw systemdInspectionError(result, unavailable().message, scope);
     }
     const values = result.stdout
       .trim()
@@ -68,6 +92,10 @@ export async function readLoadedSystemdServiceRuntime(
     return values.map((value) => value?.data);
   };
   const readOwner = async () => {
+    if (binding) {
+      binding.verify();
+      return binding.destination;
+    }
     const [value] = await query(
       ["call", BUS, "/org/freedesktop/DBus", BUS, "GetNameOwner", "s", MANAGER],
       ["s"],
@@ -85,10 +113,12 @@ export async function readLoadedSystemdServiceRuntime(
   try {
     // Address every unit query to the observed unique bus owner, never a newly started manager.
     const owner = await readOwner();
-    const [credentials] = await query(
-      ["call", BUS, "/org/freedesktop/DBus", BUS, "GetConnectionUnixUser", "s", owner],
-      ["u"],
-    );
+    const [credentials] = binding
+      ? [[binding.managerUid]]
+      : await query(
+          ["call", BUS, "/org/freedesktop/DBus", BUS, "GetConnectionUnixUser", "s", owner],
+          ["u"],
+        );
     if (
       !Array.isArray(credentials) ||
       credentials.length !== 1 ||
@@ -98,7 +128,10 @@ export async function readLoadedSystemdServiceRuntime(
       throw unavailable();
     }
     const managerUid = credentials[0];
-    if (inspection && managerUid !== inspection.managerUid) {
+    if (
+      (scope === "system" && managerUid !== 0) ||
+      (inspection && managerUid !== inspection.managerUid)
+    ) {
       throw unavailable();
     }
     const [unit] = await query(
@@ -228,6 +261,8 @@ export async function readLoadedSystemdServiceRuntime(
         exitCode
       ],
       systemd: {
+        scope,
+        ...(scope === "user" ? { transport: await readSystemdUserTransport(env) } : {}),
         unit: id,
         managerUid,
         result,

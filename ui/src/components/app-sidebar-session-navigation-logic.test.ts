@@ -6,7 +6,7 @@ import { collectKnownSessionRows, fetchSessionLineage } from "./app-sidebar-chil
 import {
   buildSidebarSessionNavigationState,
   collectSidebarSessionRowsByKey,
-  compareSidebarSessionRowsByMode,
+  createSidebarSessionRowsComparator,
   resolveSidebarMainSessionKey,
 } from "./app-sidebar-session-navigation-logic.ts";
 import { projectSessionTree } from "./app-sidebar-session-tree.ts";
@@ -103,8 +103,8 @@ function sortSidebarRows(
   createdOrder: ReadonlyMap<string, number>,
   owners?: SessionsListResult["owners"],
 ) {
-  return rows.toSorted((a, b) =>
-    compareSidebarSessionRowsByMode({ a, b, sortMode, createdOrder, owners }),
+  return rows.toSorted(
+    createSidebarSessionRowsComparator(() => ({ sortMode, createdOrder, owners })),
   );
 }
 
@@ -186,6 +186,23 @@ describe("sidebar session sort modes", () => {
       "updated-new",
       "created-new",
     ]);
+  });
+
+  it("keeps first-facet precedence and row label fallbacks across People projections", () => {
+    const alex = row("alex", 100, 1, " alex ");
+    const sam = row("sam", 100, 1, "sam");
+    alex.owner!.actor.label = "Alex";
+    sam.owner!.actor.label = "Sam";
+    const rows = [sam, alex];
+    const observed = new Map(rows.map((entry, index) => [entry.key, index]));
+    const owners: NonNullable<SessionsListResult["owners"]> = [
+      { type: "human", id: "alex", label: " " },
+      { type: "human", id: "alex", label: "Zed" },
+      { type: "human", id: "sam", label: "Sam" },
+    ];
+    expect(sortSidebarRows(rows, "people", observed, owners)).toEqual([alex, sam]);
+    owners[0] = { type: "human", id: "alex", label: "Zed" };
+    expect(sortSidebarRows(rows, "people", observed, owners)).toEqual([sam, alex]);
   });
 });
 
@@ -290,16 +307,16 @@ describe("sidebar navigation lineage ownership", () => {
     key: "agent:main:dashboard:navigation-parent",
     kind: "direct",
     updatedAt: 1,
-    childSessions: ["agent:main:subagent:child"],
+    childSessions: ["agent:main:dashboard:child"],
   };
   const controlParent: GatewaySessionRow = {
     key: "agent:main:main",
     kind: "direct",
     updatedAt: 2,
-    childSessions: ["agent:main:subagent:child"],
+    childSessions: ["agent:main:dashboard:child"],
   };
   const child: GatewaySessionRow = {
-    key: "agent:main:subagent:child",
+    key: "agent:main:dashboard:child",
     kind: "direct",
     updatedAt: 3,
     parentSessionKey: navigationParent.key,
@@ -443,8 +460,12 @@ describe("sidebar navigation lineage ownership", () => {
     expect(tree?.runningChildCount).toBe(1);
   });
 
-  it("promotes an explicitly categorized child to a sidebar section root", () => {
-    const categorizedChild = { ...child, category: "P1 issues from beta feedback" };
+  it("promotes an explicitly categorized dashboard child to a sidebar section root", () => {
+    const categorizedChild = {
+      ...child,
+      key: "agent:main:dashboard:child",
+      category: "P1 issues from beta feedback",
+    };
     const projected = projectSessionTree({
       roots: [navigationParent, categorizedChild],
       rowsByKey: collectSidebarSessionRowsByKey({
@@ -484,6 +505,18 @@ describe("sidebar navigation lineage ownership", () => {
 
   it.each([
     ["legacy active child", { status: "running" }, 1, 0],
+    [
+      "queued leaf subagent",
+      { status: "queued", hasActiveRun: true, hasActiveSubagentRun: true },
+      1,
+      0,
+    ],
+    [
+      "archived subagent",
+      { status: "running", hasActiveRun: true, hasActiveSubagentRun: true, archived: true },
+      0,
+      0,
+    ],
     ["stale running child", { status: "running", hasActiveRun: false }, 0, 0],
     ["failed child with a stale active flag", { status: "failed", hasActiveRun: true }, 0, 1],
   ] as const)(
@@ -603,7 +636,23 @@ describe("sidebar navigation lineage ownership", () => {
         rowsByKey: collectSidebarSessionRowsByKey({ rows, childRowsByParent: {} }),
         loadingChildKeys: new Set(),
         knownSessionAttention: known
-          ? [{ sessionKey: "missing", attention: { kind: "approval" } }]
+          ? [
+              {
+                sessionKey: "missing",
+                attention: {
+                  kind: "approval",
+                  requests: [
+                    {
+                      kind: "approval",
+                      id: "missing",
+                      preview: "Approve?",
+                      count: 1,
+                      createdAtMs: 1,
+                    },
+                  ],
+                },
+              },
+            ]
           : [],
         toSidebarSession: (row, isChild) => ({
           ...projectSidebarSession(row),
@@ -611,11 +660,40 @@ describe("sidebar navigation lineage ownership", () => {
           visuallyActive: row.key === "grandchild",
           attention:
             row.key === "root"
-              ? { kind: own }
+              ? own === "question"
+                ? {
+                    kind: own,
+                    requests: [
+                      { kind: own, id: "root", preview: "Continue?", count: 1, createdAtMs: 0 },
+                    ],
+                  }
+                : { kind: own }
               : row.key === "first"
-                ? { kind: "question" }
+                ? {
+                    kind: "question",
+                    requests: [
+                      {
+                        kind: "question",
+                        id: "first",
+                        preview: "Continue?",
+                        count: 1,
+                        createdAtMs: 2,
+                      },
+                    ],
+                  }
                 : row.key === "second"
-                  ? { kind: "approval" }
+                  ? {
+                      kind: "approval",
+                      requests: [
+                        {
+                          kind: "approval",
+                          id: "second",
+                          preview: "Approve?",
+                          count: 1,
+                          createdAtMs: 3,
+                        },
+                      ],
+                    }
                   : { kind: "none" },
           workspaceConflictCount:
             row.key === "root"

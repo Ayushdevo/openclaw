@@ -13,6 +13,7 @@ import {
   execLaunchctl,
   formatLaunchctlResultDetail,
   isLaunchctlNotLoaded,
+  launchctlInspectionReason,
   type LaunchctlResult,
 } from "./launchd-exec.js";
 import { resolveLaunchAgentLabel } from "./launchd-label.js";
@@ -29,6 +30,11 @@ import {
   inspectSystemLaunchDaemonOwnership,
 } from "./launchd-system.js";
 import { parseKeyValueOutput } from "./runtime-parse.js";
+import { mergeGatewayServiceEnv } from "./service-env-merge.js";
+import {
+  ServiceInspectionError,
+  type ServiceInspectionReason,
+} from "./service-inspection-error.js";
 import type { GatewayServiceRuntime } from "./service-runtime.js";
 import type {
   GatewayServiceCommandConfig,
@@ -50,11 +56,21 @@ export async function readLaunchAgentProgramArguments(
     // A removed plist can leave its job registered; only launchd can prove absence.
     const timeoutMs =
       options.timeoutMs && options.timeoutMs > 0 ? Math.min(options.timeoutMs, 5_000) : 5_000;
-    const probe = await probeLaunchAgentState(
-      `${resolveLaunchAgentGuiDomain()}/${label}`,
-      timeoutMs,
-    ).catch(() => null);
+    const [probe, system] = await Promise.all([
+      probeLaunchAgentState(`${resolveLaunchAgentGuiDomain()}/${label}`, timeoutMs).catch(
+        () => null,
+      ),
+      inspectSystemLaunchDaemonOwnership(label, { timeoutMs, scanInstalledPlists: false }),
+    ]);
     if (probe?.state !== "not-loaded") {
+      const reason =
+        system.status === "loaded" || system.status === "installed"
+          ? "launchd-system-owned"
+          : ((system.status === "unverifiable" ? system.reason : undefined) ??
+            (probe?.state === "unknown" ? probe.inspectionReason : undefined));
+      if (reason) {
+        throw new ServiceInspectionError(reason);
+      }
       throw new Error("Effective LaunchAgent service command could not be inspected.");
     }
   }
@@ -67,15 +83,17 @@ export async function readLaunchAgentProgramArguments(
 const LAUNCH_AGENT_BOOTSTRAP_TEARDOWN_TIMEOUT_MS = (LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS + 10) * 1_000;
 const LAUNCH_AGENT_BOOTSTRAP_TEARDOWN_POLL_MS = 500;
 export async function resolveLaunchAgentGatewayContext(env: GatewayServiceEnv): Promise<{
+  env: GatewayServiceEnv;
   port: number | null;
   probeHosts: readonly string[];
 }> {
   const serviceKind = env.OPENCLAW_SERVICE_KIND?.trim();
   if (serviceKind && serviceKind !== GATEWAY_SERVICE_KIND) {
-    return { port: null, probeHosts: [] };
+    return { env, port: null, probeHosts: [] };
   }
   const command = await readLaunchAgentProgramArguments(env).catch(() => null);
   return {
+    env: mergeGatewayServiceEnv(env, command),
     port:
       parseTcpPortFromArgs(command?.programArguments) ??
       parseTcpPort(command?.environment?.OPENCLAW_GATEWAY_PORT ?? "") ??
@@ -239,6 +257,9 @@ export async function isLaunchAgentLoaded(args: GatewayServiceEnvArgs): Promise<
   if (probe.state === "not-loaded") {
     return false;
   }
+  if (probe.inspectionReason) {
+    throw new ServiceInspectionError(probe.inspectionReason);
+  }
   throw new Error(`launchctl print failed: ${probe.detail ?? "unknown error"}`);
 }
 
@@ -266,6 +287,8 @@ export async function readLaunchAgentRuntime(
     return {
       status: "unknown",
       detail: formatSystemLaunchDaemonOwnershipSummary(systemOwnership),
+      inspectionReason:
+        systemOwnership.status === "unverifiable" ? systemOwnership.reason : "launchd-system-owned",
       systemLaunchDaemon: {
         status: systemOwnership.status,
         serviceTarget: systemOwnership.serviceTarget,
@@ -283,11 +306,8 @@ export async function readLaunchAgentRuntime(
     return {
       status: "unknown",
       detail: probe.detail,
-      ...(plistExists
-        ? missingGuiSession
-          ? { missingGuiSession: true }
-          : {}
-        : { missingUnit: true }),
+      inspectionReason: probe.inspectionReason,
+      ...(missingGuiSession ? { missingGuiSession: true } : {}),
     };
   }
   const parsed = probe.runtime;
@@ -344,7 +364,7 @@ type LaunchAgentProbeResult =
   | { state: "running"; runtime: LaunchctlPrintInfo }
   | { state: "stopped"; runtime: LaunchctlPrintInfo }
   | { state: "not-loaded" }
-  | { state: "unknown"; detail?: string };
+  | { state: "unknown"; detail?: string; inspectionReason?: ServiceInspectionReason };
 
 export async function probeLaunchAgentState(
   serviceTarget: string,
@@ -360,6 +380,7 @@ export async function probeLaunchAgentState(
     return {
       state: "unknown",
       detail: formatLaunchctlResultDetail(probe) || undefined,
+      inspectionReason: launchctlInspectionReason(probe, serviceTarget),
     };
   }
   const runtime = parseLaunchctlPrint(probe.stdout || probe.stderr || "");

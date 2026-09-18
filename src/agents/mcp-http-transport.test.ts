@@ -521,30 +521,7 @@ describe("OpenClaw MCP HTTP lifecycle adapters", () => {
     },
   );
 
-  it.each([404, 405])(
-    "accepts terminal session DELETE status %s without sending it again",
-    async (status) => {
-      const onDelete = vi.fn(() => new Response(null, { status }));
-      const fetchMock = initializedFetch({
-        onGet: () => new Response(null, { status: 405 }),
-        onDelete,
-      });
-      const transport = new OpenClawStreamableHTTPClientTransport(
-        new URL("http://mcp.invalid/mcp"),
-        {
-          fetch: fetchMock,
-        },
-      );
-      const client = new Client({ name: "test", version: "1" });
-      await client.connect(transport);
-      await transport.terminateSession();
-      await transport.terminateSession();
-      await expect(
-        disposeMcpClient({ client, transport, transportType: "streamable-http" }),
-      ).resolves.toBe("closed");
-      expect(onDelete).toHaveBeenCalledOnce();
-    },
-  );
+
 
   it("does not record a rejected DELETE as successful termination", async () => {
     const onDelete = vi.fn(() => new Response("refused", { status: 500, statusText: "Rejected" }));

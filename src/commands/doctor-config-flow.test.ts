@@ -800,7 +800,9 @@ vi.mock("./doctor/channel-capabilities.js", () => {
   };
 });
 
-vi.mock("../plugins/doctor-contract-registry.js", async () => {
+vi.mock("../plugins/doctor-contract-registry.js", async (importOriginal) => {
+  const { withDeferredPluginDoctorMigrations } =
+    await importOriginal<typeof import("../plugins/doctor-contract-registry.js")>();
   const { asNullableRecord: readNullableRecord } =
     await import("@openclaw/normalization-core/record-coerce");
 
@@ -946,6 +948,7 @@ vi.mock("../plugins/doctor-contract-registry.js", async () => {
   };
   return {
     collectRelevantDoctorPluginIds,
+    withDeferredPluginDoctorMigrations,
     collectDoctorConfigRepairPluginIds: collectRelevantDoctorPluginIds,
     applyPluginDoctorCompatibilityMigrations: normalizeDiscordStreamingAliasesForTest,
     listPluginDoctorLegacyConfigRules: () => [
@@ -1290,6 +1293,7 @@ vi.mock("./doctor/shared/preview-warnings.js", async () => {
 vi.mock("./doctor-config-preflight.js", async () => {
   const fsLocal = await import("node:fs/promises");
   const pathLocal = await import("node:path");
+  const { hashConfigRaw } = await import("../config/io.read-helpers.js");
   const {
     collectRelevantDoctorPluginIds,
     listPluginDoctorLegacyConfigRules,
@@ -1317,12 +1321,12 @@ vi.mock("./doctor-config-preflight.js", async () => {
           : {};
       let injectedEffectiveConfig = injected?.config ? structuredClone(injected.config) : parsed;
       let exists = injected?.exists ?? false;
+      let raw: string | null = exists ? JSON.stringify(parsed) : null;
       if (!injected) {
         try {
-          parsed = JSON.parse(await fsLocal.readFile(configPath, "utf-8")) as Record<
-            string,
-            unknown
-          >;
+          const contents = await fsLocal.readFile(configPath, "utf-8");
+          parsed = JSON.parse(contents) as Record<string, unknown>;
+          raw = contents;
           exists = true;
           injectedEffectiveConfig = parsed;
         } catch {
@@ -1338,6 +1342,8 @@ vi.mock("./doctor-config-preflight.js", async () => {
           snapshot: {
             exists,
             path: configPath,
+            raw,
+            hash: hashConfigRaw(raw),
             parsed,
             agentRosterIncludeOwned: injected?.agentRosterIncludeOwned === true,
             ...(injected?.includeProvenance
@@ -1365,6 +1371,8 @@ vi.mock("./doctor-config-preflight.js", async () => {
         snapshot: {
           exists,
           path: configPath,
+          raw,
+          hash: hashConfigRaw(raw),
           parsed,
           agentRosterIncludeOwned: injected?.agentRosterIncludeOwned === true,
           ...(injected?.includeProvenance ? { includeProvenance: injected.includeProvenance } : {}),
@@ -1381,7 +1389,9 @@ vi.mock("./doctor-config-preflight.js", async () => {
   };
 });
 
-vi.mock("./doctor-config-analysis.js", () => {
+vi.mock("./doctor-config-analysis.js", async (importOriginal) => {
+  const { noteDoctorHookConfigWarnings, noteMissingDefaultAgentOwner } =
+    await importOriginal<typeof import("./doctor-config-analysis.js")>();
   function formatConfigKeyPath(parts: Array<string | number>): string {
     if (parts.length === 0) {
       return "<root>";
@@ -1419,9 +1429,10 @@ vi.mock("./doctor-config-analysis.js", () => {
     collectImplicitFallbackClobberWarnings: collectImplicitFallbackClobberWarningsMock,
     formatConfigKeyPath,
     noteImplicitFallbackClobberWarnings: noteImplicitFallbackClobberWarningsMock,
-    noteIncludeConfinementWarning: vi.fn(),
     noteOpencodeProviderOverrides: vi.fn(),
     noteMcpOriginWarning: vi.fn(),
+    noteDoctorHookConfigWarnings,
+    noteMissingDefaultAgentOwner,
     noteSandboxOriginProxyWarning: vi.fn(),
     resolveConfigPathTarget,
     stripUnknownConfigKeys: vi.fn((config: Record<string, unknown>) => {
@@ -1796,6 +1807,27 @@ describe("doctor config flow", () => {
       },
     });
   });
+
+  it.each([false, true])(
+    "explains how to select a default for an ownerless explicit fleet (repair: %s)",
+    async (repair) => {
+      const config: OpenClawConfig = {
+        agents: { ownership: "explicit", entries: { ops: {}, research: {} } },
+      };
+      const result = await runDoctorConfigWithInput({
+        config,
+        parsedConfig: config,
+        repair,
+        run: loadAndMaybeMigrateDoctorConfig,
+      });
+      expect(result.cfg.agents).toEqual(config.agents);
+      expect(result.shouldWriteConfig).toBe(false);
+      expect(terminalNoteMock).toHaveBeenCalledWith(
+        expect.stringContaining("openclaw config set agents.defaults.systemAgent.agentId <id>"),
+        "Agent ownership",
+      );
+    },
+  );
 
   it("materializes ambient roles for a multi-agent configured default", async () => {
     const rawConfig = {
@@ -2391,30 +2423,6 @@ describe("doctor config flow", () => {
       .filter(([, title]) => title === "Doctor warnings")
       .map(([message]) => message);
     expect(doctorWarnings.join("\n")).toContain("clobbers agents.defaults.model.fallbacks");
-  });
-
-  it("warns when hooks transformsDir points outside the hook transforms root", async () => {
-    const doctorWarnings = await collectDoctorWarnings({
-      hooks: {
-        enabled: true,
-        token: "hook-secret",
-        transformsDir: "/virtual/.openclaw/workspace/skills/linear-webhook",
-        mappings: [
-          {
-            match: { path: "linear" },
-            action: "agent",
-            messageTemplate: "Linear event",
-            transform: { module: "./openclaw-linear-transform.js" },
-          },
-        ],
-      },
-    });
-
-    const warning = doctorWarnings.join("\n");
-    expect(warning).toContain("hooks.transformsDir:");
-    expect(warning).toContain("/virtual/.openclaw/workspace/skills/linear-webhook");
-    expect(warning).toContain("/virtual/.openclaw/hooks/transforms");
-    expect(warning).toContain("move custom transforms there or remove hooks.transformsDir");
   });
 
   it("warns when internal hook entries include unsupported loader keys", async () => {

@@ -3,6 +3,7 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Page } from "playwright";
 import { afterEach, expect, it } from "vitest";
+import { prepareChatHistoryFixture } from "../test-helpers/chat-activity-fixtures.ts";
 import { takeControlUiViewportScreenshot } from "../test-helpers/control-ui-e2e-screenshot.ts";
 import {
   controlUiSessionUrl,
@@ -58,71 +59,6 @@ suite.define(() => {
       await suite.closeBrowserContext(page.context());
     }
     page = undefined;
-  });
-
-  it("keeps a failed session's draft until history is ready for an explicit retry", async () => {
-    const context = await suite.newBrowserContext({});
-    const currentPage = await context.newPage();
-    page = currentPage;
-    const sessionKey = "agent:main:main";
-    const diagnostic = "⚠️ ✉️ Message failed: delivery unavailable near 🧭";
-    const renderedDiagnostic = "Message failed: delivery unavailable near 🧭";
-    const gateway = await installMockGateway(currentPage, {
-      sessionKey,
-      // Account recovery can replace startup with a scoped history request.
-      heldMethods: ["chat.startup", "chat.history", "chat.send"],
-      sessions: [
-        {
-          key: sessionKey,
-          status: "failed",
-          hasActiveRun: false,
-          lastRunId: "failed-run",
-          lastRunError: diagnostic,
-        },
-      ],
-    });
-    await currentPage.goto(controlUiSessionUrl(suite.server.baseUrl, sessionKey));
-    await gateway.waitForRequest("sessions.list", { match: rosterMatch });
-    const startup = await gateway.waitForRequest("chat.startup");
-    expect(startup.params).toMatchObject({ sessionKey });
-    await currentPage.locator(".agent-chat__input textarea").fill("Try again");
-    expect(await currentPage.locator(".chat-send-btn--send").isDisabled()).toBe(true);
-    expect(await gateway.getRequests("chat.send")).toHaveLength(0);
-
-    // Fault injection controls only WebSocket delivery, never application state.
-    await gateway.resolveDeferred("chat.startup");
-    const sendButton = currentPage.getByRole("button", { name: "Send message" });
-    await expect
-      .poll(
-        async () =>
-          (await gateway.getRequests("chat.history")).length > 0 ||
-          ((await sendButton.count()) > 0 && (await sendButton.isEnabled())),
-      )
-      .toBe(true);
-    if ((await gateway.getRequests("chat.history")).length > 0) {
-      await gateway.resolveDeferred("chat.history");
-    }
-    await sendButton.waitFor();
-    expect(await currentPage.locator(".agent-chat__input textarea").inputValue()).toBe("Try again");
-    expect(await gateway.getRequests("chat.send")).toHaveLength(0);
-    const alert = currentPage.getByRole("alert").filter({ hasText: renderedDiagnostic });
-    await alert.waitFor();
-    await alert.locator(".chat-error__content > strong").getByText(renderedDiagnostic).waitFor();
-    expect(await alert.locator("details").count()).toBe(0);
-    await sendButton.click();
-    const send = await gateway.waitForRequest("chat.send");
-    const { idempotencyKey: runId } = send.params as { idempotencyKey: string };
-    expect(runId).toEqual(expect.any(String));
-    expect(await alert.count()).toBe(0);
-    await gateway.resolveDeferred("chat.send", { runId, status: "started" });
-    await currentPage.getByRole("button", { name: "Stop generating" }).waitFor();
-    await gateway.emitChatFinal({ sessionKey, runId, text: "Recovery completed." });
-    await currentPage
-      .locator(".chat-group.assistant")
-      .getByText("Recovery completed.", { exact: true })
-      .waitFor();
-    await expect.poll(() => alert.count()).toBe(0);
-    expect(await currentPage.getByRole("button", { name: "Stop generating" }).count()).toBe(0);
   });
 
   it("excludes a reply-less failed turn's idle time from the next successful turn", async () => {
@@ -196,6 +132,7 @@ suite.define(() => {
       role: "toolResult",
       toolName: "bash",
       toolCallId: "successful-tool",
+      isError: false,
       content: "ok",
       timestamp: firstStartedAt + 982_000,
       __openclaw: { id: "successful-tool-result", runId },
@@ -222,7 +159,7 @@ suite.define(() => {
     // The same canonical history must survive a full page reload, not just
     // the live terminal projection or its retained local timestamps.
     await gateway.setMethodResponse("chat.history", {
-      messages,
+      ...prepareChatHistoryFixture(messages),
       sessionId: `session:${sessionKey}`,
       sessionInfo: { key: sessionKey, hasActiveRun: false, activeRunIds: [], status: "done" },
     });
@@ -231,16 +168,19 @@ suite.define(() => {
       .locator(".chat-group.assistant")
       .getByText(reply.content, { exact: true });
     await replyBody.waitFor();
-    const elapsedLabel = currentPage.locator(".chat-work-group .chat-activity-group__label");
+    const operationLabel = currentPage.locator(".chat-work-group .chat-activity-group__label");
+    const elapsedLabel = currentPage.locator(".chat-work-group .chat-activity-group__duration");
     await elapsedLabel.waitFor();
-    expect.soft(await elapsedLabel.textContent()).toBe("Worked for 13s");
+    await expect.poll(() => operationLabel.textContent()).toBe("Bash");
+    expect.soft(await elapsedLabel.textContent()).toBe("13s");
     expect(await currentPage.getByRole("button", { name: "Stop generating" }).count()).toBe(0);
 
     await currentPage.reload();
     await gateway.waitForRequest("chat.startup");
     await replyBody.waitFor();
     await elapsedLabel.waitFor();
-    expect(await elapsedLabel.textContent()).toBe("Worked for 13s");
+    expect(await operationLabel.textContent()).toBe("Bash");
+    expect(await elapsedLabel.textContent()).toBe("13s");
     expect(await currentPage.locator(".chat-group.user").count()).toBe(2);
   });
 

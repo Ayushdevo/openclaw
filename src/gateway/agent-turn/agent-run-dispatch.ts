@@ -15,7 +15,10 @@ import {
 } from "../../agents/cron-creator-authority-context.js";
 import { isTimeoutError } from "../../agents/failover-error.js";
 import type { MainSessionRecoveryPendingTarget } from "../../agents/main-session-recovery/main-session-recovery-store.js";
-import { isAgentRunRestartAbortReason } from "../../agents/run-termination.js";
+import {
+  isAgentRunDirectAbortReason,
+  isAgentRunRestartAbortReason,
+} from "../../agents/run-termination.js";
 import { runWithCanonicalSkillWorkspace } from "../../agents/skill-workshop-workspace-context.js";
 import {
   createExecutionStartedOwnerBinding,
@@ -37,6 +40,7 @@ import { withTimeout } from "../../infra/fs-safe.js";
 import { defaultRuntime } from "../../runtime.js";
 import { createRunningTaskRun } from "../../tasks/detached-task-runtime.js";
 import { getTaskById } from "../../tasks/runtime-internal.js";
+import { captureTaskCancellationControl } from "../../tasks/task-cancellation-context.js";
 import { bindTaskFlowExecution } from "../../tasks/task-flow-registry.store.sqlite.js";
 import { mapAgentRunTerminalOutcomeToTaskStatus } from "../../tasks/task-registry-common.js";
 import { bindTaskRunExecution } from "../../tasks/task-registry.store.sqlite.js";
@@ -79,7 +83,8 @@ function isGatewayAbortSignalReason(reason: unknown): boolean {
 
 function isGatewayAgentAbortRejection(error: unknown, signal: AbortSignal): boolean {
   if (!signal.aborted) {
-    return false;
+    // The run can cancel its own controller without aborting the Gateway observer.
+    return isAgentRunDirectAbortReason(error);
   }
   if (isAgentRunRestartAbortReason(signal.reason)) {
     return true;
@@ -111,7 +116,7 @@ const RESOLVED_GATEWAY_STATUS_BY_TERMINAL_CLASSIFICATION = {
 
 function projectRejectedGatewayStatus(outcome: AgentRunTerminalOutcome): "error" | "timeout" {
   // The shipped wire keeps raw provider/AbortError rejections as errors. Only
-  // signal-owned cancellation/timeout metadata promotes a rejection to timeout.
+  // owner-recorded cancellation/timeout metadata promotes a rejection to timeout.
   return outcome.reason === "cancelled" ||
     outcome.reason === "superseded" ||
     outcome.stopReason === "timeout"
@@ -156,13 +161,18 @@ export function dispatchAgentRunFromGateway(params: {
   }) => Promise<boolean> | boolean;
 }) {
   let trackedTask: TaskRecord | undefined;
-  if (params.taskTrackingMode === "cli") {
+  if (params.taskTrackingMode !== "none") {
+    const followup =
+      typeof params.taskTrackingMode === "object" ? params.taskTrackingMode : undefined;
     try {
       trackedTask =
         createRunningTaskRun({
           runtime: "cli",
           sourceId: params.runId,
-          ownerKey: params.ingressOpts.sessionKey,
+          ownerKey: followup?.requesterSessionKey ?? params.ingressOpts.sessionKey,
+          requesterSessionKey: followup?.requesterSessionKey,
+          label: followup?.label,
+          ...(followup ? { notifyPolicy: "silent" as const } : {}),
           scopeKind: "session",
           requesterOrigin: normalizeDeliveryContext({
             channel: params.ingressOpts.channel,
@@ -212,9 +222,13 @@ export function dispatchAgentRunFromGateway(params: {
     ? createCronCreatorAuthorityCapability(
         params.cronCreatorAuthority.runId,
         params.cronCreatorAuthority.callerOrigin,
-        params.cronCreatorAuthority.controlUiAdmin,
+        params.cronCreatorAuthority.managementEntitlement,
+        params.cronCreatorAuthority.isCurrent,
       )
     : undefined;
+  if (cronCreatorAuthorityCapability) {
+    params.cronCreatorAuthority?.bindRunScope?.(cronCreatorAuthorityCapability);
+  }
   const ingressOptsWithSpawnFacts = withAgentCommandExecutionIdentitySpawnFacts(
     params.ingressOpts,
     readAgentRunDispatchExecutionIdentity(params),
@@ -277,6 +291,7 @@ export function dispatchAgentRunFromGateway(params: {
         params.abortController.signal,
       )
     : runAgent();
+  let inputCompletionWriteFailed = false;
   const runCompletion = agentRun
     .then(async (result) => {
       const recordedOutcome = readAgentRunTerminalOutcome(result);
@@ -292,7 +307,7 @@ export function dispatchAgentRunFromGateway(params: {
           : undefined;
       const timeoutPhase = normalizeAgentRunTimeoutPhase(result?.meta?.timeoutPhase);
       const terminalError = readAgentRunTerminalError(result) ?? result?.meta?.error?.message;
-      const terminalOutcome = buildAgentRunTerminalOutcome({
+      let terminalOutcome = buildAgentRunTerminalOutcome({
         status:
           aborted || result?.meta?.stopReason === "timeout" || timeoutPhase
             ? "timeout"
@@ -307,6 +322,15 @@ export function dispatchAgentRunFromGateway(params: {
         timeoutPhase,
         providerStarted: result?.meta?.providerStarted,
       });
+      let recordedInputCompletion: AgentRunTerminalOutcome | undefined;
+      try {
+        recordedInputCompletion =
+          params.ingressOpts.userTurnTranscriptRecorder?.completeProcessing?.(terminalOutcome);
+        terminalOutcome = recordedInputCompletion ?? terminalOutcome;
+      } catch (error) {
+        inputCompletionWriteFailed = true;
+        throw error;
+      }
       const responseStatus =
         RESOLVED_GATEWAY_STATUS_BY_TERMINAL_CLASSIFICATION[
           classifyAgentRunTerminalOutcome(terminalOutcome)
@@ -350,6 +374,8 @@ export function dispatchAgentRunFromGateway(params: {
           : {}),
         result,
       };
+      const inputProcessingCompleted =
+        recordedInputCompletion?.reason === "completed" && responseStatus === "ok";
       const persistTerminalDedupe = () => {
         setGatewayDedupeEntries({
           dedupe: params.context.dedupe,
@@ -357,7 +383,10 @@ export function dispatchAgentRunFromGateway(params: {
           entry: {
             ts: Date.now(),
             ok: true,
-            payload,
+            payload: {
+              ...payload,
+              ...(inputProcessingCompleted ? { inputProcessingCompleted: true } : {}),
+            },
           },
         });
       };
@@ -384,7 +413,14 @@ export function dispatchAgentRunFromGateway(params: {
       cleanupRunOwner();
       // Send a second res frame (same id) so TS clients with expectFinal can wait.
       // Swift clients will typically treat the first res as the result and ignore this.
-      params.io.emitFinal([true, payload, undefined], { runId: params.runId });
+      params.io.emitFinal(
+        [
+          true,
+          { ...payload, ...(inputProcessingCompleted ? { inputProcessingCompleted: true } : {}) },
+          undefined,
+        ],
+        { runId: params.runId },
+      );
       return { terminalOutcome, settled };
     })
     .catch(async (cause: unknown) => {
@@ -396,12 +432,25 @@ export function dispatchAgentRunFromGateway(params: {
         : isAbortError(cause)
           ? "aborted"
           : undefined;
-      const terminalOutcome = buildAgentRunTerminalOutcome({
+      let terminalOutcome = buildAgentRunTerminalOutcome({
         status: aborted || isTimeoutError(cause) ? "timeout" : "error",
         error: renderedErr,
         stopReason,
         timeoutPhase: stopReason === "restart" ? "gateway_draining" : undefined,
       });
+      // A failed required write cannot be its own retry loop. Publish failure
+      // and release the accepted owner even while the receipt store is unavailable.
+      if (!inputCompletionWriteFailed) {
+        try {
+          terminalOutcome =
+            params.ingressOpts.userTurnTranscriptRecorder?.completeProcessing?.(terminalOutcome) ??
+            terminalOutcome;
+        } catch (completionError) {
+          params.context.logGateway.warn(
+            `input completion persistence failed: ${formatForLog(completionError)}`,
+          );
+        }
+      }
       const responseStatus = projectRejectedGatewayStatus(terminalOutcome);
       if (trackedTask) {
         const status = mapAgentRunTerminalOutcomeToTaskStatus(terminalOutcome);
@@ -482,6 +531,7 @@ export function dispatchAgentRunFromGateway(params: {
       ) {
         return err("Task no longer owns an active Gateway run.");
       }
+      captureTaskCancellationControl()?.assertCurrent();
       const result = abortChatRunById(createChatAbortOps(params.context), {
         runId: params.runId,
         sessionKey,

@@ -3,6 +3,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
+import * as bundledSources from "./bundled-sources.js";
 import { attachPluginInstallOwnerMigrations } from "./install-transaction.js";
 import { recordInstalledPluginIndexInstallOwner } from "./installed-plugin-index-install-owner.js";
 import type { InstalledPluginIndex, InstalledPluginIndexRecord } from "./installed-plugin-index.js";
@@ -82,6 +83,7 @@ function installedIndex(params: {
 describe("plugin release cohort package reconciliation", () => {
   const tempDirs: string[] = [];
   afterEach(() => cleanupTrackedTempDirs(tempDirs));
+  afterEach(() => vi.restoreAllMocks());
   beforeEach(() => {
     vi.resetAllMocks();
     collectMissingPluginInstallPayloadsMock.mockResolvedValue([]);
@@ -99,6 +101,7 @@ describe("plugin release cohort package reconciliation", () => {
   });
 
   it("keeps updates and payload verification active without initial install owners", async () => {
+    const sourceDiscovery = vi.spyOn(bundledSources, "resolveSourceCheckoutBundledPluginIds");
     const config = { plugins: { entries: { unrelated: { enabled: false } } } };
     const records = {
       introduced: {
@@ -145,6 +148,7 @@ describe("plugin release cohort package reconciliation", () => {
       remainingMissingPayloads: remaining,
     });
     expect(loadInstalledPluginIndexMock).not.toHaveBeenCalled();
+    expect(sourceDiscovery).not.toHaveBeenCalled();
   });
 
   it.each(["missing", "replaced", "replaced after sync introduces its owner"] as const)(
@@ -332,5 +336,63 @@ describe("plugin release cohort package reconciliation", () => {
     expect(result.config.channels?.qqbot).toEqual(config.channels.qqbot);
     expect(result.config.plugins?.installs).toEqual(canonicalRecords);
     expect(result.config.plugins?.load?.paths).toEqual(["/plugins/unrelated.js"]);
+  });
+
+  it("rejects a repair owner migration when caller authority is revoked before the cohort resumes", async () => {
+    const records = {
+      legacy: { source: "npm", spec: "@example/legacy", installPath: "/plugins/legacy" },
+    } satisfies Record<string, PluginInstallRecord>;
+    const config = { plugins: { installs: records } };
+    const repair = attachPluginInstallOwnerMigrations(
+      {
+        config: {
+          plugins: {
+            installs: {
+              canonical: {
+                source: "npm",
+                spec: "@example/canonical",
+                installPath: "/plugins/canonical",
+              },
+            },
+          },
+        } satisfies OpenClawConfig,
+        changed: true,
+        outcomes: [],
+      },
+      { legacy: "canonical" },
+    );
+    const failure = new Error("original update authority revoked");
+    let current = true;
+    const assertCurrent = () => {
+      if (!current) {
+        throw failure;
+      }
+    };
+    loadInstalledPluginIndexMock.mockReturnValue(installedIndex({ records }));
+    collectMissingPluginInstallPayloadsMock.mockResolvedValueOnce([
+      { pluginId: "legacy", installPath: "/plugins/legacy", reason: "missing-package-json" },
+    ]);
+    updateNpmInstalledPluginsMock.mockResolvedValue(repair).mockImplementationOnce(async () => {
+      // Revoke after repair returns but before the awaiting cohort continues.
+      queueMicrotask(() => {
+        current = false;
+      });
+      return repair;
+    });
+
+    await expect(
+      convergePluginReleaseCohort({
+        config,
+        channel: "stable",
+        timeoutMs: 60_000,
+        beforePersistentEffect: assertCurrent,
+      }),
+    ).rejects.toBe(failure);
+    expect(updateNpmInstalledPluginsMock).toHaveBeenCalledOnce();
+    expect(updateNpmInstalledPluginsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ pluginIds: ["legacy"], beforePersistentEffect: assertCurrent }),
+    );
+    expect(loadInstalledPluginIndexMock).toHaveBeenCalledOnce();
+    expect(collectMissingPluginInstallPayloadsMock).toHaveBeenCalledOnce();
   });
 });

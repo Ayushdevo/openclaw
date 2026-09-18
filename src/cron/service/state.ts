@@ -298,6 +298,7 @@ type QueuedCronRunReservation = {
   markerAtMs: number;
   runReceipt: CronRunReceiptHandle;
   preserveWhenDisabled: boolean;
+  onExit?: boolean;
   activationPreviousLastError?: { value: string | undefined };
 };
 
@@ -333,8 +334,6 @@ export type CronServiceState = {
    * until the runtime can quarantine and sanitize the active store.
    */
   warnedInvalidPersistedJobKeys: Set<string>;
-  /** Availability is rechecked every tick; this set only bounds skip diagnostics. */
-  reportedUnavailableReaperAgentIds: Set<string>;
   pendingQuarantineConfigJobs: QuarantinedCronConfigJob[];
   lastQuarantineFailureWarnKey: string | null;
   storeLoadedAtMs: number | null;
@@ -364,7 +363,6 @@ export function createCronServiceState(deps: CronServiceDeps): CronServiceState 
     op: Promise.resolve(),
     warnedDisabled: false,
     warnedInvalidPersistedJobKeys: new Set<string>(),
-    reportedUnavailableReaperAgentIds: new Set<string>(),
     pendingQuarantineConfigJobs: [],
     lastQuarantineFailureWarnKey: null,
     storeLoadedAtMs: null,
@@ -421,8 +419,10 @@ export type CronRunResult =
   | { ok: true; ran: false; reason: "ownerless" }
   | { ok: false };
 
-/** Remove result that distinguishes missing jobs from failed removal. */
-export type CronRemoveResult = { ok: true; removed: boolean } | { ok: false; removed: false };
+/** Remove result, including deferred base-session cleanup after durable deletion. */
+export type CronRemoveResult =
+  | { ok: true; removed: boolean; sessionCleanup?: "pending" }
+  | { ok: false; removed: false };
 
 /** Created cron job returned by service mutation calls. */
 type CronDeclarativeAddResult = CronStoredJob & {
@@ -463,7 +463,8 @@ export type CronAddOptions = {
 export type CronUpdateInput = CronJobPatch;
 /** Authenticated caller provenance used only when a tool policy is explicitly adopted. */
 export type CronUpdateOptions = {
-  scheduledToolPolicy?: CronScheduledToolPolicy;
+  /** Null forbids policy adoption; undefined retains in-process operator defaults. */
+  scheduledToolPolicy?: CronScheduledToolPolicy | null;
   toolsAllowProvenance?: CronToolsAllowProvenance;
   /** Restrict-only exec pin from the signed creator-turn identity. */
   toolsAllowExecTarget?: CronToolsAllowExecTarget;

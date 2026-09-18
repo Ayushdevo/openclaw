@@ -270,7 +270,7 @@ describe("Codex supervision actions", () => {
       getRuntimeConfig: () => config,
       env: { CODEX_HOME: home },
     });
-    const source = factory.homesForAgent("main")[0]!;
+    const source = (await factory.homesForAgent("main"))[0]!;
     const { runtime, createSessionEntry } = createRuntime();
     const { api } = createGatewayApi(runtime);
     await expect(
@@ -289,7 +289,6 @@ describe("Codex supervision actions", () => {
     );
     expect(pinnedConnectionMocks.request.mock.calls.map(([request]) => request.method)).toEqual([
       "thread/read",
-      "thread/list",
       "thread/read",
     ]);
   });

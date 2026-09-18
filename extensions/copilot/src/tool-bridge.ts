@@ -73,8 +73,10 @@ type CopilotToolAttemptParams = Partial<Omit<EmbeddedRunAttemptParamsV2, "hostCa
 type CopilotToolCompletion = {
   toolName: string;
   toolCallId: string;
+  parentToolCallId?: string;
   args: Record<string, unknown>;
   result?: unknown;
+  isError: boolean;
   error?: string;
   startedAt: number;
 };
@@ -189,10 +191,6 @@ export async function createCopilotToolBridge(
     return { codeModeEngaged: false, promptToolPolicy: EMPTY_PROMPT_TOOL_POLICY, sourceTools: [] };
   }
 
-  const createOpenClawCodingTools =
-    input.createOpenClawCodingTools ??
-    (await import("openclaw/plugin-sdk/agent-harness")).createOpenClawCodingTools;
-
   const toolSurfaceRuntime = createAgentHarnessToolSurfaceRuntime({
     abortSignal: input.abortSignal,
     agentId: attemptParams.sandboxAgentId ?? input.agentId,
@@ -237,11 +235,21 @@ export async function createCopilotToolBridge(
   const bindingCwd = toolOptions.cwd ?? toolOptions.workspaceDir;
   const bindingOptions = bindingCwd ? { cwd: bindingCwd } : undefined;
   try {
-    const constructedTools = await createOpenClawCodingTools(toolOptions);
-    if (!Array.isArray(constructedTools)) {
-      throw new Error("createOpenClawCodingTools must return an array of tools");
+    let boundTools: AnyAgentTool[];
+    if (input.createOpenClawCodingTools) {
+      const constructedTools = await input.createOpenClawCodingTools(toolOptions);
+      if (!Array.isArray(constructedTools)) {
+        throw new Error("createOpenClawCodingTools must return an array of tools");
+      }
+      boundTools = hostCapabilities.bindToolSurface(constructedTools, bindingOptions);
+    } else {
+      const createToolSurface = hostCapabilities.createToolSurface;
+      if (!createToolSurface) {
+        throw new Error("Copilot tool construction requires a current host capability");
+      }
+      // The host supplies run-owned resources and binds its tools exactly once.
+      boundTools = createToolSurface(toolOptions, bindingOptions);
     }
-    const boundTools = hostCapabilities.bindToolSurface(constructedTools, bindingOptions);
     sourceTools = boundTools;
     for (const tool of boundTools) {
       boundSourceTools.add(tool);
@@ -417,6 +425,7 @@ function buildOpenClawCodingToolsOptions(
     sandbox,
     spawnWorkspaceDir: input.spawnWorkspaceDir,
     config: toolSurfaceRuntime?.config ?? a.config,
+    skillsSnapshot: a.skillsSnapshot,
     abortSignal: input.abortSignal,
     modelProvider: input.modelProvider,
     modelId: input.modelId,
@@ -513,7 +522,7 @@ function convertOpenClawToolToSdkTool(
     executionStarted: boolean,
   ): ToolResultObject => {
     const errorMessage = toCopilotToolError(error).message;
-    input.attemptParams.observeToolTerminal?.({
+    const terminal = input.attemptParams.observeToolTerminal?.({
       toolCallId: invocation.toolCallId,
       toolName: sourceTool.name,
       result: error,
@@ -533,7 +542,8 @@ function convertOpenClawToolToSdkTool(
     notifyToolCompleted({
       toolName: sourceTool.name,
       toolCallId: invocation.toolCallId,
-      args: toToolStartArgs(executedArgs),
+      args: toToolStartArgs(terminal?.executedArguments ?? executedArgs),
+      isError: true,
       error: errorMessage,
       startedAt,
     });
@@ -609,7 +619,7 @@ function convertOpenClawToolToSdkTool(
       isError: resultIsError,
     });
     const resultError = resultIsError ? extractToolErrorMessage(sanitizedResult) : undefined;
-    input.attemptParams.observeToolTerminal?.({
+    const terminal = input.attemptParams.observeToolTerminal?.({
       toolCallId: invocation.toolCallId,
       toolName: sourceTool.name,
       result,
@@ -623,8 +633,9 @@ function convertOpenClawToolToSdkTool(
     notifyToolCompleted({
       toolName: sourceTool.name,
       toolCallId: invocation.toolCallId,
-      args: toToolStartArgs(preparedArgs),
+      args: toToolStartArgs(terminal?.executedArguments ?? preparedArgs),
       result: sanitizedResult,
+      isError: resultIsError,
       ...(resultError ? { error: resultError } : {}),
       startedAt,
     });
@@ -675,7 +686,7 @@ async function executeCatalogTool(
       ? (extractToolErrorMessage(sanitizedResult) ?? "tool returned an error")
       : undefined;
     terminalObserved = true;
-    input.attemptParams?.observeToolTerminal?.({
+    const terminal = input.attemptParams?.observeToolTerminal?.({
       toolCallId: params.toolCallId,
       toolName: params.toolName,
       result,
@@ -693,8 +704,10 @@ async function executeCatalogTool(
     await input.onToolCompleted?.({
       toolName: params.toolName,
       toolCallId: params.toolCallId,
-      args: toToolStartArgs(preparedArgs),
+      parentToolCallId: params.parentToolCallId,
+      args: toToolStartArgs(terminal?.executedArguments ?? preparedArgs),
       result: sanitizedResult,
+      isError,
       ...(error ? { error } : {}),
       startedAt,
     });
@@ -704,7 +717,7 @@ async function executeCatalogTool(
     // Completion hooks can throw after the tool terminal outcome. Do not
     // rewrite that recorded outcome as a second, contradictory tool failure.
     if (!terminalObserved) {
-      input.attemptParams?.observeToolTerminal?.({
+      const terminal = input.attemptParams?.observeToolTerminal?.({
         toolCallId: params.toolCallId,
         toolName: params.toolName,
         result: error,
@@ -714,6 +727,7 @@ async function executeCatalogTool(
         failure: { error: message },
         ...(ownerMutation ? { ownerMutation } : {}),
       });
+      preparedArgs = terminal?.executedArguments ?? preparedArgs;
     }
     const failure = sanitizeToolResult({
       content: [{ type: "text", text: message }],
@@ -727,7 +741,9 @@ async function executeCatalogTool(
     await input.onToolCompleted?.({
       toolName: params.toolName,
       toolCallId: params.toolCallId,
+      parentToolCallId: params.parentToolCallId,
       args: toToolStartArgs(preparedArgs),
+      isError: true,
       error: message,
       startedAt,
     });

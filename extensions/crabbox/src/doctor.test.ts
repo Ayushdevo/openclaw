@@ -1,14 +1,14 @@
 import path from "node:path";
 import type { HealthCheck, HealthRepairContext } from "openclaw/plugin-sdk/health";
-import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
+import {
+  createPluginStateSyncKeyedStoreForTests,
+  resetPluginStateStoreForTests,
+} from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import * as processRuntime from "openclaw/plugin-sdk/process-runtime";
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as managedBinary from "./crabbox-managed-binary.js";
-import {
-  openCrabboxWarmImageStore,
-  type WarmProfileRecord,
-} from "./crabbox-worker-warm-image-store.js";
+import type { WarmProfileRecord } from "./crabbox-worker-warm-image-store.js";
 import {
   CRABBOX_CLOUD_WORKER_PROFILE_CHECK_ID,
   registerCrabboxWorkerProviderDoctorChecks,
@@ -58,7 +58,7 @@ describe("Crabbox worker doctor", () => {
   it("accepts a supported configured executable without downloading", async () => {
     const probe = vi
       .spyOn(managedBinary, "probeCrabboxVersion")
-      .mockResolvedValue({ status: "supported", version: "0.55.0" });
+      .mockResolvedValue({ status: "supported", version: "0.56.0" });
     const install = vi.spyOn(managedBinary, "ensureManagedCrabboxBinary");
     await expect(captureCrabboxDoctorCheck().detect(context())).resolves.toEqual([]);
     expect(probe).toHaveBeenCalledOnce();
@@ -77,7 +77,7 @@ describe("Crabbox worker doctor", () => {
         expect.objectContaining({
           severity: "warning",
           target: "worker",
-          requirement: "Crabbox 0.55.0 or newer",
+          requirement: "Crabbox 0.56.0 or newer",
           fixHint: expect.stringContaining("openclaw doctor --fix"),
         }),
       ]);
@@ -89,7 +89,7 @@ describe("Crabbox worker doctor", () => {
     vi.spyOn(managedBinary, "resolveManagedCrabboxBinaryPath").mockReturnValue(process.execPath);
     vi.spyOn(managedBinary, "probeCrabboxVersion").mockResolvedValue({
       status: "supported",
-      version: "0.55.0",
+      version: "0.56.0",
     });
     const ctx = context();
     ctx.cfg.cloudWorkers!.profiles!.worker!.settings = { binary: "/nonexistent/crabbox" };
@@ -115,7 +115,7 @@ describe("Crabbox worker doctor", () => {
       .spyOn(managedBinary, "ensureManagedCrabboxBinary")
       .mockImplementation(async ({ binary } = {}) => ({
         binary: binary ?? "crabbox",
-        version: "0.55.0",
+        version: "0.56.0",
       }));
     const check = captureCrabboxDoctorCheck();
     const findings = [{ checkId: CRABBOX_CLOUD_WORKER_PROFILE_CHECK_ID }] as never;
@@ -156,7 +156,12 @@ describe("Crabbox warm-image doctor", () => {
     "reports $name without repairing state or probing providers",
     async ({ operation, severity }) => {
       const env = { OPENCLAW_STATE_DIR: tempDirs.make("openclaw-crabbox-warm-doctor-") };
-      const store = openCrabboxWarmImageStore(env);
+      const store = createPluginStateSyncKeyedStoreForTests<WarmProfileRecord>("crabbox", {
+        namespace: "warm-images",
+        maxEntries: 128,
+        overflowPolicy: "reject-new",
+        env,
+      });
       const now = Date.now();
       const record: WarmProfileRecord = {
         version: 3,

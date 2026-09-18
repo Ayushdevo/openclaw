@@ -2,6 +2,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { overwriteFileHandle } from "@openclaw/fs-safe/advanced";
 import {
   canonicalPathFromExistingAncestor,
   FsSafeError,
@@ -172,8 +173,8 @@ async function writeBoundTarget(input: {
           input.canonicalTargetPath,
         );
       }
-      await handle.truncate(0);
-      await handle.writeFile(input.buffer);
+      // Preserve the inode authorized by the binding while fs-safe owns write rollback.
+      await overwriteFileHandle(handle, input.buffer);
       await handle.sync();
       return {
         ok: true,

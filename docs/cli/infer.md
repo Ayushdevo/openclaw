@@ -124,7 +124,7 @@ openclaw infer model run --prompt "Summarize this changelog entry" --model opena
 openclaw infer model run --prompt "Describe this image in one sentence" --file ./photo.jpg --model google/gemini-2.5-flash --json
 openclaw infer model run --prompt "Use more reasoning here" --thinking high --json
 openclaw infer model providers --agent <id> --json
-openclaw infer model inspect --model gpt-5.6-sol --json
+openclaw infer model inspect --model gpt-6-astra --json
 ```
 
 Use full `<provider/model>` refs with `--local` to smoke-test one provider without starting the Gateway or loading the agent tool surface:
@@ -211,6 +211,11 @@ openclaw infer audio transcribe --file ./memo.m4a --model openai/whisper-1 --jso
 
 `--model` must be `<provider/model>`.
 
+For CLI-backed transcription, the result's `provider` identifies the tool family
+and `model` reports the executed command. Auto-detected tools report their resolved
+executable path; explicit CLI entries retain their authored command value. This
+field does not identify the speech model loaded internally by the tool.
+
 ## TTS
 
 Speech synthesis and TTS provider/persona state.
@@ -228,6 +233,7 @@ Notes:
 
 - `tts status` only supports `--gateway` (it reflects gateway-managed TTS state).
 - Local and loopback-Gateway `tts convert --output` copies stage beside the destination and replace it only after success; a failed copy leaves an existing file unchanged.
+- Remote-Gateway `tts convert --output` is rejected before requesting speech synthesis.
 - Use `tts convert --provider <id>` when selecting a provider without overriding its model.
 - Use `tts providers`, `tts voices`, `tts personas`, `tts set-provider`, and `tts set-persona` to inspect and configure TTS behavior.
 

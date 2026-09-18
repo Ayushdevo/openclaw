@@ -17,6 +17,7 @@ import {
   withRestoredMocks,
 } from "../test-utils/vitest-spies.js";
 import { PACKAGE_DIST_INVENTORY_RELATIVE_PATH } from "./package-dist-inventory.js";
+import type { CommandRunner } from "./update-global-command-runner.js";
 import {
   canResolveRegistryVersionForPackageTarget,
   collectInstalledGlobalPackageErrors,
@@ -26,14 +27,16 @@ import {
   createGlobalInstallEnv,
   globalInstallArgs,
   globalInstallFallbackArgs,
+  isPackageTargetAlreadyCurrent,
   resolveExpectedInstalledVersionFromSpec,
   resolveGlobalInstallTarget,
   resolveGlobalInstallSpec,
+  resolvePnpmGlobalDirFromGlobalRoot,
+} from "./update-global.js";
+import {
   resolveNpmGlobalPrefixLayoutFromGlobalRoot,
   resolveNpmGlobalPrefixLayoutFromPrefix,
-  resolvePnpmGlobalDirFromGlobalRoot,
-  type CommandRunner,
-} from "./update-global.js";
+} from "./update-npm-prefix.js";
 
 const execFileSyncMock = vi.hoisted(() => vi.fn(() => "/tmp/openclaw-test-global-npmrc\n"));
 const TELEGRAM_RUNTIME_API = bundledDistPluginFile("telegram", "runtime-api.js");
@@ -177,6 +180,37 @@ describe("update global helpers", () => {
     expect(canResolveRegistryVersionForPackageTarget("main")).toBe(false);
     expect(canResolveRegistryVersionForPackageTarget("github:openclaw/openclaw#main")).toBe(false);
     expect(canResolveRegistryVersionForPackageTarget("/tmp/openclaw.tgz")).toBe(false);
+  });
+
+  it.each([
+    { target: "latest", currentVersion: "1.0.0", targetVersion: "1.0.0", expected: true },
+    {
+      target: "/tmp/openclaw-current.tgz",
+      currentVersion: "1.0.0",
+      targetVersion: "1.0.0",
+      expected: false,
+    },
+    {
+      target: "file:/tmp/openclaw-current.tgz",
+      currentVersion: "1.0.0",
+      targetVersion: "1.0.0",
+      expected: false,
+    },
+    {
+      target: "openclaw@file:/tmp/openclaw-current.tgz",
+      currentVersion: "1.0.0",
+      targetVersion: "1.0.0",
+      expected: false,
+    },
+    {
+      target: "openclaw@1.0.0",
+      currentVersion: "1.0.0",
+      targetVersion: "1.0.0",
+      expected: true,
+    },
+    { target: "latest", currentVersion: "1.0.0", targetVersion: "1.0.1", expected: false },
+  ])("classifies same-version package target $target", (testCase) => {
+    expect(isPackageTargetAlreadyCurrent(testCase)).toBe(testCase.expected);
   });
 
   it.each([

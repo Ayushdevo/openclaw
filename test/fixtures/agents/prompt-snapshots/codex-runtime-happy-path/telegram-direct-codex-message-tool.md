@@ -102,7 +102,8 @@
   "model": "gpt-5.5",
   "personality": "none",
   "sandbox": "danger-full-access",
-  "serviceName": "OpenClaw"
+  "serviceName": "OpenClaw",
+  "threadSource": "openclaw"
 }
 ```
 
@@ -180,7 +181,8 @@
   "sandboxPolicy": {
     "type": "dangerFullAccess"
   },
-  "threadId": "thread-telegram-direct-codex-message-tool"
+  "threadId": "thread-telegram-direct-codex-message-tool",
+  "turnTrigger": "user"
 }
 ```
 
@@ -252,8 +254,8 @@ This is the deterministic model-bound layer stack OpenClaw can snapshot for the 
     "roughTokens": 0
   },
   "dynamicToolsJson": {
-    "chars": 58312,
-    "roughTokens": 14578
+    "chars": 66158,
+    "roughTokens": 16540
   },
   "openClawDeveloperInstructions": {
     "chars": 2629,
@@ -264,16 +266,16 @@ This is the deterministic model-bound layer stack OpenClaw can snapshot for the 
     "roughTokens": 127
   },
   "totalTextOnly": {
-    "chars": 26463,
-    "roughTokens": 6616
+    "chars": 26549,
+    "roughTokens": 6638
   },
   "totalWithDynamicToolsJson": {
-    "chars": 84777,
-    "roughTokens": 21195
+    "chars": 92709,
+    "roughTokens": 23178
   },
   "userInputText": {
-    "chars": 793,
-    "roughTokens": 199
+    "chars": 879,
+    "roughTokens": 220
   }
 }
 ```
@@ -541,6 +543,7 @@ For the exact current time, use `session_status`.</openclaw_temporal_context>
 ### User: Turn Input Text
 
 ````text
+[OpenClaw conversation info: sender={"id":"1000001","name":"Pash","username":"pash"}]
 OpenClaw runtime context for this turn:
 Treat this OpenClaw-provided context as supporting project/user reference for the current request.
 

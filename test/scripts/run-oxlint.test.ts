@@ -646,6 +646,62 @@ describe("run-oxlint", () => {
   );
 
   it.each([
+    { name: "Linux CI", env: { CI: "true" }, chunkSize: 16 },
+    { name: "GitHub Actions", env: { GITHUB_ACTIONS: "true" }, chunkSize: 16 },
+    { name: "three CPUs", logicalCpuCount: 3, chunkSize: 8 },
+    { name: "below capacity threshold", memoryCapacityBytes: 15 * 1024 ** 3 - 1, chunkSize: 8 },
+    { name: "ancestor memory cap", memoryCapacityBytes: 8 * 1024 ** 3, chunkSize: 8 },
+    { name: "unknown capacity", memoryCapacityBytes: null, chunkSize: 8 },
+    { name: "local Linux", env: {}, chunkSize: 8 },
+    { name: "macOS", platform: "darwin", chunkSize: 8 },
+    { name: "Windows", platform: "win32", chunkSize: 8 },
+    { name: "explicit stripes", splitExtensions: true, chunkSize: 8 },
+    {
+      name: "explicit serial",
+      env: { CI: "true", OPENCLAW_OXLINT_SHARDS_SERIAL: "1" },
+      chunkSize: 8,
+    },
+  ] as const)("preserves complete plugin coverage with $name batches", (scenario) => {
+    const directories = Array.from(
+      { length: 17 },
+      (_, index) => `plugin-${String(index).padStart(2, "0")}`,
+    );
+    const shards = filterOxlintShards(
+      createOxlintShards({
+        cwd: "/repo",
+        env: { CI: "true" },
+        platform: "linux",
+        ...scenario,
+        hostResources: {
+          totalMemoryBytes: 16 * 1024 ** 3,
+          logicalCpuCount: scenario.logicalCpuCount ?? 4,
+          memoryCapacityBytes:
+            "memoryCapacityBytes" in scenario ? scenario.memoryCapacityBytes : 15 * 1024 ** 3,
+        },
+        readDir: (target) =>
+          target.endsWith("/extensions")
+            ? ([
+                ...directories
+                  .toReversed()
+                  .map((name) => ({ name, isDirectory: () => true, isFile: () => false })),
+                { name: "root.test.ts", isDirectory: () => false, isFile: () => true },
+                { name: "notes.md", isDirectory: () => false, isFile: () => true },
+              ] as never)
+            : [],
+      }),
+      new Set(["extensions"]),
+    );
+    expect(shards.map((shard) => shard.args.slice(2).length)).toEqual(
+      scenario.chunkSize === 16 ? [1, 16, 1] : [1, 8, 8, 1],
+    );
+    expect(shards.flatMap((shard) => shard.args.slice(2))).toEqual([
+      "extensions/root.test.ts",
+      ...directories.map((directory) => `extensions/${directory}`),
+    ]);
+    expect(shouldPrepareExtensionPackageBoundaryArtifactsForShards(shards)).toBe(true);
+  });
+
+  it.each([
     { name: "explicit full speed", memoryGiB: 16, env: { OPENCLAW_LOCAL_CHECK_MODE: "full" } },
     { name: "explicit fast mode", memoryGiB: 16, env: { OPENCLAW_LOCAL_CHECK_MODE: "fast" } },
     { name: "explicit parallel", memoryGiB: 16, env: { OPENCLAW_OXLINT_SHARDS_SERIAL: "0" } },
@@ -682,6 +738,49 @@ describe("run-oxlint", () => {
       oxlintShard("core:packages", "core", "packages"),
     ]);
   });
+
+  it.each([
+    { platform: "linux", env: { CI: "true" } },
+    { platform: "darwin", env: {} },
+    { platform: "win32", env: {} },
+  ] as const)(
+    "bounds small-host core Programs without losing targets on $platform",
+    ({ platform, env }) => {
+      const directories = ["alpha", "beta", "delta", "epsilon", "gamma", "zeta"];
+      const cwd = createTempDir("openclaw-oxlint-core-memory-");
+      for (const directory of directories) {
+        mkdirSync(join(cwd, "src", directory), { recursive: true });
+      }
+      writeFileSync(join(cwd, "src", "root.ts"), "");
+      const shards = filterOxlintShards(
+        createOxlintShards({
+          cwd,
+          env,
+          platform,
+          hostResources: CONSTRAINED_HOST,
+        }),
+        new Set(["core"]),
+      );
+
+      expect(shards).toHaveLength(5);
+      expect(shards.every((shard) => shard.args[1] === "config/tsconfig/oxlint.core.json")).toBe(
+        true,
+      );
+      const targets = shards.flatMap((shard) => shard.args.slice(2));
+      expect(targets.toSorted()).toEqual(
+        [
+          ...directories.map((directory) => `src/${directory}`),
+          "src/root.ts",
+          "ui",
+          "packages",
+        ].toSorted(),
+      );
+      expect(new Set(targets).size).toBe(targets.length);
+      expect(shouldRunOxlintShardsSerial({ env, platform, hostResources: CONSTRAINED_HOST })).toBe(
+        true,
+      );
+    },
+  );
 
   it("parses shard runner flags without forwarding them to oxlint", () => {
     const parsed = parseShardRunnerArgs([

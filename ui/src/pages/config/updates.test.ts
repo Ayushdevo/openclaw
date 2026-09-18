@@ -35,6 +35,7 @@ function createProps(overrides: Partial<UpdatesViewProps> = {}): UpdatesViewProp
       channel: "stable",
     },
     statusBanner: null,
+    statusCheckBanner: null,
     run: null,
     connected: true,
     configBusy: false,
@@ -44,6 +45,7 @@ function createProps(overrides: Partial<UpdatesViewProps> = {}): UpdatesViewProp
     canHoldUpdate: true,
     canReport: true,
     updateBusy: false,
+    statusChecking: false,
     reportableUpdateFailureId: null,
     updateFailureReportBusy: false,
     updateFailureReportNotice: null,
@@ -53,7 +55,7 @@ function createProps(overrides: Partial<UpdatesViewProps> = {}): UpdatesViewProp
     onAutomaticUpdatesChange: vi.fn(),
     onUpdateNow: vi.fn(),
     onHoldUpdate: vi.fn(async () => true),
-    onCheckStatus: vi.fn(async () => undefined),
+    onCheckStatus: vi.fn(async () => true),
     onReportFailure: vi.fn(async () => undefined),
     ...overrides,
   };
@@ -87,6 +89,181 @@ beforeEach(async () => {
 });
 
 describe("renderUpdates", () => {
+  it.each([
+    {
+      name: "checking",
+      props: { statusChecking: true },
+      status: "Checking for updates…",
+      tone: "muted",
+      label: "Update now",
+      disabled: true,
+      title: "Checking for updates…",
+    },
+    {
+      name: "updating while a check is pending",
+      props: { updateBusy: true, statusChecking: true },
+      status: "Update available v2026.8.2",
+      tone: "accent",
+      label: "Updating…",
+      disabled: true,
+      title: "",
+    },
+    {
+      name: "failed check with a known update",
+      props: { statusCheckBanner: { tone: "warn", text: "Could not check for updates: timeout" } },
+      status: "Could not check for updates: timeout",
+      tone: "warn",
+      label: "Update now",
+      disabled: false,
+      title: "",
+    },
+    {
+      name: "failed check with a previously confirmed checkout update",
+      props: {
+        configObject: { update: { channel: "dev", checkOnStart: false } },
+        schedule: {
+          channel: "dev",
+          autoEnabled: false,
+          install: { kind: "git", git: { status: "behind", commitsBehind: 3 } },
+        },
+        updateAvailable: null,
+        statusCheckBanner: { tone: "warn", text: "Could not check for updates: timeout" },
+      },
+      status: "Could not check for updates: timeout",
+      tone: "warn",
+      label: "Update now",
+      disabled: false,
+      title: "",
+    },
+    {
+      name: "failed check with a previously confirmed diverged checkout update",
+      props: {
+        configObject: { update: { channel: "dev", checkOnStart: false } },
+        schedule: {
+          channel: "dev",
+          autoEnabled: false,
+          install: { kind: "git", git: { status: "diverged", commitsAhead: 1, commitsBehind: 3 } },
+        },
+        updateAvailable: null,
+        statusCheckBanner: { tone: "warn", text: "Could not check for updates: timeout" },
+      },
+      status: "Could not check for updates: timeout",
+      tone: "warn",
+      label: "Update now",
+      disabled: false,
+      title: "",
+    },
+    {
+      name: "failed check without a known update",
+      props: {
+        schedule: null,
+        updateAvailable: null,
+        statusCheckBanner: { tone: "warn", text: "Could not check for updates: timeout" },
+      },
+      status: "Could not check for updates: timeout",
+      tone: "warn",
+      label: "Update now",
+      disabled: true,
+      title: "Check for updates successfully before starting an update.",
+    },
+    {
+      name: "up to date",
+      props: {
+        schedule: { channel: "stable", autoEnabled: false, install: { kind: "package" } },
+        updateAvailable: null,
+      },
+      status: "Up to date",
+      tone: "ok",
+      label: "Update now",
+      disabled: false,
+      title: "",
+    },
+    {
+      name: "update available",
+      props: {},
+      status: "Update available v2026.8.2",
+      tone: "accent",
+      label: "Update now",
+      disabled: false,
+      title: "",
+    },
+    {
+      name: "real update failure",
+      props: { statusBanner: { tone: "danger", text: "Update error: build failed" } },
+      status: "Update error: build failed",
+      tone: "danger",
+      label: "Update now",
+      disabled: false,
+      title: "",
+    },
+    {
+      name: "restart pending",
+      props: {
+        updateBusy: true,
+        statusBanner: {
+          tone: "info",
+          text: "Update installed. A gateway restart is already in progress; status will refresh after it reconnects.",
+        },
+      },
+      status:
+        "Update installed. A gateway restart is already in progress; status will refresh after it reconnects.",
+      tone: "accent",
+      label: "Updating…",
+      disabled: true,
+      title: "",
+    },
+  ] satisfies Array<{
+    name: string;
+    props: Partial<UpdatesViewProps>;
+    status: string;
+    tone: string;
+    label: string;
+    disabled: boolean;
+    title: string;
+  }>)("distinguishes $name", ({ props, status, tone, label, disabled, title }) => {
+    const onCheckStatus = vi.fn(async () => true);
+    render(renderUpdates(createProps({ ...props, onCheckStatus })), container);
+    const statusRow = row("Status");
+    expect(statusRow.querySelector(".settings-status")?.textContent?.trim()).toBe(status);
+    expect(statusRow.querySelector(".settings-status")?.className).toBe(
+      tone === "muted" ? "settings-status" : `settings-status settings-status--${tone}`,
+    );
+    const button = row("Update now").querySelector<HTMLButtonElement>("button")!;
+    expect(button.textContent?.trim()).toBe(label);
+    expect(button.disabled).toBe(disabled);
+    expect(button.title).toBe(title);
+    if (props.statusCheckBanner) {
+      expect(container.textContent).not.toContain("Latest update attempt");
+      const check = statusRow.querySelector<HTMLButtonElement>("button")!;
+      expect(check.textContent?.trim()).toBe("Check for updates");
+      expect(check.disabled).toBe(false);
+      check.click();
+      expect(onCheckStatus).toHaveBeenCalledOnce();
+    }
+  });
+
+  it.each([false, true])(
+    "keeps a previous update failure visible during a check (pending: %s)",
+    (statusChecking) => {
+      render(
+        renderUpdates(
+          createProps({
+            statusChecking,
+            statusBanner: { tone: "danger", text: "Update error: build failed" },
+            statusCheckBanner: statusChecking
+              ? null
+              : { tone: "warn", text: "Could not check for updates: timeout" },
+          }),
+        ),
+        container,
+      );
+      expect(row("Status").textContent).toContain(
+        statusChecking ? "Checking for updates…" : "Could not check for updates: timeout",
+      );
+      expect(row("Failure details").textContent).toContain("Update error: build failed");
+    },
+  );
+
   it.each(["ios", "waiting"])(
     "keeps Gateway updates without an advertised device updater: %s",
     (host) => {
@@ -617,11 +794,16 @@ describe("renderUpdates", () => {
     expect(row("Status").querySelector(".settings-status--danger")).not.toBeNull();
   });
 
-  it.each(["succeeded", "failed", "skipped"] as const)(
-    "renders the durable %s report and only offers recovery for unsuccessful runs",
-    async (status) => {
+  it.each([
+    { status: "succeeded", reconciled: false },
+    { status: "failed", reconciled: false },
+    { status: "skipped", reconciled: false },
+    { status: "failed", reconciled: true },
+  ] as const)(
+    "renders the durable $status report with reconciled=$reconciled and only offers current recovery",
+    async ({ status, reconciled }) => {
       const onUpdateNow = vi.fn();
-      const onCheckStatus = vi.fn(async () => undefined);
+      const onCheckStatus = vi.fn(async () => true);
       render(
         renderUpdates(
           createProps({
@@ -629,7 +811,7 @@ describe("renderUpdates", () => {
               phase: "finished",
               status,
               finishedAtMs: 10,
-              reason: status === "failed" ? "build-failed" : null,
+              reason: reconciled ? "abandoned" : status === "failed" ? "build-failed" : null,
               after: { version: "2026.9.2" },
               steps: [
                 {
@@ -637,6 +819,9 @@ describe("renderUpdates", () => {
                   status: status === "failed" ? "failed" : "completed",
                   detail: "Build output",
                 },
+                ...(reconciled
+                  ? [{ step: "reconcile:acknowledged", status: "completed" as const }]
+                  : []),
               ],
             }),
             onUpdateNow,
@@ -652,9 +837,13 @@ describe("renderUpdates", () => {
         )!;
         await view.updateComplete;
         expect(view.querySelector(".update-run-view__report")?.textContent).toContain(
-          status === "succeeded" ? "OpenClaw updated to 2026.9.2" : `OpenClaw update ${status}`,
+          reconciled
+            ? "OpenClaw abandoned update reconciled."
+            : status === "succeeded"
+              ? "OpenClaw updated to 2026.9.2"
+              : `OpenClaw update ${status}`,
         );
-        if (status !== "succeeded") {
+        if (status !== "succeeded" && !reconciled) {
           const recovery = row("Recovery");
           recovery.querySelector<HTMLButtonElement>("button")?.click();
           recovery.querySelectorAll<HTMLButtonElement>("button")[1]?.click();
@@ -663,6 +852,16 @@ describe("renderUpdates", () => {
           expect(row("CLI fallback").querySelector("code")?.textContent).toBe("openclaw triage");
         } else {
           expect(container.textContent).not.toContain("Retry update");
+          expect(container.textContent).not.toContain("openclaw triage");
+        }
+        if (reconciled) {
+          expect(view.querySelector(".update-run-view__report--failed")).toBeNull();
+          expect(view.querySelector('[data-step="build"]')?.getAttribute("data-status")).toBe(
+            "failed",
+          );
+          expect(view.querySelector(".update-run-view__details")?.textContent).toContain(
+            "Build output",
+          );
         }
       } finally {
         container.remove();

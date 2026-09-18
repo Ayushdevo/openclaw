@@ -41,6 +41,7 @@ import {
   buildModelIdentityPromptLine,
 } from "../../system-prompt.js";
 import { log } from "../logger.js";
+import { normalizeAssistantReplayContent } from "../replay-history.js";
 import {
   cloneToolResultPromptProjectionState,
   type ToolResultPromptProjectionState,
@@ -84,9 +85,11 @@ type PromptBuildHookContext = Parameters<typeof resolvePromptBuildHookResult>[0]
 type EmbeddedAttemptSteeringLease = {
   leaseId: string;
   runIds: string[];
+  isCurrent: () => boolean;
 };
 
 type EmbeddedAttemptPromptAssembly = {
+  assertHostActive?: () => void;
   hookCtx: PromptBuildHookContext;
   effectivePrompt: string;
   promptBuildPrependContext?: string;
@@ -293,14 +296,19 @@ export async function prepareEmbeddedAttemptPromptAssembly(input: {
   let leasedSteering: EmbeddedAttemptSteeringLease | undefined;
   if (attempt.sessionKey && !preserveExactPrompt) {
     const leaseId = `${attempt.runId}:agent-steering`;
-    const leased = leasePendingAgentSteeringItems({
+    const leased = await leasePendingAgentSteeringItems({
       requesterSessionKey: attempt.sessionKey,
       leaseId,
     });
     if (leased) {
-      leasedSteering = { leaseId, runIds: leased.runIds };
+      leasedSteering = { leaseId, runIds: leased.runIds, isCurrent: leased.isCurrent };
       // Transfer cleanup ownership before any prompt mutation can throw.
       input.setLeasedSteering(leasedSteering);
+      if (!leased.isCurrent()) {
+        throw new Error(
+          "The queued child results lost authority before requester prompt injection.",
+        );
+      }
       effectivePrompt = prependAgentSteeringPrompt({
         steeringPrompt: leased.prompt,
         prompt: effectivePrompt,
@@ -331,6 +339,7 @@ export async function prepareEmbeddedAttemptPromptAssembly(input: {
       : undefined;
 
   return {
+    assertHostActive,
     hookCtx,
     effectivePrompt,
     promptBuildPrependContext,
@@ -390,7 +399,7 @@ type EmbeddedAttemptPromptContext = {
   systemPromptForHook: string;
 };
 
-export function prepareEmbeddedAttemptPromptContext(input: {
+export async function prepareEmbeddedAttemptPromptContext(input: {
   sessionVersion?: number;
   appendOnlyRuntimeContext?: boolean;
   attempt: PromptContextAttempt;
@@ -406,18 +415,21 @@ export function prepareEmbeddedAttemptPromptContext(input: {
   systemPromptReport?: SessionSystemPromptReport;
   systemPromptText: string;
   toolResultPromptProjectionState: ToolResultPromptProjectionState;
-}): EmbeddedAttemptPromptContext {
+}): Promise<EmbeddedAttemptPromptContext> {
   const { attempt } = input;
   const preparedUserTurnTimestamp = (
     input.preparedUserTurnMessage as { timestamp?: unknown } | undefined
   )?.timestamp;
-  let sessionMessages = filterHeartbeatTranscriptArtifacts(
+  const heartbeatFiltered = filterHeartbeatTranscriptArtifacts(
     input.messages,
     input.prompt.heartbeatSummary?.ackMaxChars,
     input.prompt.heartbeatSummary?.prompt,
   );
-  if (sessionMessages.length < input.messages.length) {
+  let sessionMessages = normalizeAssistantReplayContent(heartbeatFiltered);
+  if (sessionMessages !== heartbeatFiltered || sessionMessages.length < input.messages.length) {
     input.replaceSessionMessages(sessionMessages);
+  } else {
+    sessionMessages = input.messages;
   }
   // Raw probes temporarily hide durable history; only normal prepared history
   // is authoritative for reclaiming session-owned provider projections.
@@ -512,7 +524,7 @@ export function prepareEmbeddedAttemptPromptContext(input: {
   const runtimeFacts =
     input.isRawModelRun || attempt.operation === "settled-tool-finalization"
       ? []
-      : buildRuntimeFactsContext({
+      : await buildRuntimeFactsContext({
           capabilityToolNames: input.capabilityToolNames,
           cfg: attempt.config ?? {},
           sessionKey: attempt.sessionKey,

@@ -50,6 +50,7 @@ describe("Web Awesome control ownership", () => {
       "components/composer-menu.ts",
       "components/multi-select.ts",
       "components/select-picker.ts",
+      "pages/chat/components/chat-model-account-control.ts",
       "pages/chat/components/chat-model-picker-options.ts",
       "pages/chat/components/chat-model-picker.ts",
       "pages/new-session/place-browser.ts",
@@ -62,7 +63,7 @@ describe("Web Awesome control ownership", () => {
     expect(matchingFiles(/<resizable-divider\b/u)).toEqual([
       "app/app-shell-view.ts",
       "components/dock-layout-controller.ts",
-      "pages/chat/chat-page.ts",
+      "pages/chat/chat-page-pane-render.ts",
       "pages/chat/components/chat-resizable-divider.ts",
       "pages/skill-workshop/view.ts",
     ]);

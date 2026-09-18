@@ -1,13 +1,15 @@
 import { expectDefined } from "@openclaw/normalization-core";
-import type { SessionEntry } from "../config/sessions.js";
 import {
   listSessionEntriesCore as listAccessorSessionEntries,
   listSessionEntriesReadOnly as listAccessorSessionEntriesReadOnly,
   loadExactSessionEntryCandidates,
   loadExactSessionEntryCandidatesReadOnlyBatch,
-  type SessionEntryListScope,
-  type SessionEntryReadSource,
 } from "../config/sessions/session-accessor.js";
+import type {
+  SessionEntryListScope,
+  SessionEntryReadSource,
+} from "../config/sessions/session-accessor.types.js";
+import type { SessionEntry } from "../config/sessions/types.js";
 
 /**
  * Request-scoped store reuse.
@@ -87,13 +89,14 @@ function loadGatewaySessionLookupStore(
     readOnly?: boolean;
     cache?: GatewaySessionStoreCache;
     exactKeys?: readonly string[];
+    listKeys?: readonly string[];
     projection?: SessionEntryListScope["projection"];
     readSource?: SessionEntryReadSource;
   } = {},
 ): GatewaySessionStoreView {
   const cache = options.cache;
   const cacheKey = cache
-    ? `${storePath}\u0000${agentId ?? ""}\u0000${clone === false ? "0" : "1"}\u0000${options.readOnly}\u0000${options.projection ?? "full"}\u0000${options.exactKeys?.join("\u0001") ?? ""}`
+    ? `${storePath}\u0000${agentId ?? ""}\u0000${clone === false ? "0" : "1"}\u0000${options.readOnly}\u0000${options.projection ?? "full"}\u0000${options.exactKeys?.join("\u0001") ?? ""}\u0000${options.listKeys ? JSON.stringify(options.listKeys) : ""}`
     : "";
   if (cache) {
     const cached = cache.get(cacheKey);
@@ -112,6 +115,7 @@ function loadGatewaySessionLookupStoreUncached(
   agentId?: string,
   options: {
     exactKeys?: readonly string[];
+    listKeys?: readonly string[];
     readOnly?: boolean;
     projection?: SessionEntryListScope["projection"];
     readSource?: SessionEntryReadSource;
@@ -150,6 +154,7 @@ function loadGatewaySessionLookupStoreUncached(
           ...(agentId ? { agentId } : {}),
           ...(clone === false ? { clone: false } : {}),
           ...(options.projection ? { projection: options.projection } : {}),
+          ...(options.listKeys ? { sessionKeys: options.listKeys } : {}),
           storePath,
         }).map(({ sessionKey, entry }) => [sessionKey, entry]),
       ),

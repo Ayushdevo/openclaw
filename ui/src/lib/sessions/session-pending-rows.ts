@@ -28,12 +28,35 @@ type SessionReadFields = {
   lastReadAt: number | undefined;
   markedUnreadAt: number | undefined;
 };
+export type SessionArchiveFields = Pick<
+  GatewaySessionRow,
+  "archivedAt" | "archivedBy" | "archiveReason"
+> & { archived: boolean } & Partial<SessionPinFields>;
 export type SessionPatchRowFact = {
   key: string;
   agentId: string;
   sessionId: string;
   updatedAt: number | null;
-  fields: SessionPinFields | SessionReadFields | (SessionPinFields & SessionReadFields);
+  readCutoff?: number;
+  fields:
+    | SessionPinFields
+    | { pinned: true }
+    | SessionReadFields
+    | (SessionPinFields & SessionReadFields)
+    | SessionArchiveFields
+    | Pick<
+        GatewaySessionRow,
+        | "model"
+        | "modelProvider"
+        | "modelOverrideSource"
+        | "agentRuntime"
+        | "runtimeSelectionLocked"
+        | "contextWindow"
+        | "contextWindows"
+        | "thinkingLevel"
+        | "thinkingLevels"
+      >
+    | { boardPresentation: GatewaySessionRow["boardPresentation"] };
 };
 export type PendingRowTarget = Readonly<{
   identity: string;

@@ -5,6 +5,7 @@ import {
 } from "@openclaw/gateway-protocol";
 import type { SkillWorkshopRevisionAdmissionOutcome } from "../../app/skill-workshop-revision-admissions.ts";
 import { t } from "../../i18n/index.ts";
+import { registerSkillWorkshopEnglish } from "../../i18n/locales/en-skill-workshop.ts";
 import { formatUiError } from "../../lib/format-error.ts";
 import { canCallGatewayMethod } from "../../lib/gateway-methods.ts";
 import type {
@@ -29,7 +30,11 @@ import {
 } from "./proposals.ts";
 import type { SkillWorkshopState } from "./state.ts";
 
+registerSkillWorkshopEnglish();
+
 const SKILL_WORKSHOP_NOTICE_MS = 2800;
+
+type SkillWorkshopActionOptions = Pick<SkillWorkshopLoadOptions, "isCurrent" | "onProgress">;
 
 function clearActionNoticeTimer(state: SkillWorkshopState): void {
   if (state.skillWorkshopActionNoticeTimer) {
@@ -42,7 +47,7 @@ function showActionNotice(
   state: SkillWorkshopState,
   proposal: SkillWorkshopProposal | undefined,
   label: string,
-  options?: { persistent?: boolean },
+  options?: SkillWorkshopActionOptions & { persistent?: boolean },
 ): void {
   if (!proposal) {
     return;
@@ -57,10 +62,13 @@ function showActionNotice(
     return;
   }
   state.skillWorkshopActionNoticeTimer = globalThis.setTimeout(() => {
+    state.skillWorkshopActionNoticeTimer = null;
     if (state.skillWorkshopActionNotice?.key === proposal.key) {
       state.skillWorkshopActionNotice = null;
+      if (options?.isCurrent?.() !== false) {
+        options?.onProgress?.();
+      }
     }
-    state.skillWorkshopActionNoticeTimer = null;
   }, SKILL_WORKSHOP_NOTICE_MS);
 }
 
@@ -104,7 +112,7 @@ export async function runSkillWorkshopLifecycleAction(
   context: SkillWorkshopContext,
   action: Extract<SkillWorkshopAction, "apply" | "reject">,
   decision: SkillWorkshopProposalDecision,
-  options?: Pick<SkillWorkshopLoadOptions, "isCurrent" | "onProgress">,
+  options?: SkillWorkshopActionOptions,
 ): Promise<void> {
   const { proposalId, expectedRevisionHash } = decision;
   const method = action === "apply" ? "skills.proposals.apply" : "skills.proposals.reject";
@@ -165,6 +173,7 @@ export async function runSkillWorkshopLifecycleAction(
       state,
       confirmed,
       t(action === "apply" ? "skillWorkshop.notices.applied" : "skillWorkshop.notices.rejected"),
+      refreshOptions,
     );
     options?.onProgress?.();
     await refreshAfterMutation(state, context, proposalId, refreshOptions);
@@ -192,8 +201,9 @@ export async function runSkillWorkshopEvaluation(
   state: SkillWorkshopState,
   context: SkillWorkshopContext,
   proposalId: string,
-  isCurrent: () => boolean = () => true,
+  options?: SkillWorkshopActionOptions,
 ): Promise<boolean> {
+  const isCurrent = options?.isCurrent ?? (() => true);
   if (
     !canCallGatewayMethod(context.gateway.snapshot, "skills.proposals.evaluate", "operator.admin")
   ) {
@@ -251,6 +261,7 @@ export async function runSkillWorkshopEvaluation(
       state,
       state.skillWorkshopProposals.find((proposal) => proposal.key === proposalId) ?? previous,
       t("skillWorkshop.actions.evaluated"),
+      options,
     );
     return true;
   } catch (err) {
@@ -278,8 +289,9 @@ export async function requestSkillWorkshopRevision(
     agentId: string,
     expectedRevisionHash?: string,
   ) => Promise<SkillWorkshopRevisionAdmissionOutcome>,
-  isCurrent: () => boolean = () => true,
+  options?: SkillWorkshopActionOptions,
 ): Promise<SkillWorkshopRevisionAdmissionOutcome | null> {
+  const isCurrent = options?.isCurrent ?? (() => true);
   if (
     !canCallGatewayMethod(
       context.gateway.snapshot,
@@ -350,7 +362,7 @@ export async function requestSkillWorkshopRevision(
     }
     state.skillWorkshopRevisionKey = null;
     state.skillWorkshopRevisionDraft = "";
-    showActionNotice(state, proposal, t("skillWorkshop.notices.revisionRequested"));
+    showActionNotice(state, proposal, t("skillWorkshop.notices.revisionRequested"), options);
     return outcome;
   } catch (err) {
     if (isCurrent()) {

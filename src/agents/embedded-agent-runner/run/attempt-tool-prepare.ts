@@ -15,7 +15,10 @@ import { extractModelCompat } from "../../../plugins/provider-model-compat.js";
 import { getPluginToolMeta } from "../../../plugins/tool-metadata.js";
 import { isSubagentSessionKey } from "../../../routing/session-key.js";
 import type { NestedToolActivity } from "../../../sessions/nested-tool-activity.js";
-import { createOpenClawCodingTools } from "../../agent-tools.js";
+import {
+  createOpenClawCodingToolsInternal,
+  resolveToolLoopDetectionConfig,
+} from "../../agent-tools.js";
 import { createSkillInstructionDeliveryCache } from "../../agent-tools.read.js";
 import { getChannelAgentToolMeta } from "../../channel-tools.js";
 import { createCodeModePermissionChangeReason } from "../../code-mode-permission-change.js";
@@ -53,13 +56,16 @@ import type { EmbeddedAttemptSetup } from "./attempt-setup.js";
 import { resolveAttemptSpawnWorkspaceDir } from "./attempt-thread-helpers.js";
 import {
   applyEmbeddedAttemptToolsAllow,
+  mergeForcedEmbeddedAttemptToolsAllow,
   resolveEmbeddedAttemptToolConstructionPlan,
 } from "./attempt-tool-construction-plan.js";
 import { buildEmbeddedAttemptToolRunContext } from "./attempt-tool-run-context.js";
 import { TOOL_SEARCH_CONTROL_ALLOWLIST_NAMES } from "./attempt-tool-search-run-plan.js";
 import type { EmbeddedRunAttemptParams } from "./types.js";
 
-type OpenClawCodingToolsOptions = NonNullable<Parameters<typeof createOpenClawCodingTools>[0]>;
+type OpenClawCodingToolsOptions = NonNullable<
+  Parameters<typeof createOpenClawCodingToolsInternal>[0]
+>;
 type SkillUsagePaths = OpenClawCodingToolsOptions["skillUsagePaths"];
 
 export async function prepareEmbeddedAttemptToolBase(params: {
@@ -71,6 +77,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
   runAbortController: AbortController;
   runTrace: DiagnosticTraceContext;
   skillUsagePaths: SkillUsagePaths;
+  skillReadResources?: Parameters<typeof createOpenClawCodingToolsInternal>[1];
   skillsSnapshot: EmbeddedRunAttemptParams["skillsSnapshot"];
   codeModeSkills: readonly CodeModeSkill[];
   reviewTranscript?: NonNullable<OpenClawCodingToolsOptions["exec"]>["reviewTranscript"];
@@ -108,6 +115,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
     modelProvider: attempt.provider,
     modelId: attempt.modelId,
     codeModeOverride: attempt.codeModeOverride,
+    disableToolSearch: attempt.disableToolSearch,
     toolsEnabled,
     disableTools: attempt.disableTools,
     isRawModelRun,
@@ -130,10 +138,12 @@ export async function prepareEmbeddedAttemptToolBase(params: {
             : "nonempty",
     });
   }
-  const effectiveToolsAllow =
-    toolSearchControlsEnabledForRun && toolsAllowWithForcedRuntimeTools
-      ? [...new Set([...toolsAllowWithForcedRuntimeTools, ...TOOL_SEARCH_CONTROL_ALLOWLIST_NAMES])]
-      : toolsAllowWithForcedRuntimeTools;
+  const effectiveToolsAllow = mergeForcedEmbeddedAttemptToolsAllow(
+    toolsAllowWithForcedRuntimeTools,
+    {
+      forceToolNames: toolSearchControlsEnabledForRun ? TOOL_SEARCH_CONTROL_ALLOWLIST_NAMES : [],
+    },
+  );
   const shouldConstructTools =
     toolConstructionPlan.constructTools ||
     toolSearchControlsEnabledForRun ||
@@ -266,7 +276,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
     const constructedToolsRaw = !shouldConstructTools
       ? []
       : (() => {
-          const allTools = createOpenClawCodingTools({
+          const codingToolOptions: OpenClawCodingToolsOptions = {
             agentId: params.setup.sessionAgentId,
             ...buildConversationContext(),
             exec: {
@@ -292,6 +302,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
             codeModeSkills,
             preparedModelRuntime: attempt.preparedModelRuntime,
             requireWorkspaceOnly: attempt.requireWorkspaceOnly,
+            sessionReadScopeKey: attempt.sessionReadScopeKey,
             sessionConfigSource: attempt.oneShotCliRun ? "pinned" : "runtime",
             webSearchEnabled: attempt.toolOverrides?.webSearch !== false,
             githubPublicationAvailable: attempt.githubPublicationAvailable,
@@ -334,7 +345,11 @@ export async function prepareEmbeddedAttemptToolBase(params: {
             skillUsagePaths: params.skillUsagePaths,
             conversationCapabilityProfile: runtimeCapabilityProfile,
             onYield: params.onYield,
-          });
+          };
+          const allTools = createOpenClawCodingToolsInternal(
+            codingToolOptions,
+            params.skillReadResources,
+          );
           // The built-in harness retains its existing authoritative wrappers.
           // Only plugin harnesses receive and require the projected host capability.
           const boundTools = attempt.hostCapabilities
@@ -376,6 +391,23 @@ export async function prepareEmbeddedAttemptToolBase(params: {
   });
 
   return {
+    toolHookContext: {
+      agentId: params.setup.sessionAgentId,
+      config: attempt.config,
+      cwd: params.setup.effectiveCwd,
+      sessionKey: params.setup.sandboxSessionKey,
+      sessionId: attempt.sessionId,
+      runId: attempt.runId,
+      approvalReviewerDeviceId: attempt.approvalReviewerDeviceId,
+      channelId: attempt.currentChannelId,
+      trace: params.runTrace,
+      loopDetection: resolveToolLoopDetectionConfig({
+        cfg: attempt.config,
+        agentId: params.setup.sessionAgentId,
+      }),
+      onToolOutcome: attempt.onToolOutcome,
+      allocateToolOutcomeOrdinal: attempt.allocateToolOutcomeOrdinal,
+    },
     get toolAbortSignal() {
       return toolAbortSignal;
     },

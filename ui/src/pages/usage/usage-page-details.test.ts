@@ -3,6 +3,7 @@
 import { queryObjects } from "node:v8";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionUsageTimeSeries } from "../../../../src/shared/session-usage-timeseries-types.js";
+import { createDeferred as deferred } from "../../../../test/helpers/promise.js";
 import { GatewayRequestError, type GatewayBrowserClient } from "../../api/gateway.ts";
 import type { SessionsUsageResult } from "../../api/types.ts";
 import * as downloads from "../../lib/download.ts";
@@ -15,7 +16,6 @@ import {
   contextWithClient,
   contextWeight,
   createPage,
-  deferred,
   focusDocument,
   preloadUsage,
   refreshButton,
@@ -626,6 +626,7 @@ describe("UsagePage detail requests", () => {
     )!;
     scope.click();
     expect(cancelled[2]?.signal?.aborted).toBe(true);
+    await page.updateComplete;
     pending.resolve(full);
     await vi.waitFor(() => expect(refreshButton(page).disabled).toBe(false));
     expect(download).toHaveBeenCalledOnce();

@@ -9,7 +9,7 @@
   "type": "module",
   "dependencies": {
     "google-auth-library": "11.0.2",
-    "zod": "4.4.3"
+    "zod": "4.5.4"
   },
   "devDependencies": {
     "@openclaw/plugin-sdk": "workspace:*",
@@ -133,6 +133,7 @@
       }
     },
     "install": {
+      "clawhubSpec": "clawhub:@openclaw/googlechat",
       "npmSpec": "@openclaw/googlechat",
       "defaultChoice": "npm",
       "minHostVersion": ">=2026.4.10"

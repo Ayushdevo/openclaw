@@ -15,6 +15,32 @@ title: "Database layout"
 
 The task registry uses the shared state database. Runtime trajectory events live with their sessions in the per-agent database or a configured shared session SQLite store.
 
+### Activity session recaps
+
+[Activity](/web/control-ui/settings#activity-tab) stores one optional `activitySummary` object in the existing `session_nodes.entry_json` session metadata. This is a reconstructible cache; the transcript remains canonical. The [approved persistence design](https://github.com/openclaw/openclaw/issues/147383) adds no SQL table, column, or database schema-version change. Current and `v2026.9.4` metadata serializers preserve unknown optional fields; unknown recap payload versions are treated as cache misses.
+
+Payload version 1 records the recap text, generation time, session ID and lifecycle revision, transcript generation and leaf, chronological coverage, and whether oversized message content was omitted. The optional `formatRevision` identifies the generated prose format; revision 2 uses one to three concise sentences. Missing or older format revisions retain their text and coverage while the existing queue refreshes the prose. This adds no SQL migration or payload-version bump. A rewind or replacement invalidates an incompatible source binding. The Gateway reads bounded transcript chunks outside the metadata write and rechecks the current lifecycle and transcript branch before committing. Recap writes preserve session activity timestamps and ordering.
+
+The latest recap survives restart and archival. Deleting the session removes it; reset or replacement makes the prior lifecycle's recap unusable. Incognito sessions do not persist or generate this cache. A shared, bounded Gateway queue deduplicates generation across viewers, retains the previous recap on failure, and uses only the configured utility route. Disabling that route stops new generation. Removing or ignoring the optional field is a rollback path that leaves session and transcript data intact; removing the feature does not require reversing a database migration.
+
+### Cold transcript archives
+
+The per-agent `session_transcript_cold_archives` table records cold transcript
+locations alongside `session_windows` and `transcript_events`. Each row belongs
+to a retained session window and identifies its generation, archive name, hash,
+counts, and sizes. The payload lives in an immutable compressed JSONL file, or
+in the row's blob when embedded by a supported backup.
+
+The default archive directory is
+`~/.openclaw/agents/<agentId>/sessions/cold/`, with filenames
+`<sha256>.jsonl.zst`. A database in a directory named `agent` uses its sibling
+`sessions/cold/` directory; other store layouts use `cold/` beside the database.
+These files contain authoritative history. See
+[cold transcript storage](/reference/session-management-compaction/maintenance#cold-transcript-storage)
+for retention and restoration, and
+[agent schema 20](/reference/database-schemas/agent-schema-history#cold-transcript-storage)
+for the schema and update contract.
+
 ### Plugin state listing index
 
 Plugin keyed stores use the shared `plugin_state_entries` table. Its listing
@@ -59,17 +85,21 @@ persisted text field, plus 32 bytes per row. Session totals include their events
 This is a retained-content estimate, not a limit on SQLite file, page, or WAL size.
 
 Older releases counted characters inconsistently, undercounting Unicode and
-allowing unchanged metadata writes to drift. The existing app-version upgrade
-repair and explicit shared-state schema repair rebuild all derived totals
+allowing unchanged metadata writes to drift. Explicit Doctor shared-state
+repair rebuilds all derived totals
 atomically, preserving event JSON text, identifiers, timestamps, and sequence.
 Repair does not prune history. The next ordinary session write applies the
 existing caps and eviction order, so corrected Unicode history may trim sooner
 and use transcript fallback when loaded.
 
-A current-app-version reopen skips this repair. Replacing code without changing
-the app version does not repair an already-open or current-version database;
-explicit schema repair remains the repair owner for that case. Accounting repair
-cannot recover history already evicted by an older writer. See [ACP CLI](/cli/acp).
+Normal runtime opens and automatic startup schema preparation leave existing
+accounting columns unchanged, including after the application version changes. If
+the supported older shape lacks accounting columns, adding them also initializes
+their totals in the same transaction. Run
+`openclaw doctor --fix` during update maintenance to repair historical accounting.
+Supported older-schema upgrades still perform the content transformations needed
+to preserve data while changing its schema. Accounting repair cannot recover
+history already evicted by an older writer. See [ACP CLI](/cli/acp).
 
 ### Meeting transcript tables
 
@@ -253,9 +283,51 @@ metadata alone exceeds a hard limit, the write fails without changing the row.
 The CLI and Gateway share WAL-backed transactions, including while the Gateway
 is stopped. The first terminal outcome wins; subsequent verification can enrich
 its observed facts without rewriting success, failure, skip, or rollback status.
+Explicit `update repair` can correct the older package-owner refusal
+misclassification to `skipped` once the installed version satisfies its resolved
+target. This exception requires the latest run to contain only the untouched
+request and optional driver-adoption metadata, with no recovery or active update.
+It preserves the refusal detail and finish time and records the existing
+acknowledgement marker; subsequent repairs use normal finalization.
 The restart sentinel carries `stats.runId` and remains the continuation owner;
 consuming it does not delete the run row. Chat, CLI, and status reports read that
 row. See [Run history and reports](/cli/update#run-history-and-reports).
+
+### Update installation control
+
+Managed update leases use a separate machine-local `managed-update-handoffs.sqlite`
+database under the secure OpenClaw temporary directory. This owner must remain
+available while an update replaces an installation or changes its runtime state.
+The update history above remains in the profile's shared state database.
+
+First creation exclusively creates a private file with one filesystem link.
+Concurrent initializers use that same file without replacing it. SQLite commits
+the existing schema atomically; ordinary lease inspection reports no lease while
+the first-use schema is empty. Reads of an absent database create no state.
+Existing lease rows, claim transactions, and the rule that one updater owns an
+installation are unchanged.
+
+The normal handoff parent prepares this database before launching its sealed
+helper. The helper receives the captured database identity and operates only on
+that existing database, without resolving installation packages or recreating
+missing or empty state.
+
+File creation applies private permissions before SQLite opens the file, including
+a protected ACL on Windows. Initialization follows the existing directory-durability
+policy and does not require the optional fs-safe native binding. Failure stops
+lease admission before its operation runs. After an interrupted first creation,
+the normal owner can finish initialization through its existing empty-database
+recovery path; committed rows remain governed by SQLite's normal transactions.
+This change requires no schema migration. See the
+[accepted initialization design](https://github.com/openclaw/openclaw/pull/144155).
+
+### Managed worktree acceleration templates
+
+[Managed worktree acceleration](/concepts/managed-worktrees#filesystem-acceleration) uses the first-use `worktree_templates` table in the shared state database. Each row records a reconstructible source template: repository and Git common directory, destination root, filesystem backend, artifact path, source commit, checkout content key, preparation status, and creation and last-use timestamps. The cache key allows one template per repository and destination root. The template contains no provisioned ignored files or repository setup output.
+
+The worktree service owns template creation, reuse, invalidation, and cleanup under its existing allocation lease. It reserves a `preparing` row before creating the artifact and publishes `ready` only after preparation completes. Durable mutations recheck the lease inside synchronous state transactions; filesystem work runs outside those transactions. Cleanup uses the reserved template ID so an old operation cannot delete its replacement. Templates are replaced when the commit or checkout policy changes and retired after seven days without use.
+
+The additive table is ensured on first use and does not change the numeric database schema version. Existing worktree and snapshot records retain their meaning; no existing checkout is migrated or moved. Template artifacts are reconstructible, while registered worktree contents and recovery snapshots retain their existing preservation rules.
 
 ### Cloud repository workspaces
 
@@ -268,3 +340,36 @@ Both tables are additive, lazily ensured on first use, and leave the numeric dat
 Checkpoint Git artifacts live under `state/repository-workspaces/<workspace-id>.git`, next to the shared database. These are bare repositories containing complete file manifests, cumulative changed-file blobs, and publication snapshots; they are not working checkouts or a backup of upstream Git history. Restoring an entire checkout still requires access to the pinned upstream commit. Back up these artifacts together with the shared and per-agent databases.
 
 Accepted checkpoint history and publication source artifacts remain until explicit session deletion, including after Stop, archive, reset, or Gateway restart. There is no timed checkpoint expiry. Deletion retires publication requests and source ownership before removing their artifact repository; failed cleanup is reported. The managed-worktree idle cleanup and snapshot retention rules do not apply to these checkpoints.
+
+## Sandbox runtime reservations
+
+The existing `sandbox_registry_entries` table owns runtime identity and cleanup.
+Backends that opt into reservation persist a generation before provider allocation.
+The entry payload retains the original `workspaceDir` and records `runtimeState`
+as `pending`, `ready`, `removing`, or `removing-pending`;
+no schema version, table, or column is added. Older entries are adopted on first
+use, and backends without reservation keep their existing registry behavior.
+Factories receive the reserved workspace on replay and shared-scope reuse, rather
+than the latest caller's local workspace. Provider execution and repository-scoped
+cleanup therefore use the same original owner.
+
+Reservation and publication use synchronous SQLite transactions. Provider work
+runs outside the transaction under a per-runtime file lock beside the shared
+database. Lock contenders wait up to 15 minutes, covering the backend's warmup
+and inspection budgets. Concurrent creators reuse the same generation. Failed
+provisioning retains its pending ID for replay after restart. Recreate and prune
+record removal intent before waiting for provisioning, then remove the provider runtime before
+deleting the row. Cleanup failures retain that intent for retry; stale handles
+cannot publish readiness or start new operations after removal begins.
+
+`removing-pending` preserves the fact that provisioning never published readiness.
+If ordinary cleanup fails, the Crabbox adapter can replay that same fixed ID from
+its original workspace and then release it. This also covers a failure before
+Crabbox recorded the request: recovery may allocate and immediately release the
+reserved runtime. Unknown outcomes retain the recovery row; an absent local claim
+or an error message is not proof that provider resources are absent.
+
+The reservation is canonical recovery state. Do not delete it to clear a provider
+error. Before downgrading to a version without reservation support, disable the
+backend and reconcile its pending leases using the current version. Older readers
+can open the database but do not implement this lifecycle.

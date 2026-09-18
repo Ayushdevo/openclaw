@@ -4,6 +4,7 @@ import nodePath from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDoctorConfigSnapshot } from "../commands/doctor-config-snapshot.test-helpers.js";
 import type { DoctorPrompter } from "../commands/doctor-prompter.js";
+import { ConfigWritePostCommitError } from "../config/io.write-errors.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { LEGACY_SECRETREF_ENV_MARKER_PREFIX } from "../config/types.secrets.js";
 import { fetchNpmPackageTargetStatus } from "../infra/update-check-package-target.js";
@@ -37,12 +38,13 @@ const mocks = vi.hoisted(() => ({
   isDefaultInstallIdentity: vi.fn(() => true),
   isContainerEnvironment: vi.fn(() => false),
   maybeRunConfiguredPluginInstallReleaseStep: vi.fn(),
-  registerBundledHealthChecks: vi.fn(),
+  registerBundledHealthChecks: vi.fn((): HealthFinding[] => []),
   runDoctorHealthRepairs: vi.fn(),
   maybeMigrateAuthProfileJsonStoresToSqlite: vi.fn().mockResolvedValue({
     detected: [],
     changes: [],
-    configOwnerMigrationApplied: false,
+    migratedProfileIds: new Set<string>(),
+    blockedProfileIds: new Set<string>(),
     warnings: [],
   }),
   collectOpenAICodexAuthProfileStoreIdMap: vi.fn(() => new Map<string, string>()),
@@ -518,7 +520,8 @@ vi.mock("../commands/doctor/shared/config-flow-steps.js", () => ({
   restoreDoctorConfigEnvRefs: (cfg: OpenClawConfig) => cfg,
 }));
 
-vi.mock("../config/config.js", () => ({
+vi.mock("../config/config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../config/config.js")>()),
   CONFIG_PATH: "/tmp/fake-openclaw.json",
   transformConfigFile: async ({
     transform,
@@ -529,7 +532,8 @@ vi.mock("../config/config.js", () => ({
       { snapshot: createDoctorConfigSnapshot(), previousHash: null, attempt: 0 },
       {},
     );
-    return mocks.replaceConfigFile({ ...options, nextConfig });
+    await mocks.replaceConfigFile({ ...options, nextConfig });
+    return { nextConfig };
   },
   readConfigFileSnapshot: mocks.readConfigFileSnapshot,
 }));
@@ -719,12 +723,13 @@ describe("doctor health contributions", () => {
   beforeEach(() => {
     mocks.isContainerEnvironment.mockReset().mockReturnValue(false);
     mocks.maybeRunConfiguredPluginInstallReleaseStep.mockReset();
-    mocks.registerBundledHealthChecks.mockReset();
+    mocks.registerBundledHealthChecks.mockReset().mockReturnValue([]);
     mocks.runDoctorHealthRepairs.mockReset();
     mocks.maybeMigrateAuthProfileJsonStoresToSqlite.mockClear().mockResolvedValue({
       detected: [],
       changes: [],
-      configOwnerMigrationApplied: false,
+      migratedProfileIds: new Set<string>(),
+      blockedProfileIds: new Set<string>(),
       warnings: [],
     });
     mocks.collectOpenAICodexAuthProfileStoreIdMap.mockReset().mockReturnValue(new Map());
@@ -959,6 +964,35 @@ describe("doctor health contributions", () => {
       "doctor:test-failure run failed: media migration required",
     ]);
     expect(mocks.note).toHaveBeenCalledBefore(laterRun);
+  });
+
+  it("stops after an optional contribution fails after writing config", async () => {
+    const laterRun = vi.fn(async () => undefined);
+    const ctx = createDoctorContext({ env: {} });
+    const failure = new ConfigWritePostCommitError({
+      configPath: ctx.configPath,
+      rollbackStatus: "not-restored",
+      cause: new Error("config path changed since last load"),
+    });
+
+    await expect(
+      runDoctorHealthContributionList(ctx, [
+        createDoctorHealthContribution({
+          id: "doctor:test-config-write",
+          label: "Test config write",
+          run: async () => {
+            throw failure;
+          },
+        }),
+        createDoctorHealthContribution({
+          id: "doctor:test-later",
+          label: "Test later",
+          run: laterRun,
+        }),
+      ]),
+    ).rejects.toBe(failure);
+
+    expect(laterRun).not.toHaveBeenCalled();
   });
 
   it("rejects a failed initial config write before later work runs", async () => {
@@ -2545,7 +2579,7 @@ describe("doctor health contributions", () => {
     );
   });
 
-  it.each(["warning", "refused"] as const)(
+  it.each(["warning", "deferred", "refused"] as const)(
     "prints legacy state migration notices and records only advisories (%s)",
     async (outcome) => {
       const contribution = requireDoctorContribution("doctor:legacy-state");
@@ -2584,7 +2618,7 @@ describe("doctor health contributions", () => {
         "Doctor notices",
       );
       expect(ctx.updateWarnings ?? []).toEqual(
-        outcome === "warning" ? ["Legacy cleanup deferred; run openclaw doctor --fix"] : [],
+        outcome !== "refused" ? ["Legacy cleanup deferred; run openclaw doctor --fix"] : [],
       );
     },
   );
@@ -2634,7 +2668,8 @@ describe("doctor health contributions", () => {
     });
     expect(mocks.maybeMigrateAuthProfileJsonStoresToSqlite).toHaveBeenCalledWith({
       cfg: ctx.cfg,
-      prompter: ctx.prompter,
+      env: process.env,
+      prompter: { confirmAutoFix: ctx.prompter.confirmAutoFix },
       openAICodexAuthProfileIdMap:
         mocks.collectOpenAICodexAuthProfileStoreIdMap.mock.results[0]?.value,
     });
@@ -3784,7 +3819,8 @@ describe("doctor health contributions", () => {
     expect(ctx.cfg).toEqual({ updated: true });
     expect(ctx.cfgForPersistence).toEqual({});
     expect(ctx.runtime.error).toHaveBeenCalledWith("structured warning");
-    expect(ctx.runtime.log).toHaveBeenCalledWith("changed from structured health");
+    expect(ctx.runtime.log).not.toHaveBeenCalledWith("changed from structured health");
+    expect(ctx.configResult.pendingChangePanels).toEqual(["changed from structured health"]);
   });
 
   it.each([
@@ -4305,7 +4341,7 @@ describe("doctor health contributions", () => {
     });
 
     it("skips a missing config directory when an existing ancestor is writable", async () => {
-      vi.spyOn(fs, "existsSync").mockImplementation((path) => path === "/tmp");
+      const configPath = nodePath.join(process.cwd(), ".doctor-missing-w/openclaw.json");
       const accessSpy = vi.spyOn(fs, "accessSync").mockImplementation(() => undefined);
 
       await expect(
@@ -4314,18 +4350,18 @@ describe("doctor health contributions", () => {
             cfg: {},
             mode: "lint" as const,
             runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
-            configPath: "/tmp/openclaw-home/openclaw.json",
+            configPath,
           },
           { checks: [check], onlyIds: ["core/doctor/write-config"] },
         ),
       ).resolves.toMatchObject({
         findings: [],
       });
-      expect(accessSpy).toHaveBeenCalledWith("/tmp", fs.constants.W_OK | fs.constants.X_OK);
+      expect(accessSpy).toHaveBeenCalledWith(process.cwd(), fs.constants.W_OK | fs.constants.X_OK);
     });
 
     it("reports an unwritable existing parent when the config file is missing", async () => {
-      vi.spyOn(fs, "existsSync").mockImplementation((path) => path === "/tmp");
+      const configPath = nodePath.join(process.cwd(), ".doctor-missing-u/openclaw.json");
       vi.spyOn(fs, "accessSync").mockImplementation(() => {
         throw new Error("EACCES");
       });
@@ -4336,7 +4372,7 @@ describe("doctor health contributions", () => {
             cfg: {},
             mode: "lint" as const,
             runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
-            configPath: "/tmp/openclaw-home/openclaw.json",
+            configPath,
           },
           { checks: [check], onlyIds: ["core/doctor/write-config"] },
         ),
@@ -4344,8 +4380,8 @@ describe("doctor health contributions", () => {
         findings: [
           expect.objectContaining({
             checkId: "core/doctor/write-config",
-            path: "/tmp",
-            target: "/tmp/openclaw-home",
+            path: process.cwd(),
+            target: nodePath.dirname(configPath),
             requirement: "writable-config-directory",
           }),
         ],
@@ -4353,7 +4389,7 @@ describe("doctor health contributions", () => {
     });
 
     it("reports an existing parent without search permission", async () => {
-      vi.spyOn(fs, "existsSync").mockImplementation((path) => path === "/tmp");
+      const configPath = nodePath.join(process.cwd(), ".doctor-missing-x/openclaw.json");
       vi.spyOn(fs, "accessSync").mockImplementation((_path, mode) => {
         if (mode === (fs.constants.W_OK | fs.constants.X_OK)) {
           throw new Error("EACCES");
@@ -4366,7 +4402,7 @@ describe("doctor health contributions", () => {
             cfg: {},
             mode: "lint" as const,
             runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
-            configPath: "/tmp/openclaw-home/openclaw.json",
+            configPath,
           },
           { checks: [check], onlyIds: ["core/doctor/write-config"] },
         ),
@@ -4374,8 +4410,8 @@ describe("doctor health contributions", () => {
         findings: [
           expect.objectContaining({
             checkId: "core/doctor/write-config",
-            path: "/tmp",
-            target: "/tmp/openclaw-home",
+            path: process.cwd(),
+            target: nodePath.dirname(configPath),
             requirement: "writable-config-directory",
           }),
         ],
@@ -4644,6 +4680,7 @@ describe("doctor health contributions", () => {
       expect(mocks.repairCronCodexModelRefsAfterConfigWrite).toHaveBeenCalledWith({
         cfg,
         retiredModelRefConfig,
+        migrateCodexModelRefs: true,
         repairRetiredModelRefs: repair,
         blockedModelIdentities: new Set(["codex\u0000gpt-5.6-sol"]),
       });

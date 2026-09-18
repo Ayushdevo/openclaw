@@ -9,6 +9,7 @@ import {
 } from "../../packages/gateway-protocol/src/client-info.js";
 import { listSystemPresence } from "../infra/system-presence.js";
 import { trackAsyncWork } from "../shared/async-work-scope.js";
+import * as userProfileCatalog from "../state/user-profile-list.js";
 import {
   ensureProfileForEmail,
   getUserProfileDisplay,
@@ -16,10 +17,19 @@ import {
   resolveUserProfileId,
 } from "../state/user-profiles.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
-import { createChatRunState } from "./server-chat-state.js";
+import { captureGatewayDeviceRevocation } from "./device-revocation.js";
+import { prepareGatewayRecipientProfile } from "./expected-profile.js";
+import { createGatewayBroadcaster } from "./server-broadcast.js";
+import {
+  createChatRunState,
+  createSessionEventSubscriberRegistry,
+  createSessionMessageSubscriberRegistry,
+} from "./server-chat-state.js";
 import type { GatewayServerLiveState } from "./server-live-state.js";
 import type { GatewayRequestContext } from "./server-methods/types.js";
 import { createGatewayRequestContext } from "./server-request-context.js";
+import { startGatewayEventSubscriptions } from "./server-runtime-subscriptions.js";
+import { GatewayClientRegistry } from "./server/client-registry.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
 
 type GatewayRequestContextParams = Parameters<typeof createGatewayRequestContext>[0];
@@ -49,6 +59,7 @@ function makeContextParams(overrides: Partial<RequestRuntime> = {}): GatewayRequ
   const config = {} as never;
   return {
     runtime: {
+      getSessionRowProjection: () => undefined,
       connectionWork: { track: trackAsyncWork },
       deps: {} as never,
       runtimeState: {
@@ -148,7 +159,11 @@ function makeContextParams(overrides: Partial<RequestRuntime> = {}): GatewayRequ
       broadcastVoiceWakeChanged: vi.fn(),
       broadcastVoiceWakeRoutingChanged: vi.fn(),
       kernel: {
-        notifyPluginMetadataChanged: vi.fn(),
+        applyPluginLifecycleChange: vi.fn(async () => ({
+          operationId: "fixture",
+          generation: 1,
+          pluginIds: [],
+        })),
         getConfigReloaderHotReloadStatus: vi.fn(() => undefined),
       },
       unavailableGatewayMethods: new Set(),
@@ -196,7 +211,120 @@ function makeGatewayClient(params: {
   };
 }
 
+function makeDeviceClient(connId: string, deviceId: string, role = "primary") {
+  return {
+    connId,
+    connect: { device: { id: deviceId }, role },
+    socket: { close: vi.fn() },
+  };
+}
+
 describe("createGatewayRequestContext", () => {
+  it("prepares every recipient before the real merge's first notification and contains resolution failure", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      const source = ensureProfileForEmail("event-source@example.test");
+      const target = ensureProfileForEmail("event-target@example.test");
+      const third = ensureProfileForEmail("event-third@example.test");
+      const frames: Array<{ connId: string; event: string; recipientProfileId?: string }> = [];
+      const clients = new GatewayClientRegistry();
+      for (const [index, profile] of [source, target, third].entries()) {
+        clients.add({
+          ...makeGatewayClient({
+            connId: `event-${index}`,
+            clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
+            scopes: ["operator.admin"],
+          }),
+          usesSharedGatewayAuth: false,
+          presenceKey: `event-${index}`,
+          authenticatedUserProfile: {
+            profileId: profile.id,
+            displayName: null,
+            avatarRevision: "1",
+            hasAvatar: false,
+            updatedAt: profile.updatedAt,
+          },
+          socket: {
+            readyState: 1,
+            bufferedAmount: 0,
+            close: vi.fn(),
+            send: (wire: string, done?: () => void) => {
+              frames.push({ connId: `event-${index}`, ...JSON.parse(wire) });
+              done?.();
+            },
+          } as unknown as GatewayWsClient["socket"],
+        });
+      }
+      const peers = [...clients];
+      const broadcaster = createGatewayBroadcaster({
+        clients,
+        preparePresenceProjection: (presence) => () => presence,
+      });
+      const params = makeContextParams({ clients, ...broadcaster });
+      const context = createGatewayRequestContext(params);
+      for (const peer of peers) {
+        prepareGatewayRecipientProfile(peer);
+      }
+      const subscribers = createSessionEventSubscriberRegistry();
+      for (const peer of peers) {
+        subscribers.subscribe(peer.connId);
+      }
+      const chatRunState = createChatRunState();
+      const subscriptions = startGatewayEventSubscriptions({
+        ...broadcaster,
+        signal: new AbortController().signal,
+        log: params.log,
+        nodeHasSessionSubscribers: () => false,
+        nodeSendToSession: vi.fn(),
+        agentRunSeq: new Map(),
+        chatRunState,
+        toolEventRecipients: chatRunState.toolEventRecipients,
+        sessionEventSubscribers: subscribers,
+        sessionMessageSubscribers: createSessionMessageSubscriberRegistry(),
+        chatAbortControllers: new Map(),
+        restartRecoveryCandidates: new Map(),
+        terminalSessions: { closeTaskSessions: vi.fn() },
+        refreshConnectedUserProfiles: () => context.refreshConnectedUserProfile?.(),
+      });
+      try {
+        linkEmail("event-source@example.test", target.id);
+        for (const [index, profileId] of [target.id, target.id, third.id].entries()) {
+          const first = frames.find((frame) => frame.connId === `event-${index}`);
+          expect(first).toMatchObject({ recipientProfileId: profileId });
+          expect(
+            frames
+              .filter((frame) => frame.connId === `event-${index}`)
+              .every((frame) => frame.recipientProfileId === profileId),
+          ).toBe(true);
+        }
+        expect(frames.some((frame) => frame.event === "sessions.changed")).toBe(true);
+        const authenticated = peers.map((peer) => peer.authenticatedUserProfile);
+        const resolve = vi
+          .spyOn(userProfileCatalog, "readUserProfileIdentity")
+          .mockImplementationOnce(() => {
+            throw new Error("fixture storage unavailable");
+          });
+        try {
+          context.refreshConnectedUserProfile?.();
+          expect(peers[0]!.preparedRecipientProfileId).toBeUndefined();
+          expect(peers[1]!.preparedRecipientProfileId).toBe(target.id);
+          expect(peers[2]!.preparedRecipientProfileId).toBe(third.id);
+          peers.forEach((peer, index) => {
+            expect(peer.authenticatedUserProfile).toBe(authenticated[index]);
+            expect(peer.invalidated).not.toBe(true);
+          });
+        } finally {
+          resolve.mockRestore();
+        }
+      } finally {
+        subscriptions.lifecycleUnsub();
+        subscriptions.heartbeatUnsub();
+        subscriptions.transcriptUnsub();
+        await subscriptions.agentUnsub();
+        await subscriptions.taskUnsub();
+      }
+    });
+  });
+
   it("reuses the canonical connection liveness predicate", () => {
     const isConnectionActive = vi.fn(() => true);
     const params = makeContextParams();
@@ -327,17 +455,6 @@ describe("createGatewayRequestContext", () => {
     );
   });
 
-  it("routes plugin metadata changes through the kernel bridge", () => {
-    const notifyPluginMetadataChanged = vi.fn();
-    const params = makeContextParams();
-    params.runtime.kernel.notifyPluginMetadataChanged = notifyPluginMetadataChanged;
-    const context = createGatewayRequestContext(params);
-
-    context.notifyPluginMetadataChanged();
-
-    expect(notifyPluginMetadataChanged).toHaveBeenCalledOnce();
-  });
-
   it("does not treat scoped CLI or backend callers as approval delivery routes", () => {
     const clients = new Set([
       makeGatewayClient({
@@ -360,72 +477,49 @@ describe("createGatewayRequestContext", () => {
   });
 
   it("refreshes every live connection and presence row for a changed user profile", () => {
-    const first = {
+    const makeProfileClient = (
+      connId: string,
+      email: string,
+      profile: Partial<NonNullable<GatewayWsClient["authenticatedUserProfile"]>> = {},
+    ) => ({
       ...makeGatewayClient({
-        connId: "ada-one",
+        connId,
         clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
       }),
-      authenticatedUserId: "ada@example.test",
+      authenticatedUserId: email,
       authenticatedUserProfile: {
         profileId: "profile-ada",
         displayName: "Ada",
         avatarRevision: "avatar-old-png",
         hasAvatar: true,
         updatedAt: 1,
+        ...profile,
       },
-      presenceKey: "profile-refresh-ada-one",
-    };
-    const second = {
-      ...makeGatewayClient({
-        connId: "ada-two",
-        clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
-      }),
-      authenticatedUserId: "ada@work.test",
-      authenticatedUserProfile: {
-        profileId: "profile-ada",
-        displayName: "Ada",
-        avatarRevision: "avatar-old-png",
-        hasAvatar: true,
-        updatedAt: 1,
-      },
-      presenceKey: "profile-refresh-ada-two",
-    };
-    const unrelated = {
-      ...makeGatewayClient({
-        connId: "grace",
-        clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
-      }),
-      authenticatedUserId: "grace@example.test",
-      authenticatedUserProfile: {
-        profileId: "profile-grace",
-        displayName: "Grace",
-        avatarRevision: "1",
-        hasAvatar: false,
-        updatedAt: 1,
-      },
-      presenceKey: "profile-refresh-grace",
-    };
-    const clients = new Set([first, second, unrelated]) as never;
-    const params = makeContextParams({ clients });
+      presenceKey: `profile-refresh-${connId}`,
+    });
+    const first = makeProfileClient("ada-one", "ada@example.test");
+    const second = makeProfileClient("ada-two", "ada@work.test");
+    const unrelated = makeProfileClient("grace", "grace@example.test", {
+      profileId: "profile-grace",
+      displayName: "Grace",
+      avatarRevision: "1",
+      hasAvatar: false,
+    });
+    const params = makeContextParams({ clients: new Set([first, second, unrelated]) as never });
     const context = createGatewayRequestContext(params);
     const capturedFirstProfile = first.authenticatedUserProfile;
     const readCapturedDisplayName = () => capturedFirstProfile.displayName;
 
-    context.refreshConnectedUserProfile?.({
-      id: "profile-ada",
-      displayName: "Augusta Ada",
-      avatarRevision: "avatar-new-png",
-      hasAvatar: true,
-      updatedAt: 2,
-    });
-
-    context.refreshConnectedUserProfile?.({
-      id: "profile-ada",
-      displayName: "Augusta Ada",
-      avatarRevision: "avatar-newer-png",
-      hasAvatar: true,
-      updatedAt: 2,
-    });
+    const revisions = ["avatar-new-png", "avatar-newer-png"];
+    for (const avatarRevision of revisions) {
+      context.refreshConnectedUserProfile?.({
+        id: "profile-ada",
+        displayName: "Augusta Ada",
+        avatarRevision,
+        hasAvatar: true,
+        updatedAt: 2,
+      });
+    }
 
     expect(first.authenticatedUserProfile).toEqual({
       profileId: "profile-ada",
@@ -438,66 +532,28 @@ describe("createGatewayRequestContext", () => {
     expect(readCapturedDisplayName()).toBe("Augusta Ada");
     expect(second.authenticatedUserProfile).toEqual(first.authenticatedUserProfile);
     expect(unrelated.authenticatedUserProfile.displayName).toBe("Grace");
-    expect(params.runtime.broadcast).toHaveBeenNthCalledWith(
-      1,
-      "presence",
-      {
-        presence: expect.arrayContaining([
-          expect.objectContaining({
-            user: {
-              id: "profile-ada",
-              identity: { type: "profile", id: "profile-ada" },
-              email: "ada@example.test",
-              name: "Augusta Ada",
-              avatarUrl: "/api/users/profile-ada/avatar?v=avatar-new-png",
-            },
-          }),
-          expect.objectContaining({
-            user: {
-              id: "profile-ada",
-              identity: { type: "profile", id: "profile-ada" },
-              email: "ada@work.test",
-              name: "Augusta Ada",
-              avatarUrl: "/api/users/profile-ada/avatar?v=avatar-new-png",
-            },
-          }),
-        ]),
-      },
-      {
-        dropIfSlow: true,
-        stateVersion: { presence: 1, health: 1 },
-      },
-    );
-    expect(params.runtime.broadcast).toHaveBeenNthCalledWith(
-      2,
-      "presence",
-      {
-        presence: expect.arrayContaining([
-          expect.objectContaining({
-            user: {
-              id: "profile-ada",
-              identity: { type: "profile", id: "profile-ada" },
-              email: "ada@example.test",
-              name: "Augusta Ada",
-              avatarUrl: "/api/users/profile-ada/avatar?v=avatar-newer-png",
-            },
-          }),
-          expect.objectContaining({
-            user: {
-              id: "profile-ada",
-              identity: { type: "profile", id: "profile-ada" },
-              email: "ada@work.test",
-              name: "Augusta Ada",
-              avatarUrl: "/api/users/profile-ada/avatar?v=avatar-newer-png",
-            },
-          }),
-        ]),
-      },
-      {
-        dropIfSlow: true,
-        stateVersion: { presence: 1, health: 1 },
-      },
-    );
+    for (const [index, avatarRevision] of revisions.entries()) {
+      expect(params.runtime.broadcast).toHaveBeenNthCalledWith(
+        index + 1,
+        "presence",
+        {
+          presence: expect.arrayContaining(
+            ["ada@example.test", "ada@work.test"].map((email) =>
+              expect.objectContaining({
+                user: {
+                  id: "profile-ada",
+                  identity: { type: "profile", id: "profile-ada" },
+                  email,
+                  name: "Augusta Ada",
+                  avatarUrl: `/api/users/profile-ada/avatar?v=${avatarRevision}`,
+                },
+              }),
+            ),
+          ),
+        },
+        { dropIfSlow: true, stateVersion: { presence: 1, health: 1 } },
+      );
+    }
   });
 
   it("canonicalizes a connected profile after its durable identity is merged", async () => {
@@ -876,16 +932,8 @@ describe("createGatewayRequestContext", () => {
   });
 
   it("invalidateClientsForDevice sets the flag on matching clients without closing the socket", () => {
-    const target = {
-      connId: "conn-target",
-      connect: { device: { id: "device-1" }, role: "primary" },
-      socket: { close: vi.fn() },
-    };
-    const unrelated = {
-      connId: "conn-unrelated",
-      connect: { device: { id: "device-2" }, role: "primary" },
-      socket: { close: vi.fn() },
-    };
+    const target = makeDeviceClient("conn-target", "device-1");
+    const unrelated = makeDeviceClient("conn-unrelated", "device-2");
     const clients = new Set([target, unrelated]) as never;
     const invalidateDeviceTransports = vi.fn();
     const invalidateConnectionForPairingChange = vi.fn();
@@ -900,7 +948,11 @@ describe("createGatewayRequestContext", () => {
         nodeRegistry: { invalidateConnectionForPairingChange } as never,
       }),
     );
+    const detached = captureGatewayDeviceRevocation(context, { deviceId: "device-1" }, () => true);
+    onTestFinished(detached.release);
+    expect(detached.isCurrent()).toBe(true);
     context.invalidateClientsForDevice?.("device-1", { reason: "device-token-rotated" });
+    expect(detached.isCurrent()).toBe(false);
 
     expect((target as { invalidated?: boolean }).invalidated).toBe(true);
     expect((target as { invalidatedReason?: string }).invalidatedReason).toBe(
@@ -920,11 +972,7 @@ describe("createGatewayRequestContext", () => {
   });
 
   it("disconnectClientsForDevice also marks the invalidated flag before closing", () => {
-    const target = {
-      connId: "conn-target",
-      connect: { device: { id: "device-1" }, role: "primary" },
-      socket: { close: vi.fn() },
-    };
+    const target = makeDeviceClient("conn-target", "device-1");
     const clients = new Set([target]) as never;
     const disconnectDeviceTransports = vi.fn();
 
@@ -937,7 +985,11 @@ describe("createGatewayRequestContext", () => {
         },
       }),
     );
+    const detached = captureGatewayDeviceRevocation(context, { deviceId: "device-1" }, () => true);
+    onTestFinished(detached.release);
+    expect(detached.isCurrent()).toBe(true);
     context.disconnectClientsForDevice?.("device-1");
+    expect(detached.isCurrent()).toBe(false);
 
     expect((target as { invalidated?: boolean }).invalidated).toBe(true);
     expect((target as { invalidatedReason?: string }).invalidatedReason).toBe("device-removed");
@@ -994,16 +1046,8 @@ describe("createGatewayRequestContext", () => {
   });
 
   it("invalidateClientsForDevice filters by role when provided", () => {
-    const primary = {
-      connId: "conn-primary",
-      connect: { device: { id: "device-1" }, role: "primary" },
-      socket: { close: vi.fn() },
-    };
-    const secondary = {
-      connId: "conn-secondary",
-      connect: { device: { id: "device-1" }, role: "secondary" },
-      socket: { close: vi.fn() },
-    };
+    const primary = makeDeviceClient("conn-primary", "device-1");
+    const secondary = makeDeviceClient("conn-secondary", "device-1", "secondary");
     const clients = new Set([primary, secondary]) as never;
 
     const context = createGatewayRequestContext(makeContextParams({ clients }));

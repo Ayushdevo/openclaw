@@ -12,6 +12,7 @@ import type {
   OpenKeyedStoreOptions,
   PluginDoctorStateMigrationContext,
 } from "openclaw/plugin-sdk/runtime-doctor-migrations";
+import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   legacyConfigRules,
@@ -25,6 +26,13 @@ import {
   type ReviewRequest,
 } from "./protocol/index.js";
 import { ReefChannelConfigSchema } from "./src/config-schema.js";
+import {
+  REEF_REPLAY_MAX_ENTRIES,
+  REEF_REPLAY_NAMESPACE,
+  REEF_REPLAY_TTL_MS,
+  reefReplayStoreKey,
+  type ReefReplayRecord,
+} from "./src/replay-store.js";
 import {
   generateAndStoreKeys,
   loadKeys,
@@ -46,21 +54,16 @@ import {
   REEF_DELIVERED_MAX_ENTRIES,
   REEF_DELIVERED_NAMESPACE,
   REEF_DELIVERED_TTL_MS,
-  REEF_REPLAY_MAX_ENTRIES,
-  REEF_REPLAY_NAMESPACE,
-  REEF_REPLAY_TTL_MS,
   REEF_REGISTRATION_IDENTITY_KEY,
   REEF_REGISTRATION_MAX_ENTRIES,
   REEF_REGISTRATION_NAMESPACE,
   REEF_REVIEWS_MAX_ENTRIES,
   REEF_REVIEWS_NAMESPACE,
   reefAuditEntryKey,
-  reefReplayStoreKey,
   type ReefAuditHeadRecord,
   type ReefAuditStateRecord,
   type ReefIdentityBinding,
   type ReefIdentityMigrationRecord,
-  type ReefReplayRecord,
   type ReefReviewRecord,
 } from "./src/state.js";
 import {
@@ -93,6 +96,11 @@ function createRuntime(env: NodeJS.ProcessEnv) {
   const runtime = createPluginRuntimeMock();
   runtime.state.openSyncKeyedStore = <T>(options: OpenKeyedStoreOptions) =>
     createPluginStateSyncKeyedStoreForTests<T>("reef", {
+      ...options,
+      env: options.env ?? env,
+    });
+  runtime.state.openKeyedStore = <T>(options: OpenKeyedStoreOptions) =>
+    createPluginStateKeyedStoreForTests<T>("reef", {
       ...options,
       env: options.env ?? env,
     });
@@ -144,8 +152,9 @@ describe("Reef doctor contract", () => {
     env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.restoreAllMocks();
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
     fs.rmSync(stateDir, { recursive: true, force: true });
   });

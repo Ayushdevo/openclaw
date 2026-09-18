@@ -17,6 +17,7 @@ const params = {
   agentId: "cloud",
   target: { kind: "profile", profileId: "aws" } as const,
   message: "run remotely",
+  mode: "dispatch" as const,
 };
 
 function clientWith(request: ReturnType<typeof vi.fn>): Pick<GatewayBrowserClient, "request"> {
@@ -292,6 +293,40 @@ describe("session placement startup", () => {
     expect(request).toHaveBeenCalledTimes(6);
   });
 
+  it.each(["gateway-suspending", "gateway-restarting"])(
+    "continues provisioning automatically after %s without reclaiming the worker",
+    async (reason) => {
+      vi.useFakeTimers();
+      try {
+        let unavailableReads = 0;
+        const request = vi.fn(async (method: string) => {
+          if (method === "sessions.dispatch") {
+            return { placement: { state: "provisioning" } };
+          }
+          if (method === "sessions.describe") {
+            if (unavailableReads++ < 8) {
+              throw new GatewayRequestError({
+                code: "UNAVAILABLE",
+                message: "Gateway temporarily unavailable",
+                retryable: true,
+                details: { reason },
+              });
+            }
+            return { session: { placement: { state: "active" } } };
+          }
+          return { status: "started" };
+        });
+        const outcome = startSessionPlacementInitialTurn(clientWith(request), params, () => true);
+        await vi.runAllTimersAsync();
+        await expect(outcome).resolves.toMatchObject({ status: "started" });
+        expect(request).not.toHaveBeenCalledWith("sessions.reclaim", expect.anything());
+        expect(request.mock.calls.filter(([method]) => method === "sessions.send")).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it.each([
     {
       name: "reclaims the session placement",
@@ -535,7 +570,7 @@ describe("session placement startup", () => {
         {
           ...params,
           messageId: "message-recovered",
-          recovering: true,
+          mode: "recover",
         },
         () => true,
       ),
@@ -840,7 +875,7 @@ describe("session placement startup", () => {
     await expect(
       startSessionPlacementInitialTurn(
         clientWith(request),
-        { ...params, recovering: true, messageId: "recovery-message-1" },
+        { ...params, mode: "recover", messageId: "recovery-message-1" },
         () => true,
       ),
     ).resolves.toEqual({ status: "started", messageId: "recovery-message-1" });

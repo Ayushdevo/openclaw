@@ -64,7 +64,7 @@ const run = { runId: "00000000-0000-4000-8000-000000000001", env: {} };
 describe("maybeRestartService", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.waitForGatewayHttpReadiness.mockResolvedValue({ healthz: 200, readyz: 200 });
+    mocks.waitForGatewayHttpReadiness.mockReset().mockResolvedValue({ healthz: 200, readyz: 200 });
     const healthy = {
       runtime: { status: "running", pid: 8000 },
       portUsage: {
@@ -90,8 +90,13 @@ describe("maybeRestartService", () => {
     "initial-stopped",
     "initial-stopped-reachable",
     "initial-plugin-error",
+    "initial-plugin-unavailable",
     "initial-channel-error",
     "initial-readyz-error",
+    "initial-readyz-rollback",
+    "initial-version-error",
+    "initial-build-error",
+    "initial-settle-error",
   ] as const)(
     "accepts readiness only for the original live executor and healthy service: %s",
     async (change) => {
@@ -106,23 +111,59 @@ describe("maybeRestartService", () => {
           }
         },
       };
-      const initialFailure = change.startsWith("initial-");
-      if (initialFailure) {
+      const rollback = change === "initial-readyz-rollback";
+      const pluginOnly =
+        change === "initial-plugin-error" || change === "initial-plugin-unavailable";
+      const initialFailure = change.startsWith("initial-") && !pluginOnly;
+      const healthy = await mocks.inspectGatewayRestart();
+      if (change.startsWith("initial-")) {
         const health = await mocks.waitForGatewayHealthyRestart();
-        mocks.waitForGatewayHealthyRestart.mockResolvedValue({
+        const observedHealth = {
           ...health,
-          healthy: change === "initial-readyz-error" || change === "initial-stopped-reachable",
+          healthy:
+            pluginOnly ||
+            change === "initial-readyz-error" ||
+            rollback ||
+            change === "initial-stopped-reachable",
           runtime: {
             status: change.startsWith("initial-stopped") ? "stopped" : "running",
             pid: 8000,
           },
-          ...(change === "initial-plugin-error"
-            ? { activatedPluginErrors: [{ error: "failed" }] }
+          ...(change === "initial-version-error"
+            ? {
+                versionMismatch: { expected: "2026.9.2", actual: gateway.version },
+                expectedVersion: "2026.9.2",
+              }
+            : {}),
+          ...(change === "initial-build-error"
+            ? {
+                buildIdMismatch: { expected: "expected-build", actual: gateway.buildId },
+                expectedBuildId: "expected-build",
+              }
+            : {}),
+          ...(change === "initial-settle-error"
+            ? { waitOutcome: "timeout", probeError: "Gateway did not settle" }
+            : {}),
+          ...(change === "initial-plugin-error" || change.startsWith("initial-stopped")
+            ? {
+                activatedPluginErrors: [
+                  { id: "fixture", origin: "global", activated: true, error: "failed" },
+                ],
+              }
+            : {}),
+          ...(change === "initial-plugin-unavailable"
+            ? {
+                unavailablePlugins: [
+                  { id: "fixture", reason: "missing-extension-entry", detail: "Entry missing" },
+                ],
+              }
             : {}),
           ...(change === "initial-channel-error"
-            ? { channelProbeErrors: [{ error: "failed" }] }
+            ? { channelProbeErrors: [{ id: "fixture-channel", error: "connection failed" }] }
             : {}),
-        });
+        };
+        mocks.waitForGatewayHealthyRestart.mockResolvedValue(observedHealth);
+        mocks.inspectGatewayRestart.mockResolvedValue(observedHealth);
       }
       const controller = new AbortController();
       mocks.waitForGatewayHttpReadiness.mockImplementationOnce(async () => {
@@ -130,19 +171,26 @@ describe("maybeRestartService", () => {
           controller.abort();
         }
         current = change !== "revoked";
-        return { healthz: 200, readyz: change === "initial-readyz-error" ? 503 : 200 };
+        return { healthz: 200, readyz: change === "initial-readyz-error" || rollback ? 503 : 200 };
       });
       const onVerified = vi.fn();
       const opts = {
         json: true,
         run: { runId: admitted.runId, env: options.env, executorFence: fence },
       };
+      const updateResult: UpdateRunResult = { status: "ok", mode: "npm", steps: [], durationMs: 0 };
       const verification = verifyUpdatedGateway({
         opts,
         signal: controller.signal,
         requireRunningService: true,
-        result: { status: "ok", mode: "npm", steps: [], durationMs: 0 },
-        serviceEnv: options.env,
+        result: updateResult,
+        serviceEnv: {
+          ...options.env,
+          ...(pluginOnly ? { OPENCLAW_PROFILE: "service-profile" } : {}),
+          ...(change === "initial-plugin-unavailable"
+            ? { OPENCLAW_CONTAINER_HINT: "service-box" }
+            : {}),
+        },
         gatewayPort: 18789,
         expectedVersion: gateway.version,
         expectedBuildId: gateway.buildId,
@@ -151,12 +199,86 @@ describe("maybeRestartService", () => {
       if (initialFailure) {
         await expect(verification).resolves.toMatchObject({ ok: false });
         expect(onVerified).not.toHaveBeenCalled();
+        const failingCheck =
+          change === "initial-version-error"
+            ? { check: "versionMatch", code: "version-mismatch" }
+            : change === "initial-build-error"
+              ? { check: "versionMatch", code: "build-id-mismatch" }
+              : change === "initial-channel-error"
+                ? {
+                    check: "channelsReady",
+                    code: "channel-errors",
+                    pluginId: "fixture-channel",
+                    message: "connection failed",
+                  }
+                : change === "initial-readyz-error" || rollback
+                  ? { check: "readyz", code: "readyz-unhealthy" }
+                  : change === "initial-settle-error"
+                    ? { check: "settled", code: "timeout" }
+                    : { check: "service", code: "service-not-running" };
+        expect(updateResult.steps).toContainEqual(
+          expect.objectContaining({
+            name: "gateway verification",
+            exitCode: 1,
+            failureFacts: expect.arrayContaining([expect.objectContaining(failingCheck)]),
+          }),
+        );
         expect(recordUpdateRunStep).toHaveBeenCalledWith(
           admitted.runId,
-          expect.objectContaining({ step: "gateway verification", status: "failed" }),
+          expect.objectContaining({
+            step: "gateway verification",
+            status: "failed",
+            failureFacts: expect.arrayContaining([expect.objectContaining(failingCheck)]),
+          }),
           expect.anything(),
         );
-      } else if (change !== "current") {
+        if (rollback) {
+          updateResult.recovery = {
+            serviceRestartSafe: true,
+            packageRollbackVerified: true,
+            version: gateway.version,
+          };
+        }
+        mocks.inspectGatewayRestart.mockResolvedValue(healthy);
+        await expect(
+          verifyUpdatedGateway({
+            opts,
+            result: updateResult,
+            health: healthy,
+            serviceEnv: options.env,
+            gatewayPort: 18789,
+            requireRunningService: true,
+          }),
+        ).resolves.toMatchObject({ ok: true });
+        if (rollback) {
+          expect(updateResult.steps).toEqual([
+            expect.objectContaining({
+              name: "gateway verification",
+              exitCode: 1,
+              failureFacts: expect.arrayContaining([
+                expect.objectContaining({ code: "readyz-unhealthy" }),
+              ]),
+            }),
+            expect.objectContaining({ name: "rollback gateway verification", exitCode: 0 }),
+          ]);
+        } else {
+          expect(updateResult.steps).toEqual([
+            expect.objectContaining({ name: "gateway verification", exitCode: 0 }),
+          ]);
+          expect(updateResult.steps[0]?.failureFacts).toBeUndefined();
+        }
+        expect(updateResult.steps.at(-1)?.advisory).toBeUndefined();
+        expect(updateResult.steps.at(-1)?.termination).toBeUndefined();
+        expect(recordUpdateRunStep).toHaveBeenLastCalledWith(
+          admitted.runId,
+          expect.objectContaining({
+            step: rollback ? "rollback gateway verification" : "gateway verification",
+            status: "completed",
+            failureFacts: undefined,
+          }),
+          expect.anything(),
+        );
+      } else if (change === "aborted" || change === "revoked") {
         await expect(verification).rejects.toMatchObject({
           name: change === "aborted" ? "AbortError" : "Error",
         });
@@ -167,7 +289,25 @@ describe("maybeRestartService", () => {
           expect.anything(),
         );
       } else {
-        await expect(verification).resolves.toMatchObject({ ok: true });
+        const result = await verification;
+        expect(result.ok).toBe(true);
+        if (pluginOnly) {
+          const retry =
+            change === "initial-plugin-unavailable"
+              ? "openclaw --container service-box doctor --fix"
+              : "openclaw --profile service-profile doctor --fix";
+          expect(result.pluginWarnings).toEqual([
+            expect.objectContaining({
+              pluginId: "fixture",
+              message: expect.stringContaining("could not be loaded"),
+              guidance: [retry],
+            }),
+          ]);
+          expect(result.summary).toContain("plugin failures need a retry");
+          expect(mocks.waitForGatewayHealthyRestart).toHaveBeenCalledWith(
+            expect.objectContaining({ requirePluginHealth: false }),
+          );
+        }
         expect(onVerified).toHaveBeenCalledOnce();
       }
       expect(loadUpdateRecovery(admitted.runId, options)).toBeUndefined();
@@ -357,13 +497,11 @@ describe("maybeRestartService", () => {
         refreshServiceEnv ? 1 : 0,
       );
       expect(onVerified).toHaveBeenCalledTimes(verified ? 1 : 0);
+      expect(onVerificationFailure).toHaveBeenCalledTimes(verified ? 0 : 1);
       if (verified) {
         const verifiedAtMs = onVerified.mock.calls[0]?.[0];
         expect(verifiedAtMs).toBeGreaterThanOrEqual(startedAtMs);
         expect(verifiedAtMs).toBeLessThanOrEqual(Date.now());
-        expect(onVerificationFailure).not.toHaveBeenCalled();
-      } else {
-        expect(onVerificationFailure).toHaveBeenCalledWith("readyz-unhealthy");
       }
     },
   );

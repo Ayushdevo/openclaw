@@ -16,6 +16,10 @@ type WakeHandler = (
 ) => Promise<SessionEventWakeResult>;
 export type SessionEventWakeWaitOptions = {
   abortSignal?: AbortSignal;
+  /** Called when the queue starts an attempt for this waiter. */
+  onAttemptStarted?: () => void;
+  /** Called whenever this waiter enters the queue, including retained retries. */
+  onQueued?: () => void;
   /** Detach this waiter while the queue retains the wake at its retry deadline. */
   stopWaitingOnRetry?: (
     result: Extract<SessionEventWakeResult, { status: "skipped" }>,
@@ -25,6 +29,8 @@ export type SessionEventWakeWaitOptions = {
 type Settlement = {
   active: boolean;
   settle: (result: SessionEventWakeResult) => void;
+  onAttemptStarted?: SessionEventWakeWaitOptions["onAttemptStarted"];
+  onQueued?: SessionEventWakeWaitOptions["onQueued"];
   stopWaitingOnRetry?: SessionEventWakeWaitOptions["stopWaitingOnRetry"];
 };
 type PendingWake = SessionEventWakeRequest & {
@@ -149,9 +155,10 @@ function createSessionEventWakeRuntime() {
   let sequence = 0;
   let timer: NodeJS.Timeout | undefined;
   let timerDueAt = 0;
+  let timerDefersReadyWork = false;
   let enabled = true;
 
-  function enqueue(wake: PendingWake, blockedUntil = 0): void {
+  function enqueue(wake: PendingWake, blockedUntil = 0): string {
     const key = targetKey(wake);
     const group = pending.get(key) ?? { blockedUntil: 0 };
     const slot =
@@ -159,6 +166,12 @@ function createSessionEventWakeRuntime() {
     group[slot] = group[slot] ? merge(group[slot], wake) : wake;
     group.blockedUntil = Math.max(group.blockedUntil, blockedUntil);
     pending.set(key, group);
+    for (const entry of wake.settlements) {
+      if (entry.active) {
+        entry.onQueued?.();
+      }
+    }
+    return key;
   }
 
   function isReady(group: WakeGroup | undefined, now: number): boolean {
@@ -319,6 +332,11 @@ function createSessionEventWakeRuntime() {
         try {
           result = await runWithGatewayDetachedWorkAdmission(() => {
             signal.throwIfAborted();
+            for (const entry of wake.settlements) {
+              if (entry.active) {
+                entry.onAttemptStarted?.();
+              }
+            }
             // Subscribe before calling the handler: it can synchronously replace its owner.
             const aborted = new Promise<never>((_resolve, reject) => {
               onAbort = () =>
@@ -376,15 +394,17 @@ function createSessionEventWakeRuntime() {
     }
   }
 
-  function scheduleAt(dueAt: number): void {
+  function scheduleAt(dueAt: number, defersReadyWork = false): void {
     if (!handler || (timer && timerDueAt <= dueAt)) {
       return;
     }
     clearTimeout(timer);
     timerDueAt = dueAt;
+    timerDefersReadyWork = defersReadyWork;
     timer = setTimeout(
       () => {
         timer = undefined;
+        timerDefersReadyWork = false;
         const run = handler;
         if (!run) {
           return;
@@ -405,7 +425,7 @@ function createSessionEventWakeRuntime() {
     timer.unref?.();
   }
 
-  function schedulePending(readyDelayMs = 0): void {
+  function schedulePending(readyDelayMs = 0, changedKey?: string): void {
     if (active.size >= MAX_ACTIVE_TARGETS || active.has(GLOBAL_TARGET)) {
       return;
     }
@@ -415,7 +435,14 @@ function createSessionEventWakeRuntime() {
       return;
     }
     let earliest = Infinity;
-    for (const [key, group] of pending) {
+    const changedGroup = changedKey ? pending.get(changedKey) : undefined;
+    // Installation can defer already-ready work; the next admission must rescan
+    // it. Otherwise the armed timer already covers unchanged targets.
+    const candidates =
+      timer && !timerDefersReadyWork && changedKey && changedKey !== GLOBAL_TARGET && changedGroup
+        ? [[changedKey, changedGroup] as const]
+        : pending;
+    for (const [key, group] of candidates) {
       if (active.has(key)) {
         continue;
       }
@@ -427,7 +454,8 @@ function createSessionEventWakeRuntime() {
       }
     }
     if (Number.isFinite(earliest)) {
-      scheduleAt(earliest <= now ? now + readyDelayMs : earliest);
+      const ready = earliest <= now;
+      scheduleAt(ready ? now + readyDelayMs : earliest, ready && readyDelayMs > 0);
     }
   }
 
@@ -438,6 +466,7 @@ function createSessionEventWakeRuntime() {
     handler = next;
     clearTimeout(timer);
     timer = undefined;
+    timerDefersReadyWork = false;
     if (next) {
       for (const group of pending.values()) {
         group.blockedUntil = 0;
@@ -487,8 +516,8 @@ function createSessionEventWakeRuntime() {
         notBefore: 0,
         settlements: settlement ? [settlement] : [],
       };
-      enqueue(pendingWake);
-      schedulePending();
+      const key = enqueue(pendingWake);
+      schedulePending(0, key);
     });
   }
 
@@ -503,6 +532,8 @@ function createSessionEventWakeRuntime() {
       const signal = lifecycle?.abortSignal;
       const settlement: Settlement = {
         active: true,
+        onAttemptStarted: lifecycle?.onAttemptStarted,
+        onQueued: lifecycle?.onQueued,
         stopWaitingOnRetry: lifecycle?.stopWaitingOnRetry,
         settle: (result) => {
           if (settlement.active) {

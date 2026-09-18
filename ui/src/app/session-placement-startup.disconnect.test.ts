@@ -6,6 +6,7 @@ import { writeSessionPlacementRecovery } from "../lib/sessions/session-placement
 import type { ApplicationGateway } from "./gateway.ts";
 import createRuntime from "./session-placement-startup.runtime.ts";
 import {
+  blockStorageWrites,
   createPlacementStartupHarness,
   createStartupPlacement,
   flushStartupMicrotasks,
@@ -35,18 +36,7 @@ describe("initial turn ownership through disconnect", () => {
     async ({ persistent, storageFails, replacementClient }) => {
       const request = vi.fn(() => {
         if (storageFails) {
-          const storage = sessionStorage;
-          vi.stubGlobal("sessionStorage", {
-            get length() {
-              return storage.length;
-            },
-            key: storage.key.bind(storage),
-            getItem: storage.getItem.bind(storage),
-            removeItem: storage.removeItem.bind(storage),
-            setItem: () => {
-              throw new Error("quota");
-            },
-          });
+          blockStorageWrites();
         }
         return Promise.reject(
           new GatewayRequestError({ code: "INVALID_REQUEST", message: "target unavailable" }),
@@ -71,6 +61,7 @@ describe("initial turn ownership through disconnect", () => {
       await flushStartupMicrotasks();
       expect(startup.get(input.recovery.sessionKey)).toMatchObject({
         phase: "failed",
+        startedAt: input.createdAt,
         initialTurn: { text: input.recovery.message, sendRunId: input.recovery.messageId },
         action: "retry",
       });
@@ -241,6 +232,7 @@ describe("initial turn ownership through disconnect", () => {
     expect(request).toHaveBeenCalledTimes(1);
     client.recoveryScopeReady = true;
     transition(gateway, { ...gateway.snapshot, phase: "connected" });
+    expect(startup.get(input.recovery.sessionKey)?.startedAt).toBe(input.createdAt);
     await vi.waitFor(() => expect(startup.hasPendingTurn(input.recovery.sessionKey)).toBe(false));
     expect(request.mock.calls.map(([method]) => method)).toEqual([
       "sessions.dispatch",

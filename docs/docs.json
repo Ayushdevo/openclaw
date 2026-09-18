@@ -1836,6 +1836,7 @@
                   {
                     "group": "Models and memory",
                     "pages": [
+                      "plugins/apple-fm",
                       "plugins/llama-cpp",
                       "plugins/memory-lancedb",
                       "plugins/memory-wiki"
@@ -1856,6 +1857,7 @@
                       "plugins/geolocation",
                       "plugins/logbook",
                       "plugins/oc-path",
+                      "plugins/session-share",
                       "plugins/webhooks",
                       "plugins/workboard",
                       "plugins/zalouser"
@@ -2252,6 +2254,7 @@
                       "providers/perplexity-provider",
                       "providers/qianfan",
                       "providers/qwen",
+                      "providers/radius",
                       "providers/stepfun",
                       "providers/synthetic",
                       "providers/tencent",
@@ -2335,6 +2338,7 @@
                   "platforms/index",
                   "platforms/macos",
                   "platforms/linux",
+                  "platforms/omarchy",
                   "platforms/windows",
                   "platforms/android",
                   "platforms/chromeos",
@@ -2579,6 +2583,7 @@
                           "gateway/sandboxing/podman-backend",
                           "gateway/sandboxing/ssh-backend",
                           "gateway/sandboxing/openshell-backend",
+                          "gateway/sandboxing/crabbox-backend",
                           "gateway/sandboxing/workspace-access",
                           "gateway/sandboxing/multiple-folders-for-one-agent",
                           "gateway/sandboxing/images-and-setup",

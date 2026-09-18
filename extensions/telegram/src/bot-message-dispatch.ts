@@ -210,7 +210,7 @@ async function prepareTelegramSticker(params: {
     context.ctxPayload.BodyForAgent = context.ctxPayload.agentText;
     context.ctxPayload.SkipStickerMediaUnderstanding = true;
   }
-  cacheSticker({
+  await cacheSticker({
     fileId: sticker.fileId,
     fileUniqueId: sticker.fileUniqueId,
     emoji: sticker.emoji,
@@ -314,10 +314,12 @@ export const dispatchTelegramMessage = async (
   // Draft messages are provider-visible before final modifiers run. Suppress them when a hook
   // can rewrite or cancel, or the original payload can flash before the normal delivery gate.
   const hookRunner = getGlobalHookRunner();
-  const allowProviderPreview = !(
-    (hookRunner?.hasHooks("reply_payload_sending") ?? false) ||
-    (hookRunner?.hasHooks("message_sending") ?? false)
-  );
+  const allowProviderPreview =
+    !dispatchContext.ctxPayload.GroupThread &&
+    !(
+      (hookRunner?.hasHooks("reply_payload_sending") ?? false) ||
+      (hookRunner?.hasHooks("message_sending") ?? false)
+    );
   const isDispatchSuperseded = () => turnAdoptionLifecycle?.abortSignal?.aborted === true;
   const turnConfig = {
     ...dispatchParams,
@@ -427,6 +429,7 @@ export const dispatchTelegramMessage = async (
   const terminalFailure = turn.dispatchError || turn.agentRunFailed;
   const shouldSendFailureFallback =
     !isRoomEvent &&
+    turn.finalReplyOutcome !== "suppressed" &&
     !turn.sendPolicyDenied &&
     (!suppressFailureFallback || turn.agentRunFailed) &&
     !turn.finalAnswerDelivered &&
@@ -448,6 +451,7 @@ export const dispatchTelegramMessage = async (
 
   if (
     !sentFallback &&
+    turn.finalReplyOutcome !== "suppressed" &&
     !turn.sendPolicyDenied &&
     !turn.dispatchError &&
     !deliverySummary.delivered &&
@@ -466,16 +470,19 @@ export const dispatchTelegramMessage = async (
   }
 
   const hasFinalResponse =
+    turn.finalReplyOutcome === "suppressed" ||
     turn.finalAnswerDelivered ||
     sentFallback ||
     turn.suppressSilentReplyFallback ||
     turn.queuedFinal;
   const hasVisibleResponse =
+    turn.finalReplyOutcome === "suppressed" ||
     deliverySummary.delivered ||
     sentFallback ||
     turn.suppressSilentReplyFallback ||
     turn.queuedFinal;
   const deliveryFailureWithoutFinalResponse =
+    turn.finalReplyOutcome !== "suppressed" &&
     !turn.finalAnswerDelivered &&
     (deliverySummary.skippedNonSilent > 0 || deliverySummary.failedNonSilent > 0);
   const retryableDispatchFailure =

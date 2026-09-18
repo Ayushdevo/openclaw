@@ -41,16 +41,14 @@ import {
   buildDirectCronDeliveryIdempotencyKey,
   DIRECT_CRON_DELIVERY_COMPLETION_RETENTION,
   isCompletedDirectCronDelivery,
-  isStaleCronDelivery,
   logCronDeliveryError,
   logCronDeliveryErrorDeferred,
   logCronDeliveryWarn,
   maybeApplyTtsToCronPayloads,
   normalizeSilentReplyText,
   resolveCronDeliveryBestEffort,
-  resolveCronDeliveryScheduledAtMs,
   resolveDescendantSubagentFollowup,
-  resolveCronDeliveryStartDelayMs,
+  resolveStaleCronDeliveryError,
   retryTransientDirectCronDelivery,
   waitForCompletedDirectCronDelivery,
 } from "./delivery-dispatch-policy.js";
@@ -243,24 +241,11 @@ export async function dispatchCronDelivery(
           ...params.telemetry,
         });
       }
-      if (
-        params.deliveryRequested &&
-        isStaleCronDelivery({
-          job: params.job,
-          runStartedAt: params.runStartedAt,
-        })
-      ) {
+      const deliveryError = params.deliveryRequested
+        ? resolveStaleCronDeliveryError(params)
+        : undefined;
+      if (deliveryError) {
         deliveryAttempted = true;
-        const nowMs = Date.now();
-        const scheduledAtMs = resolveCronDeliveryScheduledAtMs({
-          job: params.job,
-          runStartedAt: params.runStartedAt,
-        });
-        const startDelayMs = resolveCronDeliveryStartDelayMs({
-          job: params.job,
-          runStartedAt: params.runStartedAt,
-        });
-        const deliveryError = `skipping stale delivery scheduled at ${new Date(scheduledAtMs).toISOString()}, started ${Math.round(startDelayMs / 60_000)}m late, current age ${Math.round((nowMs - scheduledAtMs) / 60_000)}m`;
         recordDelivery("not-delivered", deliveryError);
         await logCronDeliveryWarn(`[cron:${params.job.id}] ${deliveryError}`);
         return params.withRunSession({
@@ -610,7 +595,7 @@ export async function dispatchCronDelivery(
     }
     const initialSynthesizedText = synthesizedText?.trim() ?? "";
     const spawnOnlyHandoff = params.spawnOnlyHandoff;
-    const { finalReply, activeSubagentRuns, hadDescendants } =
+    const { finalReply, hasUnsettledDescendants, hadDescendants } =
       await resolveDescendantSubagentFollowup({
         sessionKey: params.runSessionKey,
         runStartedAt: params.runStartedAt,
@@ -618,6 +603,7 @@ export async function dispatchCronDelivery(
         deliveryBestEffort: params.deliveryBestEffort,
         spawnOnlyHandoff,
         initialSynthesizedText,
+        abortSignal: params.abortSignal,
       });
     if (finalReply) {
       outputText = finalReply;
@@ -630,7 +616,7 @@ export async function dispatchCronDelivery(
       // child output permanently loses one-shot scheduled work.
       const error = params.isAborted()
         ? params.abortReason()
-        : activeSubagentRuns > 0
+        : hasUnsettledDescendants
           ? "cron child-session handoff timed out before producing a final assistant payload"
           : "cron child-session handoff completed without a final assistant payload";
       deliveryAttempted = true;
@@ -642,7 +628,7 @@ export async function dispatchCronDelivery(
         ...params.telemetry,
       });
     }
-    if (!params.deliveryBestEffort && activeSubagentRuns > 0) {
+    if (!params.deliveryBestEffort && hasUnsettledDescendants) {
       // Parent orchestration is still in progress; avoid announcing a partial
       // update to the main requester. Mark deliveryAttempted so the timer does
       // not fire a redundant enqueueSystemEvent fallback (double-announce bug).
@@ -686,7 +672,21 @@ export async function dispatchCronDelivery(
     ) {
       return finishSilentReplyDelivery("silent");
     }
-    synthesizedText = normalizedSynthesizedText.text;
+    if (requiresCurrentSessionCompletion) {
+      const normalizedPayloads = normalizeDirectCronDeliveryPayloads({
+        deliveryPayloads,
+        outputText,
+        summary,
+        synthesizedText,
+      });
+      if (normalizedPayloads.kind === "suppress") {
+        return finishSilentReplyDelivery(normalizedPayloads.reason);
+      }
+      deliveryPayloads = normalizedPayloads.payload;
+    }
+    synthesizedText = normalizedSynthesizedText.strippedTrailingSilentToken
+      ? undefined
+      : normalizedSynthesizedText.text;
     if (synthesizedText) {
       outputText = synthesizedText;
     }

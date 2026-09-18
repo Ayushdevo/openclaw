@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
+import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
 import {
   isPrivateNodeInvokeCommand,
   NODE_WORKER_ENVIRONMENT_STOP_COMMAND,
@@ -48,9 +49,7 @@ export type {
   NodeWorkerSupervisorNodeProof,
 } from "./node-runner-inventory-runtime.js";
 
-type NodeRegistryPrivateSession = NodeRunnerRegistrySession;
-
-type PairingBoundNodeSession = NodeRegistryPrivateSession & { pairingIdentity: string };
+type PairingBoundNodeSession = NodeRunnerRegistrySession & { pairingIdentity: string };
 type PairingLeaseResolution =
   | { status: "current"; session: PairingBoundNodeSession }
   | { status: "stale"; presenceInvalidated: boolean }
@@ -59,6 +58,7 @@ type PairingLeaseResolution =
 type NodeWorkerPrivateCommand = (typeof NODE_WORKER_PRIVATE_COMMANDS)[number];
 
 export type NodeWorkerSupervisorTransport = {
+  getCurrentNode(nodeId: string): Promise<NodeWorkerSupervisorNodeProof | undefined>;
   listCurrentNodes(): Promise<readonly NodeWorkerSupervisorNodeProof[]>;
   hasCurrentRunner(nodeId: string): boolean;
   /** Diagnostic connection presence, independent of session-host eligibility. */
@@ -89,16 +89,13 @@ export type NodeWorkerSupervisorTransport = {
 type NodeRegistryPrivateContext = {
   getNode: (nodeId: string) => PairingBoundNodeSession | undefined;
   isCommandAllowed: (nodeId: string, command: string) => boolean;
-  listCurrentConnected: () => Promise<NodeRegistryPrivateSession[]>;
+  listCurrentConnected: () => Promise<NodeRunnerRegistrySession[]>;
+  getCurrentConnected: (nodeId: string) => Promise<NodeRunnerRegistrySession | undefined>;
   hasCurrentPairingStateResolver: boolean;
   resolvePairingLease: (node: PairingBoundNodeSession) => Promise<PairingLeaseResolution>;
   pendingInvokes: Map<string, PendingInvoke>;
   invokeStreams: NodeInvokeStreamController;
-  sendEventToSession: (
-    node: NodeRegistryPrivateSession,
-    event: string,
-    payload: unknown,
-  ) => boolean;
+  sendEventToSession: (node: NodeRunnerRegistrySession, event: string, payload: unknown) => boolean;
   rememberAuthorizedSystemRunEvent: (event: {
     nodeId: string;
     connId: string;
@@ -288,11 +285,20 @@ async function invokeNodeRegistryCore(
   }
   if (expectedPairingGeneration && state.context.hasCurrentPairingStateResolver) {
     const pairingNode = node;
-    const resolution = await awaitWithinDeadline(
-      () => state.context.resolvePairingLease(pairingNode),
-      deadlineAtMs,
-      () => performance.now(),
-    );
+    let resolution: PairingLeaseResolution | typeof ABSOLUTE_DEADLINE_EXPIRED;
+    try {
+      resolution = await awaitWithinDeadline(
+        () =>
+          racePromiseWithAbortSignal(state.context.resolvePairingLease(pairingNode), params.signal),
+        deadlineAtMs,
+        () => performance.now(),
+      );
+    } catch (error) {
+      if (params.signal?.aborted) {
+        return { ok: false, error: { code: "ABORTED", message: "node invoke cancelled" } };
+      }
+      throw error;
+    }
     if (resolution === ABSOLUTE_DEADLINE_EXPIRED) {
       return { ok: false, error: { code: "TIMEOUT", message: "node invoke timed out" } };
     }
@@ -455,6 +461,10 @@ export function registerNodeRegistryPrivateRuntime(
     await invokeNodeRegistryCore(state, params, allowPrivateCommand, isCompletionAuthorized);
   state.updateRunnerInventory = (params) => updateWorkerRunnerInventory(state, params);
   state.workerSupervisorTransport = {
+    getCurrentNode: async (nodeId) => {
+      const node = await context.getCurrentConnected(nodeId);
+      return node ? resolveNodeWorkerSupervisorProof(node, state.runnerInventoryByConn) : undefined;
+    },
     listCurrentNodes: async () => {
       const current = await context.listCurrentConnected();
       return current.flatMap((node) => {
@@ -638,7 +648,7 @@ export function forgetNodeRunnerInventory(nodeRegistry: object, connId: string):
 export function collectNodeCatalogRuntimeState(
   registry: object,
   connectedNodes: ReadonlyArray<
-    Pick<NodeRegistryPrivateSession, "nodeId" | "connId" | "pairingGeneration">
+    Pick<NodeRunnerRegistrySession, "nodeId" | "connId" | "pairingGeneration">
   >,
 ) {
   const sessionHostNodeIds = new Set<string>();
@@ -680,7 +690,7 @@ export function collectNodeCatalogRuntimeState(
 export function isNodeRegistryPendingInvokeConnectionActive(params: {
   registry: object;
   pending: PendingInvoke;
-  currentNode: NodeRegistryPrivateSession | undefined;
+  currentNode: NodeRunnerRegistrySession | undefined;
 }): boolean {
   const state = NODE_REGISTRY_PRIVATE_STATES.get(params.registry);
   const binding = state?.generationBoundInvokes.get(params.pending);

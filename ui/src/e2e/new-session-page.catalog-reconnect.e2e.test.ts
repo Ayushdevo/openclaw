@@ -73,7 +73,15 @@ suite.define(() => {
       deferredMethods: ["agents.list"],
       featureMethods: [...TERMINAL_START_FEATURE_METHODS],
       methodResponses: {
-        "sessions.catalog.list": { catalogs: [cliAgentCatalog(true)] },
+        "sessions.catalog.list": {
+          cases: [
+            {
+              match: { metadataOnly: true },
+              response: { catalogs: [{ ...cliAgentCatalog(true), hosts: [] }] },
+            },
+            { match: {}, response: { catalogs: [cliAgentCatalog(true)] } },
+          ],
+        },
       },
     });
 
@@ -83,7 +91,7 @@ suite.define(() => {
       await page.locator(".new-session-page__message").waitFor({ state: "visible" });
       expect(
         (await gateway.getRequests("sessions.catalog.list"))
-          .filter((request) => requestHasParam(request, "limitPerHost", 1))
+          .filter((request) => requestHasParam(request, "metadataOnly", true))
           .map((request) => request.params),
       ).toEqual([]);
 
@@ -93,16 +101,16 @@ suite.define(() => {
       await expect
         .poll(async () =>
           (await gateway.getRequests("sessions.catalog.list")).filter((request) =>
-            requestHasParam(request, "limitPerHost", 1),
+            requestHasParam(request, "metadataOnly", true),
           ),
         )
         .toHaveLength(1);
       const catalogRequest = (await gateway.getRequests("sessions.catalog.list")).find((request) =>
-        requestHasParam(request, "limitPerHost", 1),
+        requestHasParam(request, "metadataOnly", true),
       );
       expect(catalogRequest?.params).toEqual({
         agentId: "roboclaw",
-        limitPerHost: 1,
+        metadataOnly: true,
       });
 
       await page.locator('[data-chat-model-select="true"]').click();
@@ -132,6 +140,13 @@ suite.define(() => {
         : {}),
     });
     const page = await context.newPage();
+    const terminalCatalog = cliAgentCatalog(true);
+    const historyCatalog = {
+      id: "history-only",
+      label: "History only",
+      capabilities: { continueSession: true, archive: false },
+      hosts: [],
+    };
     const gateway = await installMockGateway(page, {
       cliAgentsEnabled: true,
       featureMethods: [
@@ -143,31 +158,16 @@ suite.define(() => {
       ],
       methodResponses: {
         "sessions.catalog.list": {
-          catalogs: [
+          cases: [
             {
-              id: "claude",
-              label: "Claude Code",
-              capabilities: {
-                continueSession: true,
-                archive: false,
-                startTerminal: true,
+              match: { metadataOnly: true },
+              response: {
+                catalogs: [{ ...terminalCatalog, hosts: [] }, historyCatalog],
               },
-              hosts: [
-                {
-                  hostId: "gateway:local",
-                  label: "Local Claude Code",
-                  kind: "gateway",
-                  connected: true,
-                  canStartTerminal: true,
-                  sessions: [],
-                },
-              ],
             },
             {
-              id: "history-only",
-              label: "History only",
-              capabilities: { continueSession: true, archive: false },
-              hosts: [],
+              match: {},
+              response: { catalogs: [terminalCatalog, historyCatalog] },
             },
           ],
         },
@@ -179,10 +179,10 @@ suite.define(() => {
       await expect
         .poll(async () =>
           (await gateway.getRequests("sessions.catalog.list")).find((request) =>
-            requestHasParam(request, "limitPerHost", 1),
+            requestHasParam(request, "metadataOnly", true),
           ),
         )
-        .toMatchObject({ params: { agentId: "main", limitPerHost: 1 } });
+        .toMatchObject({ params: { agentId: "main", metadataOnly: true } });
 
       await page.locator('[data-chat-model-select="true"]').click();
       const cliGroup = page.locator('[data-chat-model-target-group="cliAgents"]');
@@ -209,7 +209,11 @@ suite.define(() => {
             requestHasParam(request, "catalogId", "claude"),
           ),
         )
-        .toMatchObject({ params: { agentId: "main", catalogId: "claude" } });
+        .toMatchObject({ params: { agentId: "main", catalogId: "claude", limitPerHost: 1 } });
+      const targetRequest = (await gateway.getRequests("sessions.catalog.list")).find((request) =>
+        requestHasParam(request, "catalogId", "claude"),
+      );
+      expect(targetRequest?.params).not.toHaveProperty("metadataOnly");
       await pollLocatorText(page.locator(".new-session-page__runtime")).toContain("Claude Code");
       expect(await page.locator('[data-chat-model-select="true"]').count()).toBe(0);
       if (captureCliAgentsProof) {
@@ -403,15 +407,17 @@ suite.define(() => {
       expect(methods.indexOf("worktrees.create")).toBeLessThan(
         methods.indexOf("sessions.catalog.startTerminal"),
       );
-      await expect.poll(() => page.locator(".new-session-page__message").inputValue()).toBe("");
-      const panel = page.locator("openclaw-terminal-panel");
+      await page.waitForURL(`${suite.server.baseUrl}terminal/terminal-cli-1`);
+      const panel = page.locator("openclaw-terminal-page openclaw-terminal-panel");
       await panel.locator(".tabstrip-tab.is-live").waitFor();
       await panel.locator(".tp-host canvas").waitFor({ state: "visible" });
+      expect(await page.locator(".new-session-page__message").count()).toBe(0);
       await expect
         .poll(() => panel.locator(".tabstrip-tab.is-live").getAttribute("title"))
         .toContain(worktreePath);
       expect(await gateway.getRequests("terminal.open")).toHaveLength(0);
 
+      await navigateInApp(page, "new-session", "?agent=research&catalog=claude");
       await expect
         .poll(() => page.getByRole("button", { name: "Start in terminal" }).isEnabled())
         .toBe(true);
@@ -432,7 +438,7 @@ suite.define(() => {
         catalogId: "claude",
         agentId: "research",
         hostId: "gateway:local",
-        cwd: worktreePath,
+        cwd: WORKSPACE,
       });
     } finally {
       await context.close();
@@ -542,8 +548,9 @@ suite.define(() => {
         expect(await page.locator(".new-session-page__starting").count()).toBe(0);
         expect(await gateway.getRequests("sessions.create")).toHaveLength(0);
         await gateway.resolveDeferred("sessions.catalog.startTerminal");
-        await expect.poll(() => message.inputValue()).toBe("");
-        await page.locator("openclaw-terminal-panel .tabstrip-tab.is-live").waitFor();
+        await page.waitForURL(`${suite.server.baseUrl}terminal/native-cli`);
+        await expect.poll(() => message.count()).toBe(0);
+        await page.locator("openclaw-terminal-page .tabstrip-tab.is-live").waitFor();
         expect(await gateway.getRequests("sessions.title.prepare")).toHaveLength(1);
         expect(await gateway.getRequests("sessions.create")).toHaveLength(0);
       } finally {

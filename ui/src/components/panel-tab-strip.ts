@@ -17,6 +17,9 @@ export type PanelTabStripTab = {
   badge?: string | null;
   className?: string;
   closeLabel: string;
+  group?: string;
+  draggable?: boolean;
+  reorderId?: string;
   /** Explicit click/Enter/Space action; arrow-key selection still uses onSelect. */
   onActivate?: () => void;
 };
@@ -48,12 +51,12 @@ function activeElementFor(element: Element): Element | null {
     : document.activeElement;
 }
 
-function deepestActiveElement(): Element | null {
+function deepestActiveElementId(): string | null {
   let active = document.activeElement;
   while (active instanceof HTMLElement && active.shadowRoot?.activeElement) {
     active = active.shadowRoot.activeElement;
   }
-  return active;
+  return active instanceof HTMLElement ? active.id : null;
 }
 
 function focusNeedsRecovery(element: Element, current: Element | null): boolean {
@@ -226,12 +229,11 @@ export function renderPanelTabStrip(params: {
     // visible. Keep the new-session control outside the group until one exists.
     return newButton(false);
   }
-  const activeElement = deepestActiveElement();
-  const focusedTabDomId =
-    activeElement instanceof HTMLElement &&
-    params.tabs.some((tab) => tab.domId === activeElement.id)
-      ? activeElement.id
-      : null;
+  // Event callbacks retain this render scope; keep focus identity without retaining its DOM tree.
+  const activeElementId = deepestActiveElementId();
+  const focusedTabDomId = params.tabs.some((tab) => tab.domId === activeElementId)
+    ? activeElementId
+    : null;
   // Selection belongs in the key: activating a clipped tab has to scroll it back
   // into view, otherwise it stays cut off at the viewport edge as icon-only.
   // Serialized rather than joined: a delimiter can appear inside an id, and two
@@ -257,9 +259,14 @@ export function renderPanelTabStrip(params: {
         (tab) => tab.id,
         (tab, index) => {
           const selected = tab.id === params.activeId;
-          // Every gap keeps its separator so activating a tab cannot reflow the
-          // row; the pair touching the active tab is faded out in CSS instead.
-          const showSeparator = params.separateTabs === true && index < params.tabs.length - 1;
+          const reorderId = tab.reorderId ?? tab.id;
+          const draggable = Boolean(params.onReorder) && tab.draggable !== false;
+          // Every gap outside a group keeps its separator so activating a tab cannot
+          // reflow the row; the pair touching the active tab is faded out in CSS instead.
+          const showSeparator =
+            params.separateTabs === true &&
+            index < params.tabs.length - 1 &&
+            (tab.group === undefined || tab.group !== params.tabs[index + 1]?.group);
           const tabContent = html`
             ${
               tab.icon == null || tab.icon === nothing
@@ -283,7 +290,7 @@ export function renderPanelTabStrip(params: {
               aria-selected=${selected ? "true" : "false"}
               title=${tab.title || nothing}
               ?active=${selected}
-              draggable=${params.onReorder ? "true" : nothing}
+              draggable=${draggable ? "true" : nothing}
               .tabIndex=${selected ? 0 : -1}
               ${
                 selected
@@ -318,15 +325,15 @@ export function renderPanelTabStrip(params: {
                 }
               }}
               @dragstart=${(event: DragEvent) => {
-                if (!params.onReorder || !event.dataTransfer) {
+                if (!draggable || !event.dataTransfer) {
                   return;
                 }
                 event.dataTransfer.effectAllowed = "move";
-                event.dataTransfer.setData(PANEL_TAB_DRAG_TYPE, tab.id);
+                event.dataTransfer.setData(PANEL_TAB_DRAG_TYPE, reorderId);
                 if (event.currentTarget instanceof Element) {
                   const group = event.currentTarget.closest<HTMLElement>("wa-tab-group");
                   if (group) {
-                    group.dataset.draggedPanelTab = tab.id;
+                    group.dataset.draggedPanelTab = reorderId;
                   }
                 }
               }}
@@ -338,7 +345,7 @@ export function renderPanelTabStrip(params: {
                   event.currentTarget instanceof Element
                     ? draggedPanelTabId(event.currentTarget)
                     : "";
-                if (!sourceId || sourceId === tab.id) {
+                if (!sourceId || sourceId === reorderId) {
                   return;
                 }
                 event.preventDefault();
@@ -370,13 +377,13 @@ export function renderPanelTabStrip(params: {
                   target instanceof Element
                     ? draggedPanelTabId(target) || event.dataTransfer.getData(PANEL_TAB_DRAG_TYPE)
                     : "";
-                if (!sourceId || sourceId === tab.id || !(target instanceof Element)) {
+                if (!sourceId || sourceId === reorderId || !(target instanceof Element)) {
                   return;
                 }
                 event.preventDefault();
                 const placement = panelTabDropPlacement(event, target);
                 finishPanelTabDrag(target);
-                params.onReorder(sourceId, tab.id, placement);
+                params.onReorder(sourceId, reorderId, placement);
               }}
               @dragend=${(event: DragEvent) => {
                 if (event.currentTarget instanceof Element) {
@@ -523,6 +530,12 @@ export const panelTabStripStyles = css`
   .tabstrip-tab__icon {
     display: inline-flex;
     color: var(--accent, #ff5c5c);
+  }
+  .tabstrip-tab__favicon {
+    width: 16px;
+    height: 16px;
+    border-radius: 3px;
+    object-fit: contain;
   }
   .tabstrip-tab.is-exited .tabstrip-tab__icon {
     color: var(--muted, #8a919e);

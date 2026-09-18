@@ -23,6 +23,7 @@ export type OpenClawToolsOptions = {
   sandboxBrowserBridgeUrl?: string;
   allowHostBrowserControl?: boolean;
   agentSessionKey?: string;
+  gatewayUiCommandTarget?: import("../gateway/ui-command-target.types.js").GatewayUiCommandTarget;
   toolBindings?: Readonly<Record<string, unknown>>;
   /** Durable store key when it differs from the sandbox/policy session key. */
   runSessionKey?: string;
@@ -50,9 +51,14 @@ export type OpenClawToolsOptions = {
   nativeChannelId?: string;
   /** Opaque host-issued capability for current-turn channel message actions. */
   messageActionTurnCapability?: string;
+  /** Message-only authority from a CLI grant; does not authorize plugin delivery. */
+  messageToolTurnCapability?: { token: string; sessionKey: string };
+  /** Private factory admission for a new scheduled message invocation. */
+  admitScheduledMessageInvocation?: () => OpenClawConfig;
   sandboxRoot?: string;
   sandboxContainerWorkdir?: string;
   sandboxFsBridge?: SandboxFsBridge;
+  sandboxReadOnlyResourceMounts?: readonly { hostPath: string; containerPath: string }[];
   /** Producer-authored bare upload handles mapped to exact sandbox paths. */
   stagedMediaPaths?: ReadonlyMap<string, string>;
   /** Prepared effective read authorization for exporting sandbox workspace media. */
@@ -62,6 +68,8 @@ export type OpenClawToolsOptions = {
   config?: OpenClawConfig;
   /** Gateway-owned session policy follows runtime updates; explicit overrides stay pinned. */
   sessionConfigSource?: "runtime" | "pinned";
+  /** Host-bound history/search scope; does not change mutation or execution identity. */
+  sessionReadScopeKey?: string;
   webFetchHostnameAllowlistRef?: { value?: string[] };
   webSearchEnabled?: boolean;
   /** Capabilities declared by the gateway client that originated this run. */
@@ -70,6 +78,8 @@ export type OpenClawToolsOptions = {
   pinnedWidgetAuthoring?: boolean;
   pluginToolAllowlist?: string[];
   pluginToolDenylist?: string[];
+  /** Prepared profile authority for the gateway tool's configuration-read actions. */
+  gatewayConfigReadAllowed?: boolean;
   runtimeToolAllowlist?: string[];
   /** Host-prepared proof that this exact session can request Gateway publication. */
   githubPublicationAvailable?: boolean;
@@ -127,6 +137,12 @@ export type OpenClawToolsOptions = {
   disableMessageTool?: boolean;
   swarmCollector?: boolean;
   swarmOutputSchema?: Record<string, unknown>;
+  /**
+   * Re-checked immediately before a collector result is persisted. Supplied by
+   * callers whose collector authority can be revoked while a tool call is
+   * already in flight.
+   */
+  assertCollectorWriteAuthority?: () => void;
   /** If true, include the heartbeat response tool for structured heartbeat outcomes. */
   enableHeartbeatTool?: boolean;
   /** If true, skip plugin tool resolution and return only shipped core tools. */
@@ -167,6 +183,8 @@ export type OpenClawToolsOptions = {
   questionPrompt?: QuestionPromptDelivery;
   onYield?: (message: string, acknowledgment?: string) => Promise<void> | void;
   claimYieldCompletion?: () => boolean | Promise<boolean>;
+  /** Prepared exec/process isolation key for this run. */
+  processScopeKey?: string;
   /** Allow plugin tools for this tool set to late-bind the gateway subagent. */
   allowGatewaySubagentBinding?: boolean;
 } & SpawnedToolContext &

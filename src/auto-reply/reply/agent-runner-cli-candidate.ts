@@ -89,18 +89,6 @@ export async function runCliFallbackCandidate(
     config: params.runtimeConfig,
     agentId: params.candidateRun.agentId,
   });
-  // The CLI owner must see explicit pins before provider scoping can discard them.
-  const authProfileId = allowCliAuthProfileForwarding
-    ? resolveCliExecutionAuthProfileId({
-        cliExecutionProvider: params.cliExecutionProvider,
-        authProfileProvider: params.provider,
-        config: params.runtimeConfig,
-        agentDir: params.candidateRun.agentDir,
-        selected: params.candidateRun,
-      })
-    : resolveRunAuthProfile(params.candidateRun, params.cliExecutionProvider, {
-        config: params.runtimeConfig,
-      }).authProfileId;
   const hookMessageProvider = resolveOriginMessageProvider({
     originatingChannel: turn.followupRun.originatingChannel,
     provider: turn.sessionCtx.Provider,
@@ -178,8 +166,21 @@ export async function runCliFallbackCandidate(
         ) {
           throw createAgentRunSupersededAbortError();
         }
-        const diagnosticOwner = params.deferredLifecycle.handoffToCli();
         const cliSessionBinding = getCliSessionBinding(sessionEntry, params.cliExecutionProvider);
+        // The CLI owner must see explicit pins before provider scoping can discard them.
+        const authProfileId = allowCliAuthProfileForwarding
+          ? resolveCliExecutionAuthProfileId({
+              cliExecutionProvider: params.cliExecutionProvider,
+              authProfileProvider: params.provider,
+              config: params.runtimeConfig,
+              agentDir: params.candidateRun.agentDir,
+              selected: params.candidateRun,
+              sessionBinding: cliSessionBinding,
+            })
+          : resolveRunAuthProfile(params.candidateRun, params.cliExecutionProvider, {
+              config: params.runtimeConfig,
+            }).authProfileId;
+        const diagnosticOwner = params.deferredLifecycle.handoffToCli();
         const mediaTaskIdsBefore = getGeneratedMediaTaskIdsForSessionKey(turn.sessionKey);
         let droppedCliSessionReplacement = false;
         const candidateResult = await runCliAgentWithLifecycle({
@@ -286,6 +287,7 @@ export async function runCliFallbackCandidate(
               ),
             ]);
           },
+          onItemEvent: turn.opts?.onItemEvent,
           onCommentaryText:
             bridgeCliPreambleProgress || bridgeCliDurableCommentary
               ? async (payload) => {
@@ -330,6 +332,7 @@ export async function runCliFallbackCandidate(
               : undefined,
           runParams: {
             preparedRunAdmission: params.preparedRunAdmission,
+            messageActionTurnCapability: params.messageActionTurnCapability,
             diagnosticOwner,
             sessionId: turn.followupRun.run.sessionId,
             sessionKey,
@@ -376,6 +379,7 @@ export async function runCliFallbackCandidate(
               }),
             ),
             modelProvider: params.provider,
+            requesterModel: { provider: params.provider, model: params.model },
             modelHasVision,
             modelContextWindow: selectedModelEntry?.contextWindow,
             modelContextTokens: selectedModelEntry?.contextTokens,
@@ -399,6 +403,7 @@ export async function runCliFallbackCandidate(
             taskSuggestionDeliveryMode: turn.followupRun.run.taskSuggestionDeliveryMode,
             // Heartbeat ambient routes are never implicit message recipients.
             ...(turn.isHeartbeat ? { requireExplicitMessageTarget: true } : {}),
+            cleanupBundleMcpOnRunEnd: turn.opts?.cleanupBundleMcpOnRunEnd,
             silentReplyPromptMode: turn.followupRun.run.silentReplyPromptMode,
             allowEmptyAssistantReplyAsSilent: turn.followupRun.run.allowEmptyAssistantReplyAsSilent,
             extraSystemPromptStatic: turn.followupRun.run.extraSystemPromptStatic,
@@ -421,6 +426,7 @@ export async function runCliFallbackCandidate(
             messageChannel: turn.followupRun.originatingChannel ?? undefined,
             messageProvider: hookMessageProvider,
             clientCaps: turn.followupRun.run.clientCaps,
+            gatewayUiCommandTarget: turn.followupRun.run.gatewayUiCommandTarget,
             currentChannelId:
               turn.followupRun.originatingTo ?? turn.sessionCtx.OriginatingTo ?? turn.sessionCtx.To,
             senderId: turn.followupRun.run.senderId,

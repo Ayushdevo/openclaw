@@ -39,8 +39,6 @@ describe("dispatchReplyFromConfig", () => {
     const cfg = automaticGroupReplyConfig;
     const dispatcher = createDispatcher();
     const ctx = buildTestCtx({
-      Provider: "whatsapp",
-      Surface: "whatsapp",
       ChatType: "group",
       From: "whatsapp:group:123@g.us",
       SessionKey: "agent:main:whatsapp:group:123@g.us",
@@ -962,6 +960,34 @@ describe("dispatchReplyFromConfig", () => {
     expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: "done" });
   });
 
+  it("keeps prepared notes in drafts and the generic receipt in verbose notices", async () => {
+    setNoAbort();
+    const cfg = {
+      ...emptyConfig,
+      agents: { defaults: { verboseDefault: "on" } },
+    } satisfies OpenClawConfig;
+    const dispatcher = createDispatcher();
+    await dispatchReplyFromConfig({
+      ctx: buildTestCtx({ Provider: "telegram", ChatType: "direct" }),
+      cfg,
+      dispatcher,
+      replyResolver: async (_ctx, opts) => {
+        await opts?.onPlanUpdate?.({
+          phase: "update",
+          explanation: "Use **literal** and [label](https://example.com).",
+          explanationFormat: "plain",
+          steps: [],
+        });
+        return { text: "done" };
+      },
+    });
+    expect(firstToolResultPayload(dispatcher)).toMatchObject({
+      text: "Progress updated",
+      isStatusNotice: true,
+    });
+    expect(dispatcher.sendToolResult).toHaveBeenCalledTimes(1);
+  });
+
   it("sends only one plan status notice per reply run", async () => {
     setNoAbort();
     const cfg = {
@@ -1538,8 +1564,6 @@ describe("dispatchReplyFromConfig", () => {
     const dispatcher = createDispatcher();
     const onItemEvent = vi.fn();
     const ctx = buildTestCtx({
-      Provider: "whatsapp",
-      Surface: "whatsapp",
       ChatType: "group",
       From: "whatsapp:group:123@g.us",
       SessionKey: "agent:main:whatsapp:group:123@g.us",

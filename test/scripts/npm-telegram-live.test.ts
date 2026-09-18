@@ -10,6 +10,7 @@ import {
   isPreProgressToolVisibilityTarget,
   isPreProviderFailureBeforeOutputTarget,
   isPreQueueInvalidModeTarget,
+  isPreRichInlineCompositionTarget,
   isPreSettledEmptyResponseTarget,
   resolveFrozenTelegramScenarioOmissions,
 } from "../../scripts/e2e/lib/npm-telegram-live/resolve-target-scenarios.mts";
@@ -243,6 +244,9 @@ describe("package Telegram live Docker E2E", () => {
       'node --import tsx "$ROOT_DIR/scripts/e2e/lib/npm-telegram-live/prepare-package.mts" "$harness_package_json"',
     );
     expect(script).toContain('-v "$harness_package_json:/app/package.json:ro"');
+    expect(script).toContain(
+      '-v "$harness_package_json:/app/extensions/qa-lab/node_modules/openclaw/package.json:ro"',
+    );
     expect(script).toContain('-v "$ROOT_DIR/dist:/app/dist:ro"');
     expect(script).toContain('-v "$ROOT_DIR/node_modules:/trusted-harness/node_modules:ro"');
     expect(script).toContain('-v "$ROOT_DIR/packages:/app/packages:ro"');
@@ -272,7 +276,7 @@ describe("package Telegram live Docker E2E", () => {
 
   it("adds private SDK exports only to the trusted harness manifest", () => {
     const root = mkTempRoot();
-    const harnessManifestPath = path.join(root, "harness-package.json");
+    const harnessManifestPath = path.join(root, "package.json");
     const candidateManifestPath = path.join(root, "candidate-package.json");
     const existingGatewayExport = {
       types: "./existing/gateway-runtime.d.ts",
@@ -282,6 +286,7 @@ describe("package Telegram live Docker E2E", () => {
       harnessManifestPath,
       `${JSON.stringify({
         name: "openclaw",
+        type: "module",
         exports: {
           "./kept": "./dist/kept.js",
           "./plugin-sdk/gateway-runtime": existingGatewayExport,
@@ -298,17 +303,32 @@ describe("package Telegram live Docker E2E", () => {
     };
     expect(prepared.exports["./kept"]).toBe("./dist/kept.js");
     expect(prepared.exports["./plugin-sdk/gateway-runtime"]).toEqual(existingGatewayExport);
-    expect(prepared.exports["./plugin-sdk/qa-runtime"]).toEqual({
-      default: "./dist/plugin-sdk/qa-runtime.js",
-    });
-    expect(prepared.exports["./plugin-sdk/qa-lab"]).toEqual({
-      default: "./dist/plugin-sdk/qa-lab.js",
-    });
     for (const subpath of privateLocalOnlyPluginSdkEntrypoints) {
       expect(prepared.exports[`./plugin-sdk/${subpath}`]).toEqual({
         default: `./dist/plugin-sdk/${subpath}.js`,
       });
     }
+    const privateQaSubpaths = ["qa-channel", "qa-channel-protocol", "qa-lab", "qa-runtime"];
+    for (const subpath of privateQaSubpaths) {
+      expect(prepared.exports[`./plugin-sdk/${subpath}`]).toEqual({
+        default: `./dist/plugin-sdk/${subpath}.js`,
+      });
+      mkdirSync(path.join(root, "dist/plugin-sdk"), { recursive: true });
+      writeFileSync(
+        path.join(root, `dist/plugin-sdk/${subpath}.js`),
+        "export const harnessOnly = true;\n",
+      );
+    }
+    // Resolve the private manifest with Node, without the test runner's source SDK aliases.
+    writeFileSync(
+      path.join(root, "load-private.mjs"),
+      `import assert from "node:assert/strict";
+for (const subpath of ${JSON.stringify(privateQaSubpaths)}) {
+  assert.equal((await import("openclaw/plugin-sdk/" + subpath)).harnessOnly, true);
+}
+`,
+    );
+    execFileSync(process.execPath, [path.join(root, "load-private.mjs")], { cwd: root });
     expect(readFileSync(candidateManifestPath, "utf8")).toBe(candidateBefore);
   });
 
@@ -486,6 +506,87 @@ describe("package Telegram live Docker E2E", () => {
     expect(isPreQueueInvalidModeTarget(root)).toBe(false);
   });
 
+  it("omits rich inline composition until the frozen source owns its scenario", () => {
+    const root = mkTempRoot();
+    const scenario = path.join(root, "qa/scenarios/channels/telegram-rich-inline-composition.yaml");
+
+    expect(isPreRichInlineCompositionTarget(root)).toBe(true);
+    mkdirSync(path.dirname(scenario), { recursive: true });
+    writeFileSync(scenario, "id: telegram-rich-inline-composition\n");
+    expect(isPreRichInlineCompositionTarget(root)).toBe(false);
+  });
+
+  it.each([
+    [],
+    ["telegram-policy-hot-reload"],
+    ["telegram-group-policy-hot-reload"],
+    ["telegram-policy-hot-reload", "telegram-group-policy-hot-reload"],
+  ])(
+    "qualifies default policy reload scenarios from the selected source (%j)",
+    (...supported: string[]) => {
+      const root = mkTempRoot();
+      const policyScenarios = ["telegram-policy-hot-reload", "telegram-group-policy-hot-reload"];
+      for (const id of supported) {
+        const file = path.join(root, `qa/scenarios/channels/${id}.yaml`);
+        mkdirSync(path.dirname(file), { recursive: true });
+        writeFileSync(file, `scenario:\n  id: ${id}\n`);
+      }
+      execFileSync("git", ["init", "-q", root]);
+      execFileSync("git", ["-C", root, "add", "."]);
+      execFileSync("git", [
+        "-C",
+        root,
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "-qm",
+        "target",
+        "--allow-empty",
+      ]);
+      const selectedSha = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      const output = path.join(root, "github.env");
+      const qualifier = path.resolve(
+        TEST_DIR,
+        "../../scripts/e2e/lib/npm-telegram-live/resolve-target-scenarios.mts",
+      );
+      execFileSync(process.execPath, [qualifier, root], {
+        env: { ...process.env, OPENCLAW_SELECTED_SHA: selectedSha, GITHUB_ENV: output },
+      });
+      const omissions = readFileSync(output, "utf8").trim().split("=")[1];
+      const env = { OPENCLAW_NPM_TELEGRAM_OMIT_DEFAULT_SCENARIOS: omissions };
+      const resolve = (ids: readonly string[]) =>
+        ids.length ? [...ids] : ["channel-canary", ...policyScenarios];
+      expect(testing.resolvePackageTelegramScenarios(env, resolve).resolvedScenarioIds).toEqual([
+        "channel-canary",
+        ...policyScenarios.filter((id) => supported.includes(id)),
+      ]);
+      for (const id of policyScenarios) {
+        expect(
+          testing.resolvePackageTelegramScenarios(
+            { ...env, OPENCLAW_NPM_TELEGRAM_SCENARIOS: id },
+            resolve,
+          ).resolvedScenarioIds,
+        ).toEqual([id]);
+        expect(
+          testing.resolvePackageTelegramScenarios(
+            { ...env, OPENCLAW_NPM_TELEGRAM_RTT_CHECKS: id },
+            resolve,
+          ).resolvedScenarioIds,
+        ).toEqual([id]);
+      }
+      expect(() =>
+        execFileSync(process.execPath, [qualifier, root], {
+          env: { ...process.env, OPENCLAW_SELECTED_SHA: "0".repeat(40), GITHUB_ENV: output },
+          stdio: "pipe",
+        }),
+      ).toThrow("frozen Telegram source checkout does not match package source SHA");
+    },
+  );
+
   it("combines only the unsupported frozen Telegram scenario contracts", () => {
     const root = mkTempRoot();
     const writeOwner = (relativePath: string, source: string) => {
@@ -500,12 +601,17 @@ describe("package Telegram live Docker E2E", () => {
       "enqueueDraftLaneEvent(async () => {});",
     );
 
+    for (const id of ["telegram-policy-hot-reload", "telegram-group-policy-hot-reload"]) {
+      writeOwner(`qa/scenarios/channels/${id}.yaml`, `scenario:\n  id: ${id}\n`);
+    }
+
     expect(resolveFrozenTelegramScenarioOmissions(root)).toEqual([
       "telegram-partial-failure-recovery",
       "telegram-empty-response-after-write-recovery",
       "telegram-progress-tool-visibility",
       "telegram-provider-failure-before-output",
       "telegram-queue-invalid-mode",
+      "telegram-rich-inline-composition",
     ]);
     writeOwner("extensions/telegram/src/draft-stream.ts", "waitForInFlight();");
     expect(resolveFrozenTelegramScenarioOmissions(root)).toEqual([
@@ -513,6 +619,7 @@ describe("package Telegram live Docker E2E", () => {
       "telegram-progress-tool-visibility",
       "telegram-provider-failure-before-output",
       "telegram-queue-invalid-mode",
+      "telegram-rich-inline-composition",
     ]);
     writeOwner(
       "qa/scenarios/channels/telegram-empty-response-after-write-recovery.yaml",
@@ -522,6 +629,7 @@ describe("package Telegram live Docker E2E", () => {
       "telegram-progress-tool-visibility",
       "telegram-provider-failure-before-output",
       "telegram-queue-invalid-mode",
+      "telegram-rich-inline-composition",
     ]);
     writeOwner(
       "qa/scenarios/channels/telegram-progress-tool-visibility.yaml",
@@ -530,15 +638,26 @@ describe("package Telegram live Docker E2E", () => {
     expect(resolveFrozenTelegramScenarioOmissions(root)).toEqual([
       "telegram-provider-failure-before-output",
       "telegram-queue-invalid-mode",
+      "telegram-rich-inline-composition",
     ]);
     writeOwner(
       "qa/scenarios/channels/telegram-provider-failure-before-output.yaml",
       "id: telegram-provider-failure-before-output\n",
     );
-    expect(resolveFrozenTelegramScenarioOmissions(root)).toEqual(["telegram-queue-invalid-mode"]);
+    expect(resolveFrozenTelegramScenarioOmissions(root)).toEqual([
+      "telegram-queue-invalid-mode",
+      "telegram-rich-inline-composition",
+    ]);
     writeOwner(
       "qa/scenarios/channels/telegram-queue-invalid-mode.yaml",
       "id: telegram-queue-invalid-mode\n",
+    );
+    expect(resolveFrozenTelegramScenarioOmissions(root)).toEqual([
+      "telegram-rich-inline-composition",
+    ]);
+    writeOwner(
+      "qa/scenarios/channels/telegram-rich-inline-composition.yaml",
+      "id: telegram-rich-inline-composition\n",
     );
     expect(resolveFrozenTelegramScenarioOmissions(root)).toEqual([]);
   });

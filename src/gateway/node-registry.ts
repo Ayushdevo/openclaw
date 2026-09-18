@@ -9,6 +9,7 @@ import {
 // NodeSession is plugin-SDK-reachable; importing these types from the
 // gateway-protocol index would retain the whole ProtocolSchemas registry in
 // the public plugin-sdk dts (check-plugin-sdk-exports guards this).
+import type { DesktopAvailability } from "../../packages/gateway-protocol/src/schema/environments.js";
 import type {
   NodeHostStatsPayload,
   NodePluginToolDescriptor,
@@ -67,6 +68,7 @@ import {
 import { isNodeWorkerHostClientId } from "./node-runner-inventory-runtime.js";
 import { normalizeNodeSkillDescriptors } from "./node-skill-descriptors.js";
 import { MAX_BUFFERED_BYTES, WEBSOCKET_OPEN_READY_STATE } from "./server-constants.js";
+import { closeGatewayTransportWithGrace } from "./server/connection-transport-close.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
 
 export type { NodeInvokeResult } from "./node-invoke.types.js";
@@ -108,6 +110,7 @@ export type NodeSession = {
   lastActiveAtMs?: number;
   presenceUpdatedAtMs?: number;
   hostStats?: NodeHostStats;
+  desktopAvailability?: DesktopAvailability;
 };
 
 type PairingBoundNodeSession = NodeSession & { pairingIdentity: string };
@@ -164,17 +167,6 @@ type AuthorizedSystemRunEvent = PendingSystemRunEvent & {
 export type NodeConnectivityResult =
   | { ok: true }
   | { ok: false; error: { code: string; message: string } };
-
-/** Minimal websocket ping/pong surface used by connectivity checks. */
-type PingableSocket = {
-  ping?: (data?: Buffer, mask?: boolean, cb?: (err?: Error) => void) => void;
-  once?: (event: "pong" | "close" | "error", listener: (...args: unknown[]) => void) => unknown;
-  off?: (event: "pong" | "close" | "error", listener: (...args: unknown[]) => void) => unknown;
-  removeListener?: (
-    event: "pong" | "close" | "error",
-    listener: (...args: unknown[]) => void,
-  ) => unknown;
-};
 
 const SERIALIZED_EVENT_PAYLOAD = Symbol("openclaw.serializedEventPayload");
 const AUTHORIZED_SYSTEM_RUN_EVENT_GRACE_MS = 5 * 60 * 1000;
@@ -239,6 +231,7 @@ export type NodeRegistryOptions = {
     preserveSessionState: boolean;
   }) => void;
   onPairingInvalidated?: (params: { nodeId: string; connId: string }) => void;
+  onDesktopAvailabilityChanged?: (nodeId: string) => void;
 };
 
 /** Serialize an event payload once so fanout can reuse the same JSON string. */
@@ -345,6 +338,7 @@ export class NodeRegistry {
       isCommandAllowed: (nodeId, command) =>
         this.isCommandAllowed(nodeId, command, this.options.getConfig?.()),
       listCurrentConnected: () => this.listCurrentConnected(),
+      getCurrentConnected: (nodeId) => this.getCurrentConnected(nodeId),
       hasCurrentPairingStateResolver: Boolean(this.options.resolveCurrentPairingState),
       resolvePairingLease: async (node) => {
         const current = this.nodesById.get(node.nodeId);
@@ -654,6 +648,9 @@ export class NodeRegistry {
       this.eventTransportsByConn.delete(client.connId);
     }
     this.refreshSessionPolicy(session);
+    if (previousSession) {
+      this.clearDesktopAvailability(previousSession);
+    }
     if (replacesPresence) {
       this.publishActiveNodeContext();
     }
@@ -670,10 +667,12 @@ export class NodeRegistry {
     this.nodesByConn.delete(connId);
     this.eventTransportsByConn.delete(connId);
     forgetNodeRunnerInventory(this, connId);
-    const unregistersCurrentNode = this.nodesById.get(nodeId)?.connId === connId;
+    const node = this.nodesById.get(nodeId);
+    const unregistersCurrentNode = node?.connId === connId;
     if (unregistersCurrentNode) {
-      const hadPresence = this.nodesById.get(nodeId)?.lastActiveAtMs !== undefined;
+      const hadPresence = node.lastActiveAtMs !== undefined;
       this.nodesById.delete(nodeId);
+      this.clearDesktopAvailability(node);
       removeConnectedNodePluginTools(nodeId);
       removeRemoteNodeSkills(nodeId);
       if (hadPresence) {
@@ -740,8 +739,21 @@ export class NodeRegistry {
 
   /** Resolve persistent pairing state before projecting connected sessions. */
   async listCurrentConnected(): Promise<NodeSession[]> {
+    return await this.resolveCurrentConnectedSessions(this.listConnectedSessions());
+  }
+
+  async getCurrentConnected(nodeId: string): Promise<NodeSession | undefined> {
+    const node = this.nodesById.get(nodeId);
+    return node && node.client.invalidated !== true
+      ? (await this.resolveCurrentConnectedSessions([node]))[0]
+      : undefined;
+  }
+
+  private async resolveCurrentConnectedSessions(
+    candidates: readonly PairingBoundNodeSession[],
+  ): Promise<NodeSession[]> {
     const resolved = await Promise.all(
-      this.listConnectedSessions().map((node) =>
+      candidates.map((node) =>
         this.resolvePairingLease(this.capturePairingLease(node), { invalidateStale: true }),
       ),
     );
@@ -769,6 +781,7 @@ export class NodeRegistry {
     }
     node.client.invalidated = true;
     node.client.invalidatedReason ??= reason;
+    this.clearDesktopAvailability(node);
     forgetNodeRunnerInventory(this, node.connId);
     removeConnectedNodePluginTools(node.nodeId);
     removeRemoteNodeSkills(node.nodeId);
@@ -842,6 +855,36 @@ export class NodeRegistry {
       this.publishActiveNodeContext();
     }
     return resolution.status === "current";
+  }
+
+  private clearDesktopAvailability(node: NodeSession): void {
+    if (!node.desktopAvailability) {
+      return;
+    }
+    delete node.desktopAvailability;
+    this.options.onDesktopAvailabilityChanged?.(node.nodeId);
+  }
+
+  /** Records operational state without publishing activity or retaining it across connections. */
+  updateDesktopAvailability(params: {
+    nodeId: string;
+    connId?: string;
+    availability: DesktopAvailability;
+  }): boolean | null {
+    const node = this.getRegisteredSession(params.nodeId);
+    if (
+      !node ||
+      node.connId !== params.connId ||
+      node.client.socket.readyState !== WEBSOCKET_OPEN_READY_STATE
+    ) {
+      return null;
+    }
+    if (node.desktopAvailability?.state === params.availability.state) {
+      return false;
+    }
+    node.desktopAvailability = { state: params.availability.state };
+    this.options.onDesktopAvailabilityChanged?.(node.nodeId);
+    return true;
   }
 
   /** Stores the latest resource snapshot for the exact authenticated node connection. */
@@ -977,14 +1020,14 @@ export class NodeRegistry {
         : { ok: true as const };
       return currentConnectionResult(result);
     }
-    const socket = node.client.socket as PingableSocket;
+    const socket = node.client.webSocket;
     if (!this.isNodeWebSocketOpen(node)) {
       return {
         ok: false,
         error: { code: "NOT_CONNECTED", message: "node socket not open" },
       };
     }
-    if (typeof socket.ping !== "function" || typeof socket.once !== "function") {
+    if (!socket) {
       return { ok: true };
     }
 
@@ -992,12 +1035,9 @@ export class NodeRegistry {
     return await new Promise<NodeConnectivityResult>((resolve) => {
       let settled = false;
       const cleanup = () => {
-        socket.off?.("pong", onPong);
-        socket.off?.("close", onClose);
-        socket.off?.("error", onError);
-        socket.removeListener?.("pong", onPong);
-        socket.removeListener?.("close", onClose);
-        socket.removeListener?.("error", onError);
+        socket.off("pong", onPong);
+        socket.off("close", onClose);
+        socket.off("error", onError);
       };
       const finish = (result: NodeConnectivityResult) => {
         if (settled) {
@@ -1032,11 +1072,11 @@ export class NodeRegistry {
         timeout,
       );
 
-      socket.once?.("pong", onPong);
-      socket.once?.("close", onClose);
-      socket.once?.("error", onError);
+      socket.once("pong", onPong);
+      socket.once("close", onClose);
+      socket.once("error", onError);
       try {
-        socket.ping?.(undefined, false, (err?: Error) => {
+        socket.ping(undefined, false, (err?: Error) => {
           if (err) {
             finish({
               ok: false,
@@ -1547,21 +1587,17 @@ export class NodeRegistry {
   }
 
   private rejectSlowNodeSocket(node: NodeSession): boolean {
-    if (!(node.client.socket.bufferedAmount > MAX_BUFFERED_BYTES)) {
+    const socket = node.client.socket;
+    if (!(socket.bufferedAmount > MAX_BUFFERED_BYTES)) {
       return false;
     }
     logRejectedLargePayload({
       surface: "gateway.ws.outbound_buffer",
-      bytes: node.client.socket.bufferedAmount,
+      bytes: socket.bufferedAmount,
       limitBytes: MAX_BUFFERED_BYTES,
       reason: "ws_send_buffer_close",
     });
-    try {
-      node.client.socket.close(SLOW_CONSUMER_CLOSE_CODE, "slow consumer");
-    } catch {
-      /* ignore */
-    }
-    node.client.socket.terminate();
+    closeGatewayTransportWithGrace(socket, SLOW_CONSUMER_CLOSE_CODE, "slow consumer");
     return true;
   }
 }

@@ -24,6 +24,7 @@ import {
   appendPluginControlPlaneWorkspaceDiagnostic,
   resolvePluginControlPlaneWorkspace,
 } from "./control-plane-workspace.js";
+import { resolvePluginCredentialDescriptors } from "./credential-descriptors.js";
 import { getProcessGatewayPluginMetadataSnapshot } from "./current-plugin-metadata-state.js";
 import {
   emptyInstalledPluginComponents,
@@ -33,8 +34,12 @@ import {
   createInstalledPluginEnabledPredicate,
   isInstalledPluginEnabled,
 } from "./installed-plugin-index.js";
+import { readInstalledPluginOverview } from "./installed-plugin-overview.js";
 import { createInstalledPluginOwnershipResolver } from "./installed-plugin-package-ownership.js";
 import {
+  type ManagedPluginIconSource,
+  resolvePluginIconSource,
+  resolvePluginActivityIconSource,
   type ManagedPluginCatalogEntry,
   type ManagedPluginCatalog,
   getManagedPluginCache,
@@ -131,20 +136,6 @@ function resolveManagedPluginDiagnostics(
   return diagnostics;
 }
 
-export type ManagedPluginIconSource = { kind: "file"; path: string; rootPath: string };
-
-function resolvePluginIconSource(params: {
-  metadata: PluginMetadataSnapshot;
-  pluginId: string;
-}): ManagedPluginIconSource | undefined {
-  const normalizedPluginId = params.metadata.normalizePluginId(params.pluginId);
-  const manifest = params.metadata.byPluginId.get(normalizedPluginId);
-  const localIconPath = normalizeOptionalString(manifest?.iconPath);
-  if (localIconPath && manifest) {
-    return { kind: "file", path: localIconPath, rootPath: manifest.rootDir };
-  }
-  return undefined;
-}
 function resolveManagedPluginMetadataParams(config: OpenClawConfig, env: NodeJS.ProcessEnv) {
   const workspace = resolvePluginControlPlaneWorkspace({ config, env });
   return {
@@ -154,7 +145,7 @@ function resolveManagedPluginMetadataParams(config: OpenClawConfig, env: NodeJS.
   };
 }
 
-function resolveManagedPluginMetadata(config: OpenClawConfig, env: NodeJS.ProcessEnv) {
+export function resolveManagedPluginMetadata(config: OpenClawConfig, env: NodeJS.ProcessEnv) {
   const boot = getProcessGatewayPluginMetadataSnapshot();
   const candidate = getProcessPluginCache().desiredMetadata;
   return candidate && candidate.boot === boot
@@ -199,6 +190,18 @@ export const resolveManagedPluginIconSource = withManagedPluginCache(
     const env = params.env ?? process.env;
     const metadata = resolveManagedPluginMetadata(params.config, env);
     return resolvePluginIconSource({ metadata, pluginId: params.pluginId });
+  },
+);
+
+export const resolveManagedPluginActivityIconSource = withManagedPluginCache(
+  async (params: {
+    config: OpenClawConfig;
+    pluginId: string;
+    toolName?: string;
+    env?: NodeJS.ProcessEnv;
+  }): Promise<ManagedPluginIconSource | undefined> => {
+    const metadata = resolveManagedPluginMetadata(params.config, params.env ?? process.env);
+    return resolvePluginActivityIconSource({ ...params, metadata });
   },
 );
 
@@ -415,6 +418,13 @@ export const listManagedPlugins = withManagedPluginCache(
       if (installedIconsById.get(normalizedPluginId)) {
         plugin.hasIcon = true;
       }
+      const iconOwner = metadata.byPluginId.get(normalizedPluginId);
+      if (iconOwner?.activityIconPath) {
+        plugin.hasActivityIcon = true;
+      }
+      if (iconOwner?.toolActivityIconPaths) {
+        plugin.activityIconTools = Object.keys(iconOwner.toolActivityIconPaths).toSorted();
+      }
       if (manifest?.channels.length) {
         plugin.channelIds = [...manifest.channels];
       }
@@ -595,6 +605,7 @@ export const inspectManagedPlugin = withManagedPluginCache(
           enabled,
         },
         declared: pendingReview.declared,
+        overview: readInstalledPluginOverview(manifest),
         components: projectInstalledPluginComponents({
           manifest,
           declared: pendingReview.declared,
@@ -666,6 +677,8 @@ export const inspectManagedPlugin = withManagedPluginCache(
         ...summary,
         declared,
         components: projectInstalledPluginComponents({ manifest, declared }),
+        overview: readInstalledPluginOverview(manifest),
+        credentials: manifest ? resolvePluginCredentialDescriptors(params.config, manifest) : [],
         reviewToken: computeDeclaredSurfaceHash(declared),
         ...(trust ? { trust } : {}),
       };

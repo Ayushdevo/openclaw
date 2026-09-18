@@ -1,7 +1,7 @@
 // Round-trips each CronSchedule kind through canonical SQLite job JSON.
 import { describe, expect, it } from "vitest";
 import { makeCronJob } from "../delivery.test-helpers.js";
-import type { CronSchedule } from "../types.js";
+import type { CronSchedule, CronToolsAllowProvenance } from "../types.js";
 import { projectCronJobThroughStorageCodec } from "./row-codec.js";
 
 function roundTrip(schedule: CronSchedule): CronSchedule | null {
@@ -53,18 +53,27 @@ describe("canonical cron schedule JSON round-trip", () => {
     });
   });
 
-  it("round-trips store-private scheduled caller origin without adding a column", () => {
-    const job = projectCronJobThroughStorageCodec({
-      ...makeCronJob({}),
-      toolsAllowProvenance: {
-        version: 1,
-        source: "final-executable-surface",
-        callerOrigin: { kind: "local" },
-      },
-    });
+  it.each(["final-executable-surface", "authenticated-requester"] as const)(
+    "round-trips private %s provenance through canonical job JSON",
+    (source) => {
+      const channelRequester = {
+        version: 1 as const,
+        channel: "discord",
+        accountId: "work",
+        senderId: "123456789012345678",
+      };
+      const provenance: CronToolsAllowProvenance =
+        source === "final-executable-surface"
+          ? { version: 1, source, callerOrigin: { kind: "local" }, channelRequester }
+          : { version: 1, source, channelRequester };
+      const job = projectCronJobThroughStorageCodec({
+        ...makeCronJob({}),
+        toolsAllowProvenance: provenance,
+      });
 
-    expect(job.toolsAllowProvenance?.callerOrigin).toEqual({ kind: "local" });
-  });
+      expect(job.toolsAllowProvenance).toEqual(provenance);
+    },
+  );
 
   it("keeps private runtime authority out of job_json", () => {
     const runtimeAuthority = {

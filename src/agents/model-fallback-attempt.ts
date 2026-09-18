@@ -1,4 +1,3 @@
-/** Shared attempt, error, and harness helpers for model fallback execution. */
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { TRANSCRIPT_NOT_CONTINUABLE_ERROR_CODE } from "../../packages/agent-core/src/errors.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -38,7 +37,12 @@ import type {
 import { modelKey } from "./model-ref-shared.js";
 import { isCliRuntimeAlias } from "./model-runtime-aliases.js";
 import { isCliProvider } from "./model-selection-cli.js";
-import { isAgentRunDirectAbortReason, isAgentRunRestartAbortReason } from "./run-termination.js";
+import {
+  isAgentRunDirectAbortReason,
+  isAgentRunRestartAbortReason,
+  isAgentRunSupersededAbortReason,
+  isSessionPlacementSettlementClosedError,
+} from "./run-termination.js";
 import { isSandboxProvisioningError } from "./sandbox/provisioning-error.js";
 import {
   runWithDeferredSessionSuspension,
@@ -73,11 +77,8 @@ export function resolveFallbackAuthScope(params: {
   userLockedAuthProfileId?: string;
   profileIds?: readonly string[];
 }): string | undefined {
-  if (params.userLockedAuthProfileId) {
-    return params.userLockedAuthProfileId;
-  }
   // resolveAuthProfileOrder places the profile selected for this model first.
-  return params.profileIds?.find((id) => id.trim())?.trim();
+  return params.userLockedAuthProfileId || params.profileIds?.find((id) => id.trim())?.trim();
 }
 
 type ModelFallbackRuntimeContext = {
@@ -228,10 +229,13 @@ function resolveChainStopReason(params: {
   if (isAgentRunRestartAbortReason(err)) {
     return "agent_run_restart_abort";
   }
-  if (isTerminalAbortFromError(err)) {
-    return "terminal_abort_wrapper";
-  }
-  return undefined;
+  return isAgentRunSupersededAbortReason(err)
+    ? "agent_run_superseded_abort"
+    : isSessionPlacementSettlementClosedError(err)
+      ? "session_placement_settlement_closed"
+      : isTerminalAbortFromError(err)
+        ? "terminal_abort_wrapper"
+        : undefined;
 }
 
 async function runFallbackCandidate<T>(params: {
@@ -539,6 +543,21 @@ function resolveCandidateAttemptError(
   return described.message;
 }
 
+function buildFailedCandidateAttempt(
+  candidate: ModelCandidate,
+  described: ReturnType<typeof describeFailoverError>,
+): FallbackAttempt {
+  return {
+    provider: candidate.provider,
+    model: candidate.model,
+    error: resolveCandidateAttemptError(described, candidate),
+    reason: described.reason ?? "unknown",
+    authMode: described.authMode,
+    status: described.status,
+    code: described.code,
+  };
+}
+
 export function recordFailedCandidateAttempt(params: {
   attempts: FallbackAttempt[];
   candidate: ModelCandidate;
@@ -556,16 +575,8 @@ export function recordFailedCandidateAttempt(params: {
   fallbackConfigured: boolean;
 }): ModelFallbackStepFields | undefined {
   const described = describeFailoverError(params.error);
-  const error = resolveCandidateAttemptError(described, params.candidate);
-  params.attempts.push({
-    provider: params.candidate.provider,
-    model: params.candidate.model,
-    error,
-    reason: described.reason ?? "unknown",
-    authMode: described.authMode,
-    status: described.status,
-    code: described.code,
-  });
+  const attempt = buildFailedCandidateAttempt(params.candidate, described);
+  params.attempts.push(attempt);
   return logModelFallbackDecision({
     decision: "candidate_failed",
     runId: params.runId,
@@ -579,7 +590,7 @@ export function recordFailedCandidateAttempt(params: {
     reason: described.reason,
     status: described.status,
     code: described.code,
-    error,
+    error: attempt.error,
     nextCandidate: params.nextCandidate,
     isPrimary: params.isPrimary,
     requestedModelMatched: params.requestedModelMatched,
@@ -593,15 +604,7 @@ export function appendFailedCandidateAttempt(params: {
   error: unknown;
 }): void {
   const described = describeFailoverError(params.error);
-  params.attempts.push({
-    provider: params.candidate.provider,
-    model: params.candidate.model,
-    error: resolveCandidateAttemptError(described, params.candidate),
-    reason: described.reason ?? "unknown",
-    authMode: described.authMode,
-    status: described.status,
-    code: described.code,
-  });
+  params.attempts.push(buildFailedCandidateAttempt(params.candidate, described));
 }
 
 export function resolveLiveSessionModelSwitchRedirectIndex(params: {
@@ -732,6 +735,8 @@ export function shouldDiscardDeferredSessionSuspension(params: {
     isAgentRunTerminalTimeout(params.error) ||
     isAgentRunDirectAbortReason(params.error) ||
     isAgentRunRestartAbortReason(params.error) ||
+    isAgentRunSupersededAbortReason(params.error) ||
+    isSessionPlacementSettlementClosedError(params.error) ||
     isTerminalAbortFromError(params.error) ||
     isCommandLaneTaskTimeoutError(params.error)
   ) {

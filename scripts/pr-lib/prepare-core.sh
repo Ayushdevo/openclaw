@@ -171,13 +171,12 @@ verify_prep_branch_matches_prepared_head() {
 prepare_init() {
   local pr="$1"
   # Validate the exact reviewed head before taking the lock past its reversible phase.
-  review_validate_artifacts "$pr" || return 1
+  review_validate_artifacts "$pr" true || return 1
   require_ready_review_recommendation || return 1
   mark_pr_operation_side_effects_started
   enter_worktree "$pr" false || return 1
 
   require_artifact .local/pr-meta.env
-  require_artifact .local/review.md
 
   local recorded_source_head=""
   if [ -s .local/prep-context.env ]; then
@@ -220,13 +219,7 @@ prepare_init() {
     exit 1
   fi
 
-  git fetch origin "pull/$pr/head:pr-$pr" --force
-  local fetched_head_sha
-  fetched_head_sha=$(git rev-parse "refs/heads/pr-$pr")
-  if [ "$fetched_head_sha" != "$reviewed_head_sha" ]; then
-    echo "PR head changed while prepare-init fetched it (reviewed $reviewed_head_sha, fetched $fetched_head_sha). Re-run review-init."
-    exit 1
-  fi
+  fetch_pr_head "$pr" "$reviewed_head_sha" "refs/heads/pr-$pr" || return 1
   git checkout -B "pr-$pr-prep" "$reviewed_head_sha" || return 1
   retire_prep_evidence || return 1
 

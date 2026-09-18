@@ -21,6 +21,7 @@ import {
 import { formatLine } from "./output.js";
 import { createGatewayLifecycleMutationReporter } from "./service-mutation.js";
 import type { GatewayServiceControlArgs, GatewayServiceEnv } from "./service-types.js";
+import { assertGatewayServiceUpdateCurrent } from "./service-update-authority.js";
 
 const LAUNCH_AGENT_STOP_PORT_RELEASE_TIMEOUT_MS = LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS * 1_000;
 const LAUNCH_AGENT_STOP_PORT_RELEASE_POLL_MS = 100;
@@ -60,12 +61,16 @@ async function assertGatewayPortReleasedAfterStop(
   env: GatewayServiceEnv,
   assertCurrent?: () => void,
 ): Promise<void> {
-  const { port, probeHosts } = await resolveLaunchAgentGatewayContext(env);
+  const { env: cleanupEnv, port, probeHosts } = await resolveLaunchAgentGatewayContext(env);
   if (port === null) {
     return;
   }
   assertCurrent?.();
-  cleanStaleGatewayProcessesSync(port);
+  assertGatewayServiceUpdateCurrent();
+  cleanStaleGatewayProcessesSync(port, {
+    env: cleanupEnv,
+    assertCurrent: assertGatewayServiceUpdateCurrent,
+  });
   const diagnostics = await inspectPortUsage(port, {
     probeHosts,
   }).catch(() => null);

@@ -43,11 +43,11 @@ export type ReservedIncognitoKeyRepairReport = {
   repaired: number;
 };
 
-export function repairReservedIncognitoSessionKeys(params: {
+export async function repairReservedIncognitoSessionKeys(params: {
   apply: boolean;
   cfg: OpenClawConfig;
   env: NodeJS.ProcessEnv;
-}): ReservedIncognitoKeyRepairReport {
+}): Promise<ReservedIncognitoKeyRepairReport> {
   const targets = listExistingAgentDatabaseTargets(params.cfg, params.env).map((target) => ({
     target,
     databaseOptions: resolveTargetSqliteOptions(target, params.env),
@@ -134,7 +134,7 @@ export function repairReservedIncognitoSessionKeys(params: {
       );
       rewriteDoctorSessionEntries({
         scope: { agentId: target.agentId, env: params.env, storePath: target.storePath },
-        sessionKeys: listSessionEntryKeysReadOnly({
+        sessionKeys: await listSessionEntryKeysReadOnly({
           agentId: target.agentId,
           env: params.env,
           storePath: target.storePath,
@@ -189,6 +189,7 @@ function applyReservedIncognitoKeyRenameColumns(
   database.db.exec("PRAGMA defer_foreign_keys = ON;"); // sqlite-allow-raw -- transaction-local FK deferral.
   for (const rename of renames) {
     updateSessionKeyColumns(database.db, rename);
+    publishSessionEntryCacheInvalidation(database, { sessionKey: rename.to });
   }
   // Key and lineage columns reshape the cached map even when no entry JSON needs rewriting.
   publishSessionEntryCacheInvalidation(database);

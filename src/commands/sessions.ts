@@ -43,6 +43,7 @@ import {
   deliveryContextFromSession,
   sessionDeliveryOrigin,
 } from "../utils/delivery-context.shared.js";
+import { formatTokenCount } from "../utils/token-format.js";
 import { resolveCommandSessionStoreTargets } from "./session-store-targets.js";
 import {
   resolveSessionDisplayModelRef,
@@ -53,32 +54,13 @@ import {
   formatSessionFlagsCell,
   formatSessionKeyCell,
   formatSessionModelCell,
-  type SessionDisplayRow,
   toSessionDisplayRow,
 } from "./sessions-table.js";
-
-type SessionRow = SessionDisplayRow & {
-  agentId: string;
-  kind: SessionKind;
-  agentRuntime: ReturnType<typeof resolveModelAgentRuntimeMetadata>;
-  runtimeLabel: string;
-  /** Carry the prepared identity into JSON/table emission without re-resolving plugin metadata. */
-  displayModelRef: { provider: string; model: string };
-  /**
-   * True only when the session has persisted ACP runtime metadata. Key-shape
-   * alone is not sufficient because ACP bridge sessions (translator.ts) may
-   * use ACP-shaped keys without ever writing `SessionAcpMeta` — those use the
-   * normal configured model and must not be overlaid with the acpx sentinel.
-   */
-  acpRuntime: boolean;
-};
 
 type SessionCandidate = { agentId: string; entry: SessionEntry; sessionKey: string };
 
 const DEFAULT_SESSIONS_LIMIT = 100;
 const contextLookupRuntimeLoader = createLazyImportLoader(() => import("../agents/context.js"));
-
-const formatKTokens = (value: number) => `${(value / 1000).toFixed(value >= 10_000 ? 0 : 1)}k`;
 
 /** True ACP sessions use the child runtime's model, not the configured fallback. */
 function applyAcpModelOverlayIfNeeded(
@@ -138,7 +120,7 @@ const formatTokensCell = (
   contextTokens: number | null,
   rich: boolean,
 ) => {
-  const ctxLabel = contextTokens ? formatKTokens(contextTokens) : "?";
+  const ctxLabel = contextTokens ? formatTokenCount(contextTokens) : "?";
   if (total === undefined) {
     const label = `unknown/${ctxLabel} (?%)`;
     return rich ? theme.muted(label) : label;
@@ -147,11 +129,11 @@ const formatTokensCell = (
     contextTokens && freshTotal !== undefined
       ? Math.min(999, Math.round((freshTotal / contextTokens) * 100))
       : null;
-  const label = `${formatKTokens(total)}/${ctxLabel} (${pct ?? "?"}%)`;
+  const label = `${formatTokenCount(total)}/${ctxLabel} (${pct ?? "?"}%)`;
   return colorByPct(label, pct, rich);
 };
 
-const formatKindCell = (kind: SessionRow["kind"], rich: boolean) => {
+const formatKindCell = (kind: SessionKind, rich: boolean) => {
   if (!rich) {
     return kind;
   }
@@ -191,7 +173,9 @@ function resolveSessionStoreDisplayPath(target: { agentId: string; storePath: st
   }).path;
 }
 
-function toJsonSessionRow(row: SessionRow): Omit<SessionRow, "displayModelRef" | "runtimeLabel"> {
+function toJsonSessionRow<T extends { displayModelRef: unknown; runtimeLabel: string }>(
+  row: T,
+): Omit<T, "displayModelRef" | "runtimeLabel"> {
   const { displayModelRef, runtimeLabel, ...jsonRow } = row;
   void displayModelRef;
   void runtimeLabel;
@@ -284,7 +268,7 @@ export async function sessionsCommand(
   const aggregateAgents = opts.allAgents === true;
   const cfg = getRuntimeConfig();
   const displayDefaults = resolveSessionDisplayDefaults(cfg);
-  const { lookupContextTokens, resolveContextTokensForModel } =
+  const { lookupContextTokens, resolveModelContextTokenProjection } =
     await contextLookupRuntimeLoader.load();
   const configContextTokens =
     lookupContextTokens(displayDefaults.model, { allowAsyncLoad: false }) ?? DEFAULT_CONTEXT_TOKENS;
@@ -368,9 +352,16 @@ export async function sessionsCommand(
     // the runtime's context policy, so retain their model-only offline fallback.
     const usesCliContextFallback =
       !hasPersistedContextTokens && classifyCliProvider(agentRuntime.id);
-    const resolvedContextTokens = usesCliContextFallback
-      ? lookupContextTokens(modelRef.model, { allowAsyncLoad: false })
-      : resolveContextTokensForModel({
+    const modelContext = usesCliContextFallback
+      ? {
+          contextTokens: lookupContextTokens(modelRef.model, { allowAsyncLoad: false }),
+          authoredContextTokens: resolveAuthoredModelContextTokens({
+            cfg,
+            provider: modelRef.provider,
+            model: modelRef.model,
+          }),
+        }
+      : resolveModelContextTokenProjection({
           cfg,
           provider: modelRef.provider,
           model: modelRef.model,
@@ -381,12 +372,8 @@ export async function sessionsCommand(
       provider: modelRef.provider,
       model: modelRef.model,
       agentHarnessId: agentRuntime.id,
-      resolvedContextTokens,
-      authoredContextTokens: resolveAuthoredModelContextTokens({
-        cfg,
-        provider: modelRef.provider,
-        model: modelRef.model,
-      }),
+      resolvedContextTokens: modelContext.contextTokens,
+      authoredContextTokens: modelContext.authoredContextTokens,
     });
     return Object.assign({}, row, {
       agentId,

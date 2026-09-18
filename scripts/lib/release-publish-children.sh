@@ -148,9 +148,9 @@ dispatch_workflow_at_ref() {
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2026-03-10" \
     "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/dispatches" \
-    --input -)"
-  run_id="$(printf '%s' "$dispatch_response" | jq -er '.workflow_run_id')"
-  run_url="$(printf '%s' "$dispatch_response" | jq -er '.html_url')"
+    --input -)" || return 1
+  run_id="$(printf '%s' "$dispatch_response" | jq -er '.workflow_run_id | tostring | select(test("^[1-9][0-9]*$"))')" || return 1
+  run_url="$(printf '%s' "$dispatch_response" | jq -er '.html_url | select(type == "string" and length > 0)')" || return 1
   verify_child_run_sha "$workflow" "$run_id" "$expected_sha" || return 1
 
   echo "Dispatched ${workflow} from ${workflow_ref} at ${expected_sha}: ${run_url}" >&2
@@ -529,6 +529,8 @@ guard_existing_public_release() {
   if ! release_json="$(gh release view "${RELEASE_TAG}" --repo "$GITHUB_REPOSITORY" --json isDraft,assets,body,url 2>/dev/null)"; then
     return 0
   fi
+  release_body="$(printf '%s' "${release_json}" | jq -er '.body | strings')" || return 1
+  assert_initial_release_body "${release_body}" || return 1
 
   is_draft="$(printf '%s' "${release_json}" | jq -r '.isDraft')"
   if [[ "${is_draft}" == "true" ]]; then
@@ -707,16 +709,14 @@ render_github_release_notes() {
   local output_file="$1"
   local verification_file="${2:-}"
   local metadata_file="${3:-}"
-  local changelog_file="${RUNNER_TEMP}/CHANGELOG.md"
   local -a render_args=(
-    node --import tsx scripts/render-github-release-notes.mts
-    --changelog "${changelog_file}"
+    node --import tsx "${GITHUB_WORKSPACE}/.release-harness/scripts/render-github-release-notes.mts"
+    --root "${GITHUB_WORKSPACE}" --ref "${TARGET_SHA}"
     --tag "${RELEASE_TAG}"
     --repository "${GITHUB_REPOSITORY}"
     --output "${output_file}"
   )
 
-  git show "${TARGET_SHA}:CHANGELOG.md" > "${changelog_file}"
   if [[ -n "${verification_file}" ]]; then
     render_args+=(--verification-file "${verification_file}")
   fi
@@ -748,36 +748,20 @@ verify_release_tag_target() {
 
 canonical_release_body_matches() {
   local body_file="$1"
-  local changelog_file="${RUNNER_TEMP}/release-body-changelog.md"
-  git show "${TARGET_SHA}:CHANGELOG.md" > "${changelog_file}"
-  RELEASE_BODY_FILE="${body_file}" \
-    RELEASE_CHANGELOG_FILE="${changelog_file}" \
-    RELEASE_REPOSITORY="${GITHUB_REPOSITORY}" \
-    RELEASE_TAG="${RELEASE_TAG}" \
-    node --import tsx --input-type=module <<'NODE'
-import { readFileSync } from "node:fs";
-import {
-  releaseNotesVersionForTag,
-  verifyGithubReleaseNotes,
-} from "./scripts/render-github-release-notes.mts";
-
-const body = readFileSync(process.env.RELEASE_BODY_FILE, "utf8");
-const changelog = readFileSync(process.env.RELEASE_CHANGELOG_FILE, "utf8");
-const result = verifyGithubReleaseNotes({
-  body,
-  changelog,
-  version: releaseNotesVersionForTag(process.env.RELEASE_TAG),
-  tag: process.env.RELEASE_TAG,
-  repository: process.env.RELEASE_REPOSITORY,
-});
-if (!result.matches) {
-  process.exitCode = 1;
+  node --import tsx "${GITHUB_WORKSPACE}/.release-harness/scripts/render-github-release-notes.mts" \
+    --root "$GITHUB_WORKSPACE" --ref "$TARGET_SHA" \
+    --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" --verify-body "$body_file"
 }
-NODE
+
+assert_initial_release_body() {
+  if [[ "$1" == *'<!-- openclaw-release-publication:docs-v1 -->'* ]]; then
+    echo "Release body belongs to post-docs publication; the initial publisher cannot overwrite it." >&2
+    return 1
+  fi
 }
 
 create_or_update_github_release() {
-  local existing_body_file existing_state release_version title latest_arg prerelease_arg
+  local existing_body existing_body_file existing_state release_version title latest_arg prerelease_arg
   verify_release_tag_target
   release_version="${RELEASE_TAG#v}"
   title="openclaw ${release_version}"
@@ -791,6 +775,8 @@ create_or_update_github_release() {
   fi
 
   if existing_state="$(gh release view "${RELEASE_TAG}" --repo "$GITHUB_REPOSITORY" --json isDraft,body 2>/dev/null)"; then
+    existing_body="$(printf '%s' "${existing_state}" | jq -er '.body | strings')" || return 1
+    assert_initial_release_body "${existing_body}" || return 1
     # A public page only reaches this call after
     # guard_existing_public_release accepted it as canonical; leave
     # it untouched so a failed resume cannot strip its verification
@@ -802,6 +788,8 @@ create_or_update_github_release() {
         echo "- GitHub release: existing public page left untouched until proof append" >> "$GITHUB_STEP_SUMMARY"
         return 0
       fi
+      echo "Public release notes are no longer canonical; refusing to overwrite them." >&2
+      return 1
     fi
     # Latest promotion is invalid while this existing release remains a draft.
     gh release edit "${RELEASE_TAG}" --repo "$GITHUB_REPOSITORY" \
@@ -869,6 +857,74 @@ verify_android_release_asset_contract() {
     --source-ref "refs/tags/${RELEASE_TAG}" \
     --deny-self-hosted-runners || return 1
   echo "- Android APK asset contract: verified" >> "${GITHUB_STEP_SUMMARY}"
+}
+
+dispatch_linux_mirror() {
+  local parent_ref="$1" parent_full_ref="$2" parent_sha="$3" parent_run="$4" parent_attempt="$5"
+  local mirror_run_id
+  jq -n --arg tag "$RELEASE_TAG" --arg sha "$TARGET_SHA" \
+    '{tag: $tag, sourceSha: $sha, state: "dispatch-unconfirmed", mirrorVerified: false}' \
+    > "$RUNNER_TEMP/linux-mirror-dispatch.json"
+  [[ "$parent_full_ref" == "refs/tags/$parent_ref" ]] || return 1
+  verify_release_tag_target || return 1
+  node "${BASH_SOURCE[0]%/*}/../release-tooling-identity.mjs" verify \
+    --repository "$GITHUB_REPOSITORY" \
+    --workflow-ref "$parent_ref" --workflow-full-ref "$parent_full_ref" --workflow-sha "$parent_sha" \
+    --release-publish-run-id "$parent_run" --release-publish-run-attempt "$parent_attempt" \
+    --release-publish-ref "$parent_ref" --release-publish-full-ref "$parent_full_ref" \
+    --release-publish-parent-state-policy active-or-success || return 1
+  mirror_run_id="$(dispatch_workflow_at_ref "$parent_ref" "$parent_sha" linux-app-release.yml \
+    -f release_tag="$RELEASE_TAG" -f source_sha="$TARGET_SHA" -f tooling_sha="$parent_sha" \
+    -f release_publish_run_id="$parent_run" -f release_publish_run_attempt="$parent_attempt")" || return 1
+  jq --arg runId "$mirror_run_id" '. + {state: "dispatched", childRunId: $runId}' \
+    "$RUNNER_TEMP/linux-mirror-dispatch.json" > "$RUNNER_TEMP/linux-mirror-dispatch.next.json" || return 1
+  mv "$RUNNER_TEMP/linux-mirror-dispatch.next.json" "$RUNNER_TEMP/linux-mirror-dispatch.json" || return 1
+  echo "- Legacy Linux bridge: dispatched, not yet verified. Follow https://github.com/${GITHUB_REPOSITORY}/actions/runs/${mirror_run_id}; cancellation, queue overflow, timeout, or failed readback requires reconciliation." >> "$GITHUB_STEP_SUMMARY"
+}
+
+dispatch_linux_release_assets() {
+  local release_train release_json workflow_sha request_run_id publication_state
+  release_train="$(node --input-type=module - "${BASH_SOURCE[0]%/*}/release-version.mjs" "${RELEASE_TAG}" <<'NODE'
+import { pathToFileURL } from "node:url";
+const { parseReleaseVersion, classifyReleaseTrain } = await import(pathToFileURL(process.argv[2]).href);
+const tag = process.argv[3];
+const parsed = tag.startsWith("v") ? parseReleaseVersion(tag.slice(1)) : null;
+console.log(parsed && tag === `v${parsed.version}` ? classifyReleaseTrain(parsed) : "invalid");
+NODE
+  )" || return 1
+  if [[ "${release_train}" != "stable" || "${RELEASE_NPM_DIST_TAG}" == "extended-stable" ]]; then
+    return 0
+  fi
+  jq -n --arg tag "$RELEASE_TAG" '{tag: $tag, state: "dispatch-unconfirmed"}' \
+    > "$RUNNER_TEMP/linux-dispatch.json"
+  release_json="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease)" || return 1
+  if ! jq -e '.isDraft == false and .isPrerelease == false' <<< "$release_json" >/dev/null; then
+    echo "Linux release requests require a published stable GitHub release." >&2
+    return 1
+  fi
+  verify_release_tag_target || return 1
+  publication_state="$(node "${BASH_SOURCE[0]%/*}/../linux-updater-manifest.mjs" status \
+    --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" \
+    --output "$RUNNER_TEMP/linux-release-completion")" || return 1
+  if [[ "$(jq -er '.state' <<< "$publication_state")" == published &&
+        "$(jq -r '.needsUpdaterPublication' <<< "$publication_state")" != true &&
+        "$(jq -r '.needsChannelPublication' <<< "$publication_state")" == false ]]; then
+    jq -n --arg tag "$RELEASE_TAG" '{tag: $tag, state: "published-assets-reused"}' \
+      > "$RUNNER_TEMP/linux-dispatch.json"
+    echo "- Linux: existing same-tag AppImage, Debian package, signed updater manifest, and checksums verified; no build requested." >> "$GITHUB_STEP_SUMMARY"
+    return 0
+  fi
+  workflow_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" \
+    --jq '.object.sha | select(test("^[a-f0-9]{40}$"))')" || return 1
+  verify_release_tag_target || return 1
+  # The request belongs to current main; its existing workflow_run builder
+  # validates the title, exact main SHA, release ancestry, and signing trust.
+  request_run_id="$(dispatch_workflow_at_ref main "$workflow_sha" linux-app-release-request.yml \
+    -f tag="$RELEASE_TAG" -f desktop-test-bundles=false)" || return 1
+  jq -n --arg tag "$RELEASE_TAG" --arg requestRunId "$request_run_id" --arg workflowSha "$workflow_sha" \
+    '{tag: $tag, state: "request-dispatched", requestRunId: $requestRunId, workflowSha: $workflowSha}' \
+    > "$RUNNER_TEMP/linux-dispatch.json"
+  echo "- Linux: request dispatched; release processing is pending and verified existing bundles will be reused. Request: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${request_run_id}; publication: https://github.com/${GITHUB_REPOSITORY}/actions/workflows/linux-app-release.yml" >> "$GITHUB_STEP_SUMMARY"
 }
 
 promote_windows_release_assets() {
@@ -1171,6 +1227,9 @@ verify_published_release() {
 
 append_release_proof_to_github_release() {
   local release_version proof_file notes_file metadata_file evidence_path tarball integrity telegram_line clawhub_line clawhub_bootstrap_line clawhub_runtime_state_path android_line
+  local current_body
+  current_body="$(gh release view "${RELEASE_TAG}" --repo "$GITHUB_REPOSITORY" --json body --jq '.body')" || return 1
+  assert_initial_release_body "${current_body}" || return 1
 
   release_version="${RELEASE_TAG#v}"
   proof_file="${RUNNER_TEMP}/release-verification.md"
@@ -1253,6 +1312,10 @@ writeFileSync(proofFile, section);
 NODE
 
   render_github_release_notes "${notes_file}" "${proof_file}" "${metadata_file}"
+  # Re-read immediately before this independent body writer. A docs publication
+  # may have completed since the initial publication/resume guard ran.
+  current_body="$(gh release view "${RELEASE_TAG}" --repo "$GITHUB_REPOSITORY" --json body --jq '.body')" || return 1
+  assert_initial_release_body "${current_body}" || return 1
   gh release edit "${RELEASE_TAG}" --repo "$GITHUB_REPOSITORY" --notes-file "${notes_file}"
   if jq -e '.verificationIncluded == true' "${metadata_file}" >/dev/null; then
     echo "- Release proof: appended to GitHub release" >> "$GITHUB_STEP_SUMMARY"

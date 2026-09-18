@@ -230,7 +230,7 @@ internal class WearProxyController(
       )
     val availableModels =
       catalog.models
-        .filter { it.available != false }
+        .filter { it.manualSelectionAllowed != false && it.available != false }
         .mapNotNull { model -> canonicalModelRef(model.providerQualifiedRef())?.let { ref -> ref to model } }
         .distinctBy { (ref) -> ref }
     val matchingModels =
@@ -484,7 +484,8 @@ internal fun projectedWearMessageText(message: JsonElement?): String? {
         null
       }
     }
-  return text?.takeIf { it.isNotEmpty() }
+  // Empty canonical content is a replacement, not an absent message/delta.
+  return text
 }
 
 private fun projectHistory(source: JsonObject): JsonObject =

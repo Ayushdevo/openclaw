@@ -6,7 +6,7 @@ import type { SessionPluginJsonValue } from "../../config/sessions/types.js";
 import type { HeartbeatRunResult } from "../../infra/heartbeat-wake.js";
 import type { LogLevel } from "../../logging/levels.js";
 import type { MediaUnderstandingRuntime } from "../../media-understanding/runtime-types.js";
-import type { PluginRuntimeTaskFlows, PluginRuntimeTaskRuns } from "./runtime-tasks.types.js";
+import type { PluginRuntimeTasks } from "./runtime-tasks.types.js";
 
 type TtsRuntimeApi = typeof import("../../tts/runtime-api.js");
 type ListSpeechVoices = TtsRuntimeApi["listSpeechVoices"];
@@ -318,7 +318,10 @@ export type LlmCompleteResult = {
 type RuntimeRunEmbeddedAgentParams = Omit<
   import("../../agents/embedded-agent-runner/run/params.js").RunEmbeddedAgentParams,
   "admittedRunContext" | "preparedRunAdmission"
->;
+> & {
+  /** @deprecated Ignored; the host derives availability. Retained until the next Plugin SDK major. */
+  githubPublicationAvailable?: boolean;
+};
 
 type RuntimeRunEmbeddedAgent = (
   params: RuntimeRunEmbeddedAgentParams,
@@ -510,6 +513,10 @@ export type PluginRuntimeCore = {
     openKeyedStore: <T>(
       options: import("../../plugin-state/plugin-state-store.types.js").OpenKeyedStoreOptions,
     ) => import("../../plugin-state/plugin-state-store.types.js").PluginStateKeyedStore<T>;
+    /**
+     * @deprecated Use openKeyedStore and await its operations. The synchronous
+     * compatibility adapter remains through the next Plugin SDK major.
+     */
     openSyncKeyedStore: <T>(
       options: import("../../plugin-state/plugin-state-store.types.js").OpenKeyedStoreOptions,
     ) => import("../../plugin-state/plugin-state-store.types.js").PluginStateSyncKeyedStore<T>;
@@ -535,11 +542,7 @@ export type PluginRuntimeCore = {
       },
     ) => import("../../channels/message/ingress-drain.js").ChannelIngressDrain;
   };
-  tasks: {
-    runs: PluginRuntimeTaskRuns;
-    flows: PluginRuntimeTaskFlows;
-    managedFlows: import("./runtime-taskflow.types.js").PluginRuntimeTaskFlow;
-  };
+  tasks: PluginRuntimeTasks;
   llm: {
     complete: (params: LlmCompleteParams) => Promise<LlmCompleteResult>;
     acquireLocalService: (

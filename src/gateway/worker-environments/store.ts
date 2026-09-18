@@ -1,8 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { isAbsolute } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeSortedUniqueTrimmedStringList } from "@openclaw/normalization-core/string-normalization";
 import type { Insertable, Selectable, Updateable } from "kysely";
 import {
@@ -16,7 +14,6 @@ import {
   getNodeSqliteKysely,
 } from "../../infra/kysely-sync.js";
 import type {
-  WorkerDesktopApp,
   WorkerDesktopEndpoint,
   WorkerProfile,
   WorkerSshEndpoint,
@@ -35,6 +32,7 @@ import {
   type OpenClawStateDatabase,
 } from "../../state/openclaw-state-db.js";
 import type { WorkerCredentialRecord } from "./credential.js";
+import { normalizeWorkerDesktopEndpoint } from "./desktop-endpoint.js";
 import type {
   PreparedEnvironmentPlacementBinding,
   WorkerEnvironmentBootstrapReceipt,
@@ -54,8 +52,10 @@ import {
   workerEnvironmentStateRequiresLease,
   type WorkerEnvironmentState,
 } from "./state.js";
+import { createWorkerEnvironmentStoreWriter } from "./store-write.js";
 import { pruneExpiredTerminalWorkerEnvironments } from "./terminal-environment-retention.js";
 
+export { normalizeWorkerDesktopEndpoint } from "./desktop-endpoint.js";
 export type {
   PreparedEnvironmentPlacementBinding,
   PreparedEnvironmentSelection,
@@ -130,7 +130,6 @@ const TERMINAL_STATES: WorkerEnvironmentState[] = ["destroyed", "failed", "orpha
 const WORKER_BUNDLE_HASH_PATTERN = /^[a-f0-9]{64}$/u;
 const MAX_HOST_KEY_LENGTH = 16_384;
 const MAX_SSH_FALLBACK_PORTS = 10;
-const MAX_WORKER_DESKTOP_APPS = 8;
 const ensuredWorkerEnvironmentDatabases = new WeakSet<DatabaseSync>();
 const WORKER_ENVIRONMENT_SSH_FALLBACK_PORTS_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS worker_environment_ssh_fallback_ports (
@@ -303,74 +302,6 @@ export function normalizeWorkerSshEndpoint(value: Ssh): Ssh {
     user,
     hostKey,
     keyRef: { ...value.keyRef },
-  };
-}
-export function normalizeWorkerDesktopEndpoint(
-  value: WorkerDesktopEndpoint,
-): WorkerDesktopEndpoint {
-  if (!isRecord(value) || value.protocol !== "rfb") {
-    throw new Error('Worker environment desktop protocol must be "rfb"');
-  }
-  if (!Number.isSafeInteger(value.port) || value.port < 1 || value.port > 65_535) {
-    throw new Error("Worker environment desktop port must be an integer from 1 through 65535");
-  }
-  const passwordFilePath = value.passwordFilePath;
-  if (
-    passwordFilePath !== undefined &&
-    (typeof passwordFilePath !== "string" || !isAbsolute(passwordFilePath))
-  ) {
-    throw new Error("Worker environment desktop password file path must be absolute");
-  }
-  if (value.apps !== undefined && !Array.isArray(value.apps)) {
-    throw new Error("Worker environment desktop apps must be an array");
-  }
-  if ((value.apps?.length ?? 0) > MAX_WORKER_DESKTOP_APPS) {
-    throw new Error(`Worker environment desktop apps cannot exceed ${MAX_WORKER_DESKTOP_APPS}`);
-  }
-  const seenAppIds = new Set<WorkerDesktopApp["id"]>();
-  const apps = (value.apps ?? []).map((app): WorkerDesktopApp => {
-    if (!isRecord(app) || (app.id !== "browser" && app.id !== "terminal")) {
-      throw new Error('Worker environment desktop app id must be "browser" or "terminal"');
-    }
-    if (seenAppIds.has(app.id)) {
-      throw new Error(`Worker environment desktop app id ${app.id} must be unique`);
-    }
-    seenAppIds.add(app.id);
-    if (typeof app.executablePath !== "string" || !isAbsolute(app.executablePath)) {
-      throw new Error("Worker environment desktop app executable path must be absolute");
-    }
-    if (app.id === "terminal") {
-      if (Object.keys(app).some((key) => key !== "id" && key !== "executablePath")) {
-        throw new Error("Worker environment terminal desktop app contains unknown fields");
-      }
-      return { id: "terminal", executablePath: app.executablePath };
-    }
-    if (
-      Object.keys(app).some((key) => key !== "id" && key !== "executablePath" && key !== "cdpPort")
-    ) {
-      throw new Error("Worker environment browser desktop app contains unknown fields");
-    }
-    if (
-      typeof app.cdpPort !== "number" ||
-      !Number.isSafeInteger(app.cdpPort) ||
-      app.cdpPort < 1 ||
-      app.cdpPort > 65_535
-    ) {
-      throw new Error(
-        "Worker environment browser CDP port must be an integer from 1 through 65535",
-      );
-    }
-    return {
-      id: "browser",
-      executablePath: app.executablePath,
-      cdpPort: app.cdpPort,
-    };
-  });
-  return {
-    protocol: "rfb",
-    port: value.port,
-    ...(passwordFilePath === undefined ? {} : { passwordFilePath }),
-    ...(value.apps === undefined ? {} : { apps }),
   };
 }
 function endpointFrom(row: Row, fallbackPorts: readonly number[]): Ssh | null {
@@ -818,15 +749,11 @@ export function createWorkerEnvironmentStore(
   const path = database.path;
   const now = options.now ?? Date.now;
   const read = () => openOpenClawStateDatabase({ path }).db;
-  let inventoryVersion = 0;
-  const write = <T>(operation: (db: DatabaseSync) => T): T => {
-    const result = runOpenClawStateWriteTransaction(({ db }) => operation(db), { path });
-    // Device pairing's nodeDeviceId patch deliberately stays outside this version:
-    // it changes no identity/epoch/state input. Runner availability owns its own fence.
-    inventoryVersion += 1;
-    return result;
-  };
+  const { write, inventoryVersion } = createWorkerEnvironmentStoreWriter(path);
   write((db) => reconcileAttachedSessionOwners(db, now()));
+  // Listeners observe permanent credential revocations that must fence live transfers.
+  // Rotation-style revocations (device reconcile re-mints) intentionally do not notify.
+  const credentialRevocationListeners = new Set<(environmentId: string) => void>();
   const writeCredential = (
     input: CredentialInput & {
       environmentId: string;
@@ -926,7 +853,7 @@ export function createWorkerEnvironmentStore(
       return write((db) => createIntent(db, input));
     },
     get: (environmentId: string) => find(read(), required(environmentId, "id")),
-    inventoryVersion: () => inventoryVersion,
+    inventoryVersion,
     hasNodeEnrollmentOwner(nodeId: string): boolean {
       const db = read();
       // Pairing can bind the node without changing inventoryVersion. Cleanup states
@@ -1009,8 +936,21 @@ export function createWorkerEnvironmentStore(
     getCredential: (environmentId: string) => findCredential(read(), required(environmentId, "id")),
     getTransferOwner: (environmentId: string) =>
       findTransferOwner(read(), required(environmentId, "id")),
-    revokeEnvironmentCredential(environmentId: string): void {
-      return write((db) => revokeCredential(db, required(environmentId, "id")));
+    onCredentialRevoked(listener: (environmentId: string) => void): () => void {
+      credentialRevocationListeners.add(listener);
+      return () => credentialRevocationListeners.delete(listener);
+    },
+    revokeEnvironmentCredential(
+      environmentId: string,
+      opts: { fenceWorkspaceTransfers?: boolean } = {},
+    ): void {
+      const result = write((db) => revokeCredential(db, required(environmentId, "id")));
+      if (opts.fenceWorkspaceTransfers) {
+        for (const listener of credentialRevocationListeners) {
+          listener(environmentId);
+        }
+      }
+      return result;
     },
     findCredentialByHash: (credentialHash: string) =>
       findCredentialByHash(read(), normalizeCredentialHash(credentialHash)),

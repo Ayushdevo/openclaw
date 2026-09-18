@@ -5,6 +5,7 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ErrorCodes } from "../../../packages/gateway-protocol/src/index.js";
 import type { McpToolCatalog } from "../../agents/agent-bundle-mcp-types.js";
+import { makeProviderModelFixture } from "../../agents/test-helpers/provider-model-fixture.js";
 import { setPluginToolMeta } from "../../plugins/tool-metadata.js";
 import { createToolsEffectiveHandlers, testing } from "./tools-effective.js";
 
@@ -17,24 +18,21 @@ type RuntimeModelContext = Parameters<Parameters<AcquiredRuntimeModelContext["ru
 function createAcquiredRuntimeModelContext(
   context: RuntimeModelContext,
 ): AcquiredRuntimeModelContext {
-  return { run: (project) => project(context), release: vi.fn() };
+  return { run: (project) => project(context), [Symbol.asyncDispose]: vi.fn(async () => {}) };
 }
 
 const resolveEffectiveToolInventoryRuntimeModelContextMock = vi.hoisted(() =>
   vi.fn((_params?: unknown): RuntimeModelContext => ({
     modelApi: "openai-responses",
-    runtimeModel: {
+    runtimeModel: makeProviderModelFixture({
       id: "gpt-4.1",
       name: "GPT 4.1",
       provider: "openai",
       api: "openai-responses",
       baseUrl: "https://api.openai.com/v1",
-      reasoning: false,
-      input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: 128_000,
       maxTokens: 8_192,
-    },
+    }),
   })),
 );
 
@@ -316,18 +314,15 @@ describe("tools.effective handler", () => {
     runtimeMocks.resolveRuntimeConfigCacheKey.mockReturnValue("runtime:1:test");
     runtimeMocks.resolveEffectiveToolInventoryRuntimeModelContext.mockReturnValue({
       modelApi: "openai-responses",
-      runtimeModel: {
+      runtimeModel: makeProviderModelFixture({
         id: "gpt-4.1",
         name: "GPT 4.1",
         provider: "openai",
         api: "openai-responses",
         baseUrl: "https://api.openai.com/v1",
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 128_000,
         maxTokens: 8_192,
-      },
+      }),
     });
     runtimeMocks.acquireEffectiveToolInventoryRuntimeModelContext
       .mockReset()
@@ -602,18 +597,15 @@ describe("tools.effective handler", () => {
     runtimeMocks.acquireEffectiveToolInventoryRuntimeModelContext.mockResolvedValue(
       createAcquiredRuntimeModelContext({
         modelApi: "openai-responses",
-        runtimeModel: {
+        runtimeModel: makeProviderModelFixture({
           id: "gpt-4.1",
           name: "GPT 4.1",
           provider: "openai",
           api: "openai-responses",
           baseUrl: "https://api.openai.com/v1",
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           contextWindow: 128_000,
           maxTokens: 8_192,
-        },
+        }),
       }),
     );
 
@@ -786,10 +778,9 @@ describe("tools.effective handler", () => {
     await invoke();
 
     expectPayloadGroupIds(respond, ["core", "mcp"]);
-    expect(runtimeMocks.resolveSessionMcpConfigSummary).toHaveBeenCalledWith({
-      workspaceDir: "/tmp/sandbox-copy",
-      cfg: {},
-    });
+    expect(runtimeMocks.resolveSessionMcpConfigSummary).toHaveBeenCalledWith(
+      expect.objectContaining({ workspaceDir: "/tmp/sandbox-copy", cfg: {} }),
+    );
     expect(runtimeMocks.acquireEffectiveToolInventoryRuntimeModelContext).toHaveBeenCalledTimes(2);
     expect(runtimeMocks.acquireEffectiveToolInventoryRuntimeModelContext).toHaveBeenLastCalledWith(
       expect.objectContaining({
@@ -831,6 +822,35 @@ describe("tools.effective handler", () => {
 
     expectPayloadGroupIds(respond, ["core"]);
     expectPayloadNotice(respond, "unsupported-tool-schema:reproProbe__probe_tool");
+  });
+
+  it("keeps usable MCP tools and ordered quarantine notices without changing the cached base", async () => {
+    const base = {
+      ...makeCoreInventory(),
+      notices: [{ id: "base-notice", severity: "info", message: "Keep the base notice" }],
+    };
+    const originalBase = structuredClone(base);
+    Object.freeze(base.groups);
+    Object.freeze(base.notices);
+    Object.freeze(base);
+    runtimeMocks.resolveEffectiveToolInventory.mockReturnValueOnce(base);
+    mockMcpConfigSummary();
+    mockWarmMcpRuntime(makeMcpCatalog());
+    const invalid = makeMcpTool({ type: "array", items: { type: "string" } });
+    invalid.name = "reproProbe__invalid";
+    runtimeMocks.buildBundleMcpToolsFromCatalog.mockReturnValueOnce([makeMcpTool(), invalid]);
+
+    const { respond, invoke } = createInvokeParams({ sessionKey: "main:abc" });
+    await invoke();
+
+    expectPayloadGroupIds(respond, ["core", "mcp"]);
+    const payload = firstRespondCall(respond)?.[1] as ToolsEffectivePayload;
+    expect(payload.groups?.[1]?.tools?.map((tool) => tool.id)).toEqual(["reproProbe__probe_tool"]);
+    expect(payload.notices?.map((notice) => notice.id)).toEqual([
+      "base-notice",
+      "unsupported-tool-schema:reproProbe__invalid",
+    ]);
+    expect(base).toEqual(originalBase);
   });
 
   it("does not project stale MCP catalogs after config changes", async () => {

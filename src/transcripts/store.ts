@@ -2,9 +2,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { resolveOptionalIntegerOption } from "@openclaw/normalization-core/number-coercion";
+import type { TranscriptUtterance as ProjectedTranscriptUtterance } from "../../packages/gateway-protocol/src/schema/transcripts.js";
 import { sha256File, sha256Hex } from "../infra/crypto-digest.js";
 import { ensureAbsoluteDirectory } from "../infra/fs-safe.js";
 import { executeSqliteQuerySync, executeSqliteQueryTakeFirstSync } from "../infra/kysely-sync.js";
+import { iterateOpenClawStateDatabaseReadOnly } from "../state/openclaw-state-db-readonly.js";
 import {
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
@@ -34,7 +36,18 @@ import {
   assertTranscriptExportPathAvailable,
   hasAliasedCanonicalTranscriptExportPathOwner,
 } from "./store-export-ownership.js";
+import {
+  parseTranscriptExportManifest,
+  parseTranscriptPendingExports,
+} from "./store-export-state.js";
 import * as read from "./store-read.js";
+import {
+  assertMeetingTranscriptSelectorAvailableInDatabase,
+  markMeetingTranscriptPendingExportsInDatabase,
+  updateMeetingTranscriptExportManifestInDatabase,
+  writeMeetingTranscriptSessionInDatabase,
+  writeMeetingTranscriptSummaryInDatabase,
+} from "./store-sqlite-write.js";
 import {
   appendMeetingTranscriptUtterance,
   meetingTranscriptDb,
@@ -44,6 +57,7 @@ import {
   readRecentStoppedTranscriptSession,
   readTranscriptSummaryKeys,
   readTranscriptSummaryInputRevision,
+  transcriptSummaryInputRevisionFromRow,
   sessionFromRow,
   summaryFromRow,
   utteranceFromRow,
@@ -55,17 +69,16 @@ import { renderTranscriptsMarkdown } from "./summary.js";
 export type * from "./store-types.js";
 export { safeTranscriptPathSegment, transcriptSessionExportKey, transcriptSessionSelector };
 
-export class TranscriptsSummaryChangedError extends Error {
-  constructor() {
-    super("Transcript changed while generating notes; summarize it again.");
-  }
-}
+type TranscriptSessionMatchEntry = StoreTypes.TranscriptsSessionEntry & { inputRevision: string };
 
 /** Canonical meeting-capture transcript store. Files are explicit exports only. */
 export class TranscriptsStore {
   constructor(
     private readonly exportRootDir: string,
-    private readonly databaseOptions: OpenClawStateDatabaseOptions = {},
+    private readonly databaseOptions: Pick<
+      OpenClawStateDatabaseOptions,
+      "env" | "path" | "readOnly"
+    > = {},
   ) {}
 
   private database() {
@@ -127,8 +140,8 @@ export class TranscriptsStore {
     );
     return row
       ? {
-          manifest: JSON.parse(row.export_manifest_json) as Record<string, string>,
-          pending: new Set(JSON.parse(row.export_pending_json) as string[]),
+          manifest: parseTranscriptExportManifest(row.export_manifest_json),
+          pending: parseTranscriptPendingExports(row.export_pending_json),
         }
       : { manifest: {}, pending: new Set() };
   }
@@ -165,67 +178,19 @@ export class TranscriptsStore {
     return hashes;
   }
 
-  private updateExportState(
-    session: TranscriptSessionDescriptor,
-    operationLabel: string,
-    update: (
-      stored:
-        | Pick<MeetingTranscriptSessionRow, "export_manifest_json" | "export_pending_json">
-        | undefined,
-    ) => { export_pending_json: string; export_manifest_json?: string },
-  ): void {
-    this.transaction(operationLabel, ({ db: database }) => {
-      const stored = executeSqliteQueryTakeFirstSync(
-        database,
-        meetingTranscriptSessionQuery(database, session).select([
-          "export_manifest_json",
-          "export_pending_json",
-        ]),
-      );
-      executeSqliteQuerySync(
-        database,
-        meetingTranscriptDb(database)
-          .updateTable("meeting_transcript_sessions")
-          .set(update(stored))
-          .where("session_id", "=", session.sessionId)
-          .where("started_at", "=", session.startedAt),
-      );
-    });
-  }
-
   private updateExportManifest(
     session: TranscriptSessionDescriptor,
     exportedHashes: Readonly<Record<string, string>>,
     removedExports: ReadonlySet<string> = new Set(),
   ): void {
-    this.updateExportState(session, "meeting-transcripts.export.record", (stored) => {
-      const manifest = stored
-        ? (JSON.parse(stored.export_manifest_json) as Record<string, string>)
-        : {};
-      const pending = new Set(stored ? (JSON.parse(stored.export_pending_json) as string[]) : []);
-      for (const fileName of removedExports) {
-        delete manifest[fileName];
-      }
-      for (const fileName of [...Object.keys(exportedHashes), ...removedExports]) {
-        pending.delete(fileName);
-      }
-      return {
-        export_manifest_json: JSON.stringify({ ...manifest, ...exportedHashes }),
-        export_pending_json: JSON.stringify([...pending].toSorted()),
-      };
+    this.transaction("meeting-transcripts.export.record", ({ db }) => {
+      updateMeetingTranscriptExportManifestInDatabase(db, session, exportedHashes, removedExports);
     });
   }
 
   private markPendingExports(session: TranscriptSessionDescriptor, fileNames: string[]): void {
-    this.updateExportState(session, "meeting-transcripts.export.pending", (stored) => {
-      if (!stored) {
-        throw new Error(`transcripts session not found: ${session.sessionId}`);
-      }
-      const pending = new Set(JSON.parse(stored.export_pending_json) as string[]);
-      for (const fileName of fileNames) {
-        pending.add(fileName);
-      }
-      return { export_pending_json: JSON.stringify([...pending].toSorted()) };
+    this.transaction("meeting-transcripts.export.pending", ({ db }) => {
+      markMeetingTranscriptPendingExportsInDatabase(db, session, fileNames);
     });
   }
 
@@ -294,35 +259,45 @@ export class TranscriptsStore {
     );
   }
 
-  iterateReadEntries(options: read.TranscriptReadOptions = {}) {
-    return read.iterateTranscriptReadEntries(this.database().db, options);
+  async *iterateReadEntries(options: read.TranscriptReadOptions = {}) {
+    return yield* iterateOpenClawStateDatabaseReadOnly(
+      this.database(),
+      ({ db }) => read.iterateTranscriptReadEntries(db, options),
+      this.databaseOptions.env,
+    );
   }
 
-  readEntry(selector: string, purpose: read.TranscriptReadPurpose = "page") {
+  async readEntry(selector: string, purpose: read.TranscriptReadPurpose = "page") {
     return read.readTranscriptEntry(this.database().db, selector, purpose);
   }
 
-  readLatestEntry() {
+  async readLatestEntry() {
     return read.readLatestTranscriptEntry(this.database().db);
   }
 
-  readNotes(session: TranscriptSessionDescriptor, purpose: read.TranscriptReadPurpose = "page") {
+  async readNotes(
+    session: TranscriptSessionDescriptor,
+    purpose: read.TranscriptReadPurpose = "page",
+  ) {
     return read.readStoredTranscriptNotes(this.database().db, session, purpose);
   }
 
-  readUtterancePage(
-    session: TranscriptSessionDescriptor,
-    options: { limit?: number; after?: number; query?: string } = {},
-    purpose: "page" | "legacy" = "page",
-  ) {
-    return read.readTranscriptUtterancePage(this.database().db, session, options, purpose);
+  async readLibraryEntry(params: Parameters<typeof read.readTranscriptLibraryEntry>[1]) {
+    return read.readTranscriptLibraryEntry(this.database().db, params);
   }
 
-  iterateUtterances(session: TranscriptSessionDescriptor) {
-    return read.iterateTranscriptUtterances(this.database().db, session);
+  async *iterateExport(
+    selector: string,
+    includeNotes: boolean,
+  ): AsyncGenerator<ProjectedTranscriptUtterance, read.TranscriptExportRead | undefined> {
+    return yield* iterateOpenClawStateDatabaseReadOnly(
+      this.database(),
+      ({ db }) => read.iterateTranscriptExport(db, selector, includeNotes),
+      this.databaseOptions.env,
+    );
   }
 
-  readRecentStoppedSession(
+  async readRecentStoppedSession(
     source: TranscriptSourceLocator,
     stoppedAfter: string,
     stoppedBefore: string,
@@ -335,16 +310,24 @@ export class TranscriptsStore {
     );
   }
 
-  readSummaryInputRevision(session: TranscriptSessionDescriptor): string | undefined {
+  async readSummaryInputRevision(
+    session: TranscriptSessionDescriptor,
+  ): Promise<string | undefined> {
     return readTranscriptSummaryInputRevision(this.database().db, session);
   }
 
-  listReadEntries(options: read.TranscriptReadOptions) {
+  async listReadEntries(options: read.TranscriptReadOptions) {
     return read.queryTranscriptReadEntries(this.database().db, options);
   }
 
-  async writeSession(session: TranscriptSessionDescriptor): Promise<void> {
+  async writeSession(
+    session: TranscriptSessionDescriptor,
+    condition?: { expectedInputRevision?: string; assertCurrent?: () => void },
+  ): Promise<void> {
     ensureMeetingTranscriptsSchema(this.databaseOptions);
+    const selector = transcriptSessionSelector(session);
+    // Classify the existing constraint before export checks, then recheck under write admission.
+    assertMeetingTranscriptSelectorAvailableInDatabase(this.database().db, session, selector);
     if (
       !this.readSessionByIdentity(session) &&
       !(await hasAliasedCanonicalTranscriptExportPathOwner({
@@ -357,7 +340,7 @@ export class TranscriptsStore {
       const legacySelector = legacyTranscriptSessionSelector(session);
       if (legacySelector !== undefined) {
         const legacySessionDir = path.join(this.exportRootDir, legacySelector);
-        const legacyRow = this.readCanonicalSelectorRow(legacySelector);
+        const legacyRow = this.readCanonicalSelectorRow(this.database().db, legacySelector);
         const legacyOwner = legacyRow ? sessionFromRow(legacyRow) : undefined;
         const legacyPathIsCanonical =
           legacyOwner !== undefined &&
@@ -371,7 +354,7 @@ export class TranscriptsStore {
       }
     }
     const sessionValues = {
-      selector: transcriptSessionSelector(session),
+      selector,
       export_key: transcriptSessionExportKey(session),
       session_slug: safeTranscriptPathSegment(session.sessionId),
       provider_id: session.source.providerId,
@@ -382,42 +365,13 @@ export class TranscriptsStore {
     };
     const now = Date.now();
     this.transaction("meeting-transcripts.session.write", ({ db: database }) => {
-      const previous = executeSqliteQueryTakeFirstSync(
-        database,
-        meetingTranscriptSessionQuery(database, session).selectAll(),
-      );
-      if (previous) {
-        // ID origin belongs to admission, including the absence of that fact in legacy rows.
-        const admittedMetadata = sessionFromRow(previous).metadata;
-        let metadata = session.metadata ? { ...session.metadata } : undefined;
-        if (admittedMetadata && Object.hasOwn(admittedMetadata, "sessionIdOrigin")) {
-          metadata = { ...metadata, sessionIdOrigin: admittedMetadata.sessionIdOrigin };
-        } else if (metadata) {
-          delete metadata.sessionIdOrigin;
-        }
-        sessionValues.metadata_json = metadata ? JSON.stringify(metadata) : null;
-      }
-      executeSqliteQuerySync(
-        database,
-        meetingTranscriptDb(database)
-          .insertInto("meeting_transcript_sessions")
-          .values({
-            session_id: session.sessionId,
-            started_at: session.startedAt,
-            ...sessionValues,
-            export_manifest_json: "{}",
-            export_pending_json: "[]",
-            next_utterance_seq: 0,
-            created_at_ms: now,
-            updated_at_ms: now,
-          })
-          .onConflict((conflict) =>
-            conflict.columns(["session_id", "started_at"]).doUpdateSet({
-              ...sessionValues,
-              updated_at_ms: now,
-            }),
-          ),
-      );
+      condition?.assertCurrent?.();
+      writeMeetingTranscriptSessionInDatabase(database, {
+        session,
+        sessionValues,
+        now,
+        expectedInputRevision: condition?.expectedInputRevision,
+      });
     });
   }
 
@@ -428,7 +382,7 @@ export class TranscriptsStore {
   async readSessionEntry(
     sessionSelector: string,
   ): Promise<StoreTypes.TranscriptsSessionEntry | undefined> {
-    const { qualified, unqualified } = this.matchSessionEntries(sessionSelector);
+    const { qualified, unqualified } = await this.matchSessionEntries(sessionSelector);
     const entries = qualified.length ? qualified : unqualified;
     if (entries.length > 1) {
       throw new Error(
@@ -437,14 +391,18 @@ export class TranscriptsStore {
           .join(", ")}`,
       );
     }
-    return entries[0];
+    const matched = entries[0];
+    if (!matched) {
+      return undefined;
+    }
+    const { inputRevision: _inputRevision, ...entry } = matched;
+    return entry;
   }
 
-  private readCanonicalSelectorRow(selector: string) {
-    const database = this.database();
+  private readCanonicalSelectorRow(database: OpenClawStateDatabase["db"], selector: string) {
     return executeSqliteQueryTakeFirstSync(
-      database.db,
-      meetingTranscriptDb(database.db)
+      database,
+      meetingTranscriptDb(database)
         .selectFrom("meeting_transcript_sessions")
         .selectAll()
         .where("selector", "=", selector),
@@ -453,24 +411,26 @@ export class TranscriptsStore {
 
   // Return bounded evidence, not a selection policy: operators prefer qualified
   // matches, while legacy tool handles must also account for raw-ID collisions.
-  matchSessionEntries(value: string): {
-    qualified: StoreTypes.TranscriptsSessionEntry[];
-    unqualified: StoreTypes.TranscriptsSessionEntry[];
-  } {
+  async matchSessionEntries(value: string): Promise<{
+    qualified: TranscriptSessionMatchEntry[];
+    unqualified: TranscriptSessionMatchEntry[];
+  }> {
     const database = this.database();
     const query = meetingTranscriptDb(database.db)
       .selectFrom("meeting_transcript_sessions")
       .selectAll()
       .orderBy("started_at", "desc")
       .limit(2);
+    const matchedEntry = (row: MeetingTranscriptSessionRow): TranscriptSessionMatchEntry => ({
+      ...this.entryFromRow(row, this.hasSummary(database, row)),
+      inputRevision: transcriptSummaryInputRevisionFromRow(row),
+    });
     const entries = (selection: typeof query) =>
-      executeSqliteQuerySync(database.db, selection).rows.map((row) =>
-        this.entryFromRow(row, this.hasSummary(database, row)),
-      );
-    const canonical = this.readCanonicalSelectorRow(value);
+      executeSqliteQuerySync(database.db, selection).rows.map(matchedEntry);
+    const canonical = this.readCanonicalSelectorRow(database.db, value);
     const date = value.match(/^(\d{4}-\d{2}-\d{2})\//u)?.[1];
     const qualified = canonical
-      ? [this.entryFromRow(canonical, this.hasSummary(database, canonical))]
+      ? [matchedEntry(canonical)]
       : date
         ? entries(
             query
@@ -525,6 +485,7 @@ export class TranscriptsStore {
     summary: TranscriptsSummary,
     session: TranscriptSessionDescriptor,
     expectedInputRevision?: string,
+    assertCurrent?: () => void,
   ): Promise<string> {
     const summaryJson = JSON.stringify(summary);
     const markdown = renderTranscriptsMarkdown(summary);
@@ -536,26 +497,12 @@ export class TranscriptsStore {
     };
     ensureMeetingTranscriptsSchema(this.databaseOptions);
     this.transaction("meeting-transcripts.summary.write", ({ db: database }) => {
-      // Recheck under the writer lock; a concurrent writer can change the
-      // transcript after the caller's pre-check but before this commit.
-      if (
-        expectedInputRevision !== undefined &&
-        readTranscriptSummaryInputRevision(database, session) !== expectedInputRevision
-      ) {
-        throw new TranscriptsSummaryChangedError();
-      }
-      executeSqliteQuerySync(
+      assertCurrent?.();
+      writeMeetingTranscriptSummaryInDatabase(
         database,
-        meetingTranscriptDb(database)
-          .insertInto("meeting_transcript_summaries")
-          .values({
-            session_id: session.sessionId,
-            session_started_at: session.startedAt,
-            ...summaryValues,
-          })
-          .onConflict((conflict) =>
-            conflict.columns(["session_id", "session_started_at"]).doUpdateSet(summaryValues),
-          ),
+        session,
+        summaryValues,
+        expectedInputRevision,
       );
     });
     return path.join(this.sessionDir(session), "summary.md");

@@ -599,13 +599,14 @@ export class CodexToolTranscriptProjection {
           sessionTarget: this.params.sessionTarget,
         },
         undefined,
-        "native-evidence",
+        "model-context",
         signal,
+        this.params.contextTokenBudget,
       )) ?? []
     );
   }
 
-  private recordToolCall(params: ToolTranscriptCallInput): void {
+  recordToolCall(params: ToolTranscriptCallInput): void {
     if (!params.id || !params.name || this.callIds.has(params.id)) {
       return;
     }
@@ -620,7 +621,7 @@ export class CodexToolTranscriptProjection {
     this.options.checkpointMessage?.({ read: () => message });
   }
 
-  private recordToolResult(params: ToolTranscriptResultInput): void {
+  recordToolResult(params: ToolTranscriptResultInput): void {
     if (!params.id || !params.name || this.resultIds.has(params.id)) {
       return;
     }

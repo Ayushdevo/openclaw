@@ -4,6 +4,7 @@ import type { ResolvedGlobalInstallTarget } from "../../infra/update-global.js";
 import type { OpenClawSchemaVersions } from "../../state/openclaw-schema-versions.js";
 import type { createUpdateProgress } from "./progress.js";
 import type { UpdateCommandOptions } from "./shared.js";
+import type { StagedPackageInstallUpdate } from "./update-command-package.js";
 import type { ManagedServiceRootRedirect } from "./update-command-service-plan.js";
 import type { UpdateCommandRecoveryState } from "./update-command-service.js";
 
@@ -25,6 +26,7 @@ export type MutableUpdateExecutionParams = {
   packageInstallSpec: string | null;
   packageInstallEnv?: NodeJS.ProcessEnv;
   packageInstallTarget?: ResolvedGlobalInstallTarget;
+  stagedPackage?: StagedPackageInstallUpdate;
   packageTargetVersion?: string;
   packageTargetSchemaVersions?: OpenClawSchemaVersions;
   packageUpdateNodeRunner?: string;
@@ -33,6 +35,6 @@ export type MutableUpdateExecutionParams = {
   invocationCwd?: string;
   legacyConfigPlan?: LegacyConfigUpdatePlan;
   recoveryState: UpdateCommandRecoveryState;
-  prepareMutableUpdate: (env?: NodeJS.ProcessEnv) => Promise<void>;
+  prepareMutableUpdate: (env?: NodeJS.ProcessEnv, activationTimeoutMs?: number) => Promise<void>;
   onActivation?: () => void;
 };

@@ -8,7 +8,7 @@ import {
 import { coerceRequiredSqliteNumber as sqliteNumber } from "../../infra/sqlite-number.js";
 import { normalizeAgentId, parseAgentSessionKey } from "../../routing/session-key.js";
 import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
-import type { SessionStateDeletePlan } from "./session-accessor.sqlite-archive.js";
+import type { SessionStateDeletePlan } from "./session-accessor.sqlite-archive-types.js";
 import type { SqliteSessionArtifactPreparationDiagnostics } from "./session-accessor.sqlite-contract.js";
 import { readSessionEntryStore } from "./session-accessor.sqlite-entry-store.js";
 import {
@@ -62,6 +62,12 @@ function sqliteTranscriptStateIsReclaimable(params: {
   nowMs: number;
   orphanTranscriptMinAgeMs: number;
 }): boolean {
+  if (
+    params.sessionUpdatedAt !== undefined &&
+    params.nowMs - params.sessionUpdatedAt < params.orphanTranscriptMinAgeMs
+  ) {
+    return false;
+  }
   const transcriptUpdatedAt = readSessionTranscriptUpdatedAt(params.database, params.sessionId);
   const updatedAt =
     params.sessionUpdatedAt === undefined
@@ -217,7 +223,7 @@ export function planSessionLifecycleArtifactCleanup(
       database.db,
       db
         .selectFrom("session_nodes")
-        .select(["entry_json", "session_key", "current_session_id", "updated_at"])
+        .select(["session_key", "current_session_id", "updated_at"])
         .orderBy("session_key", "asc"),
     ).rows;
 

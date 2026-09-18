@@ -12,6 +12,10 @@ import {
 } from "../infra/kysely-sync.js";
 import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
 import { runWithSqliteBusyTimeout } from "../infra/sqlite-busy-timeout.js";
+import {
+  assertExistingDatabaseIdentity,
+  readDatabasePathIdentitySync,
+} from "../infra/sqlite-worker-identity.js";
 import { prepareStateDatabaseCanonicalMutation } from "../infra/state-database-coordinator.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
@@ -21,8 +25,10 @@ import {
   prepareAgentDeletionPathFence,
 } from "./agent-deletion-journal.js";
 import { openClawStateDatabaseCache } from "./openclaw-state-db-cache.js";
-import type { OpenClawStateDatabaseOptions } from "./openclaw-state-db-contract.js";
-import { openDanglingWorkshopIndexReadAdmission } from "./openclaw-state-db-dangling-workshop-index.js";
+import type {
+  OpenClawStateDatabaseOptions,
+  OpenClawStateSchemaReadAdmission,
+} from "./openclaw-state-db-contract.js";
 import { runExistingOpenClawStateWriteTransaction } from "./openclaw-state-db-existing-write.js";
 import { ensureAgentDatabaseLeaseSchema } from "./openclaw-state-db-schema-additive.js";
 import { tableExists } from "./openclaw-state-db-schema-helpers.js";
@@ -31,7 +37,10 @@ import {
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "./openclaw-state-db.js";
-import { resolveOpenClawStateSqlitePath } from "./openclaw-state-db.paths.js";
+import {
+  resolveOpenClawStateSqlitePath,
+  resolveOpenClawStateDirForDatabasePath,
+} from "./openclaw-state-db.paths.js";
 import type { OpenClawStateLeaseContext } from "./openclaw-state-lease.js";
 import { OPENCLAW_STATE_SCHEMA_SQL } from "./openclaw-state-schema.js";
 
@@ -238,6 +247,83 @@ export function assertOpenClawAgentDatabaseLease(
   }
 }
 
+export type OpenClawAgentDatabaseWorkerLeaseReceipt = {
+  leaseId: string;
+  agentId: string;
+  path: string;
+  ownerPid: number;
+  ownerStartTime: number | null;
+  sharedStatePath: string;
+  sharedStateIdentity: string;
+};
+
+/** Capture the exact admitted claim so its parent can finish cleanup after native Worker exit. */
+export function readOpenClawAgentDatabaseWorkerLeaseReceiptFromClaim(
+  leaseId: string,
+  params: { agentId: string; path: string; env?: NodeJS.ProcessEnv },
+): OpenClawAgentDatabaseWorkerLeaseReceipt {
+  assertOpenClawAgentDatabaseLease(leaseId, params);
+  const database = openOpenClawStateDatabase({ env: params.env });
+  const row = executeSqliteQueryTakeFirstSync(
+    database.db,
+    getNodeSqliteKysely<AgentDatabaseLeaseDatabase>(database.db)
+      .selectFrom("agent_database_leases")
+      .select(["agent_id", "path", "owner_pid", "owner_start_time"])
+      .where("lease_id", "=", leaseId),
+  );
+  if (!row) {
+    throw new Error("SQLite reclamation Worker lost its admitted lease receipt");
+  }
+  return {
+    leaseId,
+    agentId: row.agent_id,
+    path: row.path,
+    ownerPid: row.owner_pid,
+    ownerStartTime: row.owner_start_time,
+    sharedStatePath: database.path,
+    sharedStateIdentity: readDatabasePathIdentitySync(database.path).key,
+  };
+}
+
+/** Only the owning parent calls this after joining this receipt's native Worker exit. */
+export function releaseExitedOpenClawAgentDatabaseWorkerLease(
+  receipt: OpenClawAgentDatabaseWorkerLeaseReceipt,
+): void {
+  assertExistingDatabaseIdentity(receipt.sharedStatePath, receipt.sharedStateIdentity);
+  runOpenClawStateWriteTransaction(
+    (database) => {
+      assertExistingDatabaseIdentity(receipt.sharedStatePath, receipt.sharedStateIdentity);
+      const db = getNodeSqliteKysely<AgentDatabaseLeaseDatabase>(database.db);
+      const row = executeSqliteQueryTakeFirstSync(
+        database.db,
+        db
+          .selectFrom("agent_database_leases")
+          .select(["agent_id", "path", "owner_pid", "owner_start_time"])
+          .where("lease_id", "=", receipt.leaseId),
+      );
+      if (!row) {
+        return;
+      }
+      if (
+        row.agent_id !== receipt.agentId ||
+        row.path !== receipt.path ||
+        row.owner_pid !== receipt.ownerPid ||
+        row.owner_start_time !== receipt.ownerStartTime
+      ) {
+        throw new Error("SQLite reclamation Worker lease cleanup receipt no longer matches");
+      }
+      executeSqliteQuerySync(
+        database.db,
+        db.deleteFrom("agent_database_leases").where("lease_id", "=", receipt.leaseId),
+      );
+    },
+    {
+      path: receipt.sharedStatePath,
+      env: { OPENCLAW_STATE_DIR: resolveOpenClawStateDirForDatabasePath(receipt.sharedStatePath) },
+    },
+  );
+}
+
 function readAgentDatabaseLeases(database: DatabaseSync) {
   const db = getNodeSqliteKysely<AgentDatabaseLeaseDatabase>(database);
   return executeSqliteQuerySync(
@@ -266,6 +352,7 @@ function isAgentDatabaseLeaseStale(row: {
 /** Doctor holds both lifecycle coordinators before checking writers, without schema repair. */
 export function assertNoOpenClawAgentDatabaseLeasesReadOnly(
   options: OpenClawStateDatabaseOptions = {},
+  openStateSchemaReadAdmission?: OpenClawStateSchemaReadAdmission,
 ): void {
   const pathname = path.resolve(options.path ?? resolveOpenClawStateSqlitePath(options.env));
   try {
@@ -284,7 +371,7 @@ export function assertNoOpenClawAgentDatabaseLeasesReadOnly(
   const db = cached?.db ?? openNodeSqliteDatabase(pathname, { readOnly: true });
   let closeSchemaReadAdmission: (() => void) | undefined;
   try {
-    closeSchemaReadAdmission = openDanglingWorkshopIndexReadAdmission(db);
+    closeSchemaReadAdmission = openStateSchemaReadAdmission?.(db);
     runWithSqliteBusyTimeout(db, 250, () => {
       if (!tableExists(db, "agent_database_leases")) {
         return;

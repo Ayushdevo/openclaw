@@ -87,7 +87,10 @@ review_checkout_pr() {
   local pr="$1"
   enter_worktree "$pr" false || return 1
   mark_pr_operation_side_effects_started
-  git fetch origin "pull/$pr/head:pr-$pr" --force
+  require_artifact .local/pr-meta.env
+  local expected_sha
+  expected_sha=$(source .local/pr-meta.env; printf '%s\n' "${PR_HEAD_SHA:-}")
+  fetch_pr_head "$pr" "$expected_sha" "refs/heads/pr-$pr" || return 1
   checkout_pr_worktree_target "$pr" "pr-$pr" || return 1
   set_review_mode pr
 
@@ -165,19 +168,12 @@ review_artifacts_init() {
     exit 1
   fi
 
-  # Take the first line in the shell, not through `head`: pipefail turns the
-  # helper's EPIPE into a spurious failure once the template outgrows the pipe.
-  local identity_line
-  identity_line=$(node "$(review_artifacts_helper_path)" markdown "$meta_number" "$head_sha")
-  identity_line=${identity_line%%$'\n'*}
-
-  if [ -f .local/review.json ] && [ -f .local/review.md ] &&
+  if [ -f .local/review.json ] &&
     jq -e --argjson number "$meta_number" --arg head "$head_sha" \
-      '.pr.number == $number and .pr.headSha == $head' .local/review.json >/dev/null 2>&1 &&
-    [ "$(head -n1 .local/review.md)" = "$identity_line" ]
+      '.pr.number == $number and .pr.headSha == $head' .local/review.json >/dev/null 2>&1
   then
     echo "review artifacts already stamped for PR #$meta_number at $head_sha"
-    echo "files=.local/review.md .local/review.json"
+    echo "file=.local/review.json (rendered summary: review-validate-artifacts)"
     return 0
   fi
 
@@ -197,11 +193,10 @@ review_artifacts_init() {
     echo "moved aside .local/review.$ext -> $superseded_dir/review.$ext (not authored for PR #$meta_number at $head_sha)"
   done
 
-  node "$(review_artifacts_helper_path)" markdown "$meta_number" "$head_sha" > .local/review.md
   node "$(review_artifacts_helper_path)" template "$meta_number" "$head_sha" > .local/review.json
 
   echo "review artifact templates are ready"
-  echo "files=.local/review.md .local/review.json"
+  echo "file=.local/review.json (rendered summary: review-validate-artifacts)"
 }
 
 validate_review_artifact_data() {
@@ -223,7 +218,6 @@ validate_review_artifact_data() {
 
   if ! node "$(review_artifacts_helper_path)" validate \
     .local/review.json \
-    .local/review.md \
     .local/pr-meta.json
   then
     return 1
@@ -237,12 +231,34 @@ require_ready_review_recommendation() {
   fi
 }
 
+# Pure local admission: malformed or unfinished input must not start a fetch or
+# leave an operation lock behind. This does not establish remote freshness.
+review_artifact_preflight() (
+  local pr="$1" ready="${2:-false}" root state target
+  root=$(common_repo_root) || return 1
+  state=$(pr_worktree_state "$root/.worktrees/pr-$pr" "" entry) || return 1
+  target=$(printf '%s\n' "$state" | jq -er 'select(.present == true) | .path') || {
+    echo "Missing PR review worktree. Run: scripts/pr review-init $pr"
+    return 1
+  }
+  cd "$target" || return 1
+  require_artifact .local/review.json || return 1
+  require_artifact .local/pr-meta.json || return 1
+  require_artifact .local/pr-meta.env || return 1
+  node "$(review_artifacts_helper_path)" validate .local/review.json .local/pr-meta.json || return 1
+  if [ "$(jq -r '.number' .local/pr-meta.json)" != "$pr" ]; then
+    echo "Review artifact identity mismatch: expected PR #$pr. Re-run scripts/pr review-init $pr"
+    return 1
+  fi
+  if [ "$ready" = true ]; then require_ready_review_recommendation || return 1; fi
+)
+
 review_validate_artifacts() {
   local pr="$1"
   # Callers use an OR-list to keep pre-mutation failures reversible; Bash disables
   # errexit within that context, so every artifact and exact-head guard must propagate.
+  review_artifact_preflight "$pr" "${2:-false}" || return 1
   review_guard "$pr" || return 1
-  require_artifact .local/review.md || return 1
   require_artifact .local/review.json || return 1
   require_artifact .local/pr-meta.json || return 1
 
@@ -316,7 +332,9 @@ review_init() {
   write_pr_meta_files "$json"
   pr_url=$(printf '%s\n' "$json" | jq -r .url)
 
-  git fetch origin "pull/$pr/head:pr-$pr" --force
+  local expected_sha
+  expected_sha=$(pr_view_string_field "$json" headRefOid "$pr") || return 1
+  fetch_pr_head "$pr" "$expected_sha" "refs/heads/pr-$pr" || return 1
   local mb
   mb=$(git merge-base "$PR_MAIN_SHA" "refs/heads/pr-$pr")
 

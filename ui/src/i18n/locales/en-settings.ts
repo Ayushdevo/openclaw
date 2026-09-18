@@ -4,6 +4,28 @@ import { en } from "./en.ts";
 // Settings copy loads with its lazy page or search, not the startup shell.
 const enSettings = {
   connection: {
+    ping: {
+      title: "Gateway ping",
+      latest: "Latest ping",
+      average: "Avg ping",
+      averageHint: "Average browser-to-Gateway round-trip time, including Gateway handling.",
+      p50: "p50",
+      p50Hint: "50% of measured pings completed in this time or less (median).",
+      p95: "p95",
+      p95Hint: "95% of measured pings completed in this time or less.",
+      p99: "p99",
+      p99Hint: "99% of measured pings completed in this time or less.",
+      unit: "ms",
+      samples: "Samples: {count}/100 · every 5 s while visible",
+      measuring: "Measuring ping…",
+      failed: "Last ping failed. Retrying…",
+    },
+    activity: {
+      title: "Gateway activity",
+      description: "Process CPU, memory, and event-loop delay · every 5 s while visible",
+      failed: "Activity refresh failed. Retrying…",
+      offline: "Connect to see Gateway activity.",
+    },
     access: {
       title: "Connection",
       descriptionOffline: "Not connected.",
@@ -18,6 +40,10 @@ const enSettings = {
       status: {
         connected: "Connected",
         offline: "Offline",
+        connecting: "Connecting…",
+        starting: "Starting…",
+        reconnecting: "Reconnecting…",
+        "reload-required": "Reload required",
       },
       gatewayUrl: "Gateway URL",
       gatewayUrlHint: "Use wss:// when the Gateway sits behind HTTPS or Tailscale Serve.",
@@ -31,8 +57,18 @@ const enSettings = {
       trustedProxy: "Authenticated via trusted proxy.",
       trustedProxyStatus: "Trusted proxy",
       sessionKey: "Default session",
-      sessionKeyHint: "Session opened after connecting.",
-      unsavedHint: "Unsaved changes apply when you connect.",
+      sessionKeyHint: "Save the session to open in this browser without reconnecting.",
+      sessionTitle: "Session",
+      saved: "Saved",
+      sessionDescription: "For {host} in this browser.",
+      unsavedHint: "Connection changes have not been applied.",
+      applyReconnect: "Apply and reconnect",
+      discard: "Discard changes",
+      retry: "Retry connection",
+      details: "Connection details",
+      reconnect: "Reconnect",
+      reconnectHint:
+        "Reconnect this browser to the current Gateway to troubleshoot a stuck connection.",
       lastError: "Last error",
       showSecret: "Show secret",
       hideSecret: "Hide secret",
@@ -130,6 +166,11 @@ const enSettings = {
       cancelBuildMessage:
         "Stop this snapshot build and destroy its worker? OpenClaw waits for provider work and cleanup to finish.",
       buildCancelled: "Build canceled",
+      dismiss: "Dismiss",
+      dismissBuild: "Dismiss failed build",
+      dismissBuildMessage:
+        "Request cleanup for this failed build and hide it from this view. The Gateway keeps the failed record until its retention window ends, so it can reappear after a reload.",
+      buildDismissed: "Failed build dismissed",
       buildAge: "Age: {age}",
       buildAfterRestart: "After the Gateway restarts, build a snapshot from the Snapshots view.",
       buildStates: {
@@ -275,10 +316,11 @@ const enSettings = {
   },
   modelProviders: {
     title: "Configured providers",
-    configureModels: "Configure Models",
+    configureModels: "Model setup",
     login: {
       action: "Connect provider",
       title: "Connect a provider",
+      noOptions: "No account connection methods are available.",
       description: "Save credentials for this agent. Choose the active model separately.",
       done: "Provider credentials saved.",
       finishing: "Credentials are being saved. Wait for the result.",
@@ -300,6 +342,7 @@ const enSettings = {
       apiKey: "API key",
       denied: "Credentials rejected",
       configured: "Credentials configured",
+      modelsUnavailable: "Models unavailable",
     },
     expiresIn: "Credential expires in {time}",
     models: "{count} models",
@@ -308,7 +351,7 @@ const enSettings = {
     globalUsage: "Global usage and cost",
     noStats: "No live usage data reported by this provider.",
     localCost: "Global session spend · {days}d",
-    localCostDetail: "{tokens} tokens · {sessions} sessions",
+    localCostDetail: "{tokens} tokens · {messages} messages",
     saving: "Saving…",
     requestFailed: "Request failed.",
     configUnavailable: "Configuration is unavailable. Refresh and try again.",
@@ -325,6 +368,8 @@ const enSettings = {
     profiles: {
       title: "Provider profiles",
       accountOne: "1 account",
+      account: "Account {number}",
+      details: "Details",
       accounts: "{count} accounts",
       reorderHint: "Drag to set your preferred account order.",
       reorder: "Reorder {account}, position {position}",
@@ -349,7 +394,6 @@ const enSettings = {
       placeholder: "Enter provider API key",
       replacePlaceholder: "Secret saved. Enter a new key to replace it.",
       set: "Set API key",
-      replace: "Replace key",
       remove: "Remove key",
       saved: "Secret saved.",
       removed: "Saved API keys removed.",
@@ -412,6 +456,7 @@ const enSettings = {
       utilityHelpAutomatic:
         "Automatic uses the primary model provider's recommended small model when available. Generated titles otherwise use the primary model.",
       automatic: "Automatic (provider default)",
+      automaticUnavailable: "No recommended small model",
       disabled: "Disabled",
       fallback: "Fallback Model",
       noFallback: "No fallback model",
@@ -430,7 +475,6 @@ const enSettings = {
         "Sets the global default for new sessions. Auto starts in fast mode and returns to standard mode after the model's configured interval; On and Off keep that behavior fixed.",
       fastModeDefaultHelp:
         "Uses the selected model's fast-mode policy. Unlike Auto, Default does not enable fast mode by itself.",
-      saved: "Defaults saved.",
     },
     readOnly: {
       disconnected: "Connect to the gateway to change model settings.",
@@ -495,6 +539,9 @@ const enSettings = {
       gitFetchFailed: "Could not fetch the tracked upstream",
       gitNoUpstream: "No tracked upstream is configured",
       gitComparisonFailed: "Could not compare this checkout with its tracked upstream",
+      checking: "Checking for updates…",
+      checkRequired: "Check for updates successfully before starting an update.",
+      updating: "Updating…",
       updateNow: "Update now",
       updateNowDescription: "Install the available update and restart the Gateway.",
       latestAttempt: "Latest update attempt",
@@ -536,6 +583,9 @@ const enSettings = {
       permissionsIntro: "macOS access for notifications, capture, voice, and device context.",
       permissionsIntroIos: "Device access for notifications, capture, voice, and personal data.",
       app: "App",
+      nativeExperience: "Native experience (Experimental)",
+      nativeExperienceHint:
+        "Use native Mac views for chat and navigation. When off, use the Web experience. Settings always open here.",
       appearance: "Appearance",
       appearanceModes: { system: "System", light: "Light", dark: "Dark" },
       notificationsEnabled: "Notifications",
@@ -578,6 +628,15 @@ const enSettings = {
       computerControlHint:
         "Starts enabled. After this Mac is paired and macOS access is granted, the paired Gateway can move the pointer, click, and type without per-action confirmation. High risk.",
       computerControlProvider: "Computer Control provider",
+      unattendedDesktop: "Unattended desktop hosting",
+      unattendedDesktopHint:
+        "Keep this Mac awake between jobs while it is connected and hosting. Manual lock and logout are still respected; OpenClaw never unlocks the Mac.",
+      desktopAvailability: "Desktop availability",
+      desktopStates: {
+        locked: "Locked",
+        unlocked: "Unlocked",
+        unknown: "Unknown",
+      },
       peekaboo: "Peekaboo",
       cua: "CUA",
       cuaUnavailable: "CUA (driver not bundled)",
@@ -948,7 +1007,22 @@ const enSettings = {
         "Enter a CSS width such as 960px, 82%, min(1280px, 82%), or calc(100% - 2rem).",
       collapseTaskProgress: "Collapse task progress by default",
       collapseTaskProgressHint:
-        "Keep task progress collapsed while work is active, then expand it when the response finishes.",
+        "Start task progress collapsed. It can expand when the response finishes if you are at the end of the chat. A manual close keeps it collapsed for that session.",
+    },
+    sessionSources: {
+      title: "Session sources",
+      hint: "Choose which coding apps show their existing conversations in the sidebar.",
+      scope: "Applies to everyone on this Gateway. Changes require a Gateway restart.",
+      claude: "Show Claude Code sessions",
+      codex: "Show Codex sessions",
+      opencode: "Show OpenCode sessions",
+      pi: "Show Pi sessions",
+      sourceHint:
+        "Discover conversations on this Gateway and eligible paired computers. Requires the {plugin} plugin to be enabled.",
+      empty: "No supported session source plugins are installed. Add one in Manage plugins.",
+      unavailable:
+        "Session source settings are unavailable. Reconnect or reload Settings to try again.",
+      managePlugins: "Manage plugins",
     },
     sidebarPrefs: {
       title: "Sidebar",
@@ -958,6 +1032,45 @@ const enSettings = {
       deleteConfirm: "Confirm before deleting sessions",
       deleteConfirmHint:
         "Applies to sidebar deletes. Stopping cloud workers and removing preserved worktrees always ask.",
+    },
+    sessionStorage: {
+      title: "Session storage",
+      description: "Transcript counts and disk usage across this Gateway's agent databases.",
+      transcripts: "Transcripts",
+      transcriptCounts: "{hot} uncompressed · {cold} archived",
+      database: "Databases",
+      walSize: "Write-ahead logs: {size}",
+      archives: "Archive files",
+      embeddedArchives: "Compressed archives in database",
+      embeddedArchivesHint: "Included in the database size above.",
+      refreshAfterError: "Refresh to check the current maintenance state.",
+      byAgent: "Details by agent",
+      agentCounts:
+        "{hot} uncompressed · {cold} archived · Database {database} · WAL {wal} · Archive files {archives} · Compressed in database {embedded}",
+      worker: "Background maintenance",
+      completed: "Last completed {time} · {count} transcripts archived",
+      notRun: "No completed maintenance run in this Gateway process.",
+      running: "Running",
+      runningProgress: "{archived} transcripts archived · {externalized} archives moved to files",
+      externalized: "{count} compressed archives moved from the database to files.",
+      idle: "Idle",
+      failed: "Needs attention",
+      adminRequired: "Administrator access is required to inspect session storage.",
+      disconnected: "Connect to the Gateway to inspect session storage.",
+      automatic: "Automatic archival",
+      enabled: "Archive older transcripts",
+      enabledHint:
+        "Workers move inactive transcripts into compressed JSONL files. Running sessions stay in the database; archived history is restored before use.",
+      afterDays: "Archive after (days)",
+      afterDaysHint:
+        "Days since the transcript last changed. Changes apply without a Gateway restart.",
+      backupHint:
+        "OpenClaw backups capture archived history with the database. Direct database copies also need the archive files. Missing or damaged archives require recovery from a backup.",
+      advanced: "Advanced session settings",
+      runNow: "Run now",
+      runHint: "Run one background batch using the saved, applied policy.",
+      runStarted: "Background batch started. You can leave this page while it runs.",
+      runCompleted: "Batch completed. {count} transcripts archived.",
     },
     sessionObserver: {
       title: "Session observer",
@@ -984,10 +1097,234 @@ const enSettings = {
       assistant: "Assistant",
     },
   },
+  memoryPage: {
+    intro: "Choose how OpenClaw stores, searches, and maintains agent memory.",
+    tablistLabel: "Memory sections",
+    tabs: {
+      overview: "Overview",
+      memories: "Memories",
+      dreams: "Dreams",
+      settings: "Settings",
+    },
+    overview: {
+      hero: {
+        awake: "Memory is awake",
+        waking: "Waking memory…",
+        hibernating: "Memory is hibernating",
+        needsAttention: "Memory needs attention",
+        activeDescription: "{engine} · {mode}",
+        loadingDescription: "Checking this agent's memory engine and dream cycle.",
+        offDescription: "Choose a memory engine in Settings to wake it up.",
+        disabledDescription: "The selected memory engine is disabled. Re-enable it in Settings.",
+        gatewayOffline: "The gateway is offline, so memory status is unavailable.",
+        hybridSearch: "hybrid search",
+        keywordSearch: "keyword search (no embeddings)",
+        openSettings: "Open Settings",
+        retry: "Retry",
+        refresh: "Refresh status",
+      },
+      schedule: {
+        title: "Sleep schedule",
+        lightDescription:
+          "Sorts fresh short-term notes and stages promising candidates without changing long-term memory.",
+        remDescription:
+          "Reflects on themes and recurring ideas across recent activity to strengthen ranking without changing long-term memory.",
+        deepDescription:
+          "Scores staged candidates, promotes the keepers into long-term memory (MEMORY.md), and writes the dream diary.",
+        nextRun: "next {time}",
+        lastRun: "last {time}",
+        notScheduled: "Not scheduled",
+        learnMore: "How dreaming works",
+        openDocs: "Open dreaming guide",
+      },
+      activity: {
+        title: "Activity",
+        promotedToday: "Promoted today",
+        promotedTotal: "Promoted total",
+        shortTermCount: "Pending short-term entries",
+        phaseHitCount: "Phase signals",
+        lightPhaseHitCount: "Light-phase hits",
+        remPhaseHitCount: "REM-phase hits",
+      },
+      health: {
+        title: "Engine health",
+        provider: "Provider",
+        embeddings: "Embeddings",
+        runtime: "Embedding runtime",
+        healthy: "Ready",
+        unavailable: "Unavailable",
+        notChecked: "Not checked",
+        notCheckedDescription: "Embedding readiness has not been checked yet.",
+        checking: "Checking…",
+        test: "Test",
+        testing: "Testing…",
+      },
+      shortcuts: {
+        title: "Explore memory",
+        memories: "Search memories",
+        diary: "Read the dream diary",
+        settings: "Configure memory",
+      },
+    },
+    memories: {
+      searchLabel: "Search memories",
+      searchPlaceholder: "Search this agent's memories",
+      searchButton: "Search",
+      idle: "Search for a person, project, decision, or anything else this agent remembers.",
+      searching: "Searching memories…",
+      results: "{count} results",
+      empty: "No memories matched “{query}”.",
+      error: "Memory search failed: {message}",
+      retry: "Retry",
+      gatewayUpdateRequired: "Update the gateway to search memories from the Control UI.",
+      hybridSearch: "hybrid search",
+      keywordSearch: "keyword search",
+      lineRange: "lines {start}–{end}",
+      score: "score {score}",
+      sourceMemory: "memory",
+      sourceSessions: "sessions",
+      fileLoading: "Loading the full memory file…",
+      fileError: "Could not load this memory file: {message}",
+      fileUnsupported: "This memory file cannot be shown as text.",
+    },
+    engine: {
+      title: "Engine",
+      description:
+        "Exactly one memory plugin owns the memory slot. Selecting an engine enables it and disables the others.",
+      rowTitle: "Memory engine",
+      openClawMemory: "OpenClaw Memory",
+      off: "Off",
+      unavailable: "Unavailable",
+      autoHint: "No engine is pinned in config, so the slot falls back to its default owner.",
+      explicitHint: "This engine is pinned in config under plugins.slots.memory.",
+      offHint: "Memory is switched off in config: plugins.slots.memory is set to none.",
+      catalogUnavailable: "Connect to the gateway to change the memory engine.",
+      changeFailed: "Could not change the memory engine",
+      disabledTitle: "This engine is disabled",
+      disabledHint:
+        "The memory slot points at this plugin, but the plugin itself is disabled, so memory is not running.",
+      enable: "Enable",
+    },
+    addons: {
+      title: "Add-ons",
+      description:
+        "These plugins layer on top of the engine instead of competing for the slot, so any combination can run at once.",
+      activeMemory: {
+        title: "Active memory",
+      },
+      memoryWiki: {
+        title: "Memory wiki",
+      },
+      toggleAriaLabel: "Enable or disable {plugin}",
+      changeFailed: "Could not update {plugin}",
+      stateUnknown: "Unknown",
+      manage: "Enable or disable add-ons",
+      manageLink: "Open Plugins",
+    },
+    import: {
+      title: "Import",
+      description: "Bring existing memory from other assistants into an agent workspace.",
+      link: "Open Memory Import",
+    },
+    search: {
+      intro: "Embedding and retrieval defaults shared by every agent that has no memory override.",
+    },
+    dreaming: {
+      intro:
+        "Dreaming runs as one managed automation across every agent workspace, so these settings are global. They are owned by the {plugin} plugin.",
+      schedule: {
+        title: "Schedule",
+        description: "When the full sweep runs and which model narrates it.",
+      },
+      frequency: {
+        label: "Dreaming frequency",
+        help: "Cron cadence for the full dreaming sweep (light, REM, then deep). Leave empty for the plugin default.",
+        placeholder: "0 3 * * *",
+      },
+      timezone: {
+        label: "Timezone",
+        help: "IANA timezone used to interpret the cron cadence.",
+        placeholder: "Europe/Vienna",
+        default: "Gateway local timezone",
+      },
+      model: {
+        label: "Dreaming model",
+        help: "Provider/model override for dream diary narration. Requires subagent model overrides to be allowed.",
+        placeholder: "anthropic/claude-sonnet-4-6",
+        default: "Agent model",
+      },
+      verboseLogging: {
+        label: "Verbose logging",
+        help: "Log each dreaming phase in detail. Useful when tuning thresholds.",
+      },
+      storage: {
+        title: "Storage",
+        description: "Where promoted memories and dreaming reports are written.",
+        modeLabel: "Storage mode",
+        modeHelp: "Inline writes into the memory file; separate keeps a dedicated report file.",
+        modes: {
+          inline: "Inline",
+          separate: "Separate",
+          both: "Both",
+        },
+        separateReportsLabel: "Separate reports",
+        separateReportsHelp: "Keep dreaming reports out of the main memory file.",
+      },
+      phases: {
+        light: {
+          title: "Light phase",
+          description: "Cheap recent-activity pass that stages replay candidates.",
+        },
+        deep: {
+          title: "Deep phase",
+          description: "Scored promotion pass that graduates short-term entries into memory.",
+        },
+        rem: {
+          title: "REM phase",
+          description: "Pattern pass that looks for recurring themes across the lookback window.",
+        },
+      },
+      phaseFields: {
+        enabled: "Enabled",
+        enabledHelp: "Run this phase during the sweep.",
+        lookbackDays: "Lookback days",
+        lookbackDaysHelp: "How far back this phase reads. Leave empty for the plugin default.",
+        limit: "Limit",
+        limitHelp: "Maximum entries this phase processes per run.",
+        dedupeSimilarity: "Dedupe similarity",
+        dedupeSimilarityHelp: "Similarity above which two candidates are treated as duplicates.",
+        minScore: "Minimum score",
+        minScoreHelp: "Promotion score an entry must reach.",
+        minRecallCount: "Minimum recalls",
+        minRecallCountHelp: "How often an entry must be recalled before it can be promoted.",
+        minUniqueQueries: "Minimum unique queries",
+        minUniqueQueriesHelp: "How many distinct queries must have surfaced the entry.",
+        recencyHalfLifeDays: "Recency half-life (days)",
+        recencyHalfLifeDaysHelp: "How quickly older recall signals lose weight.",
+        maxAgeDays: "Maximum age (days)",
+        maxAgeDaysHelp: "Ignore short-term entries older than this.",
+        maxPromotedSnippetTokens: "Max promoted snippet tokens",
+        maxPromotedSnippetTokensHelp:
+          "Token budget for each promoted snippet. Provenance stays attached.",
+        minPatternStrength: "Minimum pattern strength",
+        minPatternStrengthHelp: "Strength a recurring pattern must reach to be reported.",
+      },
+      agentScope: {
+        rowTitle: "Agent",
+      },
+      unsupported: {
+        title: "Dreaming settings",
+        rowTitle: "Not available for this engine",
+        description:
+          "The {plugin} plugin owns the memory slot and its config schema has no dreaming section, so these settings cannot be stored. Switch the engine above to edit them.",
+      },
+    },
+  },
 } satisfies TranslationMap;
 
 export const registerSettingsEnglish = Object.assign(
   () => {
+    en.memoryPage = enSettings.memoryPage;
     en.modelProviders = enSettings.modelProviders;
     // Extend the shared objects: eager save/update copy and existing readers survive.
     en.cloudWorkersPage = enSettings.cloudWorkersPage;

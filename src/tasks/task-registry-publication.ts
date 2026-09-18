@@ -1,4 +1,3 @@
-import { isTerminalTaskStatus } from "./task-executor-policy.js";
 import { clearTaskActivity, flushTaskActivity } from "./task-registry-activity.js";
 import {
   cloneTaskRecord,
@@ -6,18 +5,20 @@ import {
   normalizeTaskTimestamps,
 } from "./task-registry-records.js";
 import {
-  addOwnerKeyIndex,
-  addParentFlowIdIndex,
-  addRelatedSessionKeyIndex,
   bumpTaskRegistryRevision,
-  deleteOwnerKeyIndex,
-  deleteParentFlowIdIndex,
-  deleteRelatedSessionKeyIndex,
   emitTaskRegistryObserverEvent,
-  rebuildRunIdIndex,
   tasks,
 } from "./task-registry-state.js";
-import type { TaskRecord } from "./task-registry.types.js";
+import {
+  addOwnerKeyIndex,
+  deleteOwnerKeyIndex,
+  addParentFlowIdIndex,
+  deleteParentFlowIdIndex,
+  addRelatedSessionKeyIndex,
+  deleteRelatedSessionKeyIndex,
+  rebuildRunIdIndex,
+} from "./task-registry.process-state.js";
+import { isTerminalTaskStatus, type TaskRecord } from "./task-registry.types.js";
 
 /** Publishes a record already committed by a cross-owner shared-state transaction. */
 export function publishTaskRecordAfterAtomicStore(

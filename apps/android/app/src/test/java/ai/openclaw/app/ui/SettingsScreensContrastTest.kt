@@ -39,6 +39,7 @@ import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasAnyChild
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -48,6 +49,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.printToString
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.core.os.LocaleListCompat
 import androidx.lifecycle.SavedStateHandle
@@ -361,15 +363,32 @@ class SettingsScreensContrastTest {
         .fetchSemanticsNode()
         .config[SemanticsProperties.ContentDescription]
         .single()
-    disconnectAndReconnectStatusControl(model, showHeader = true)
-    composeRule.onNodeWithContentDescription(readyDescription).assertIsDisplayed()
+    try {
+      disconnectAndReconnectStatusControl(model, showHeader = true)
+      // The session title can resolve after reconnect; the health status is the invariant.
+      composeRule.onNode(chatStatusMatcher(showHeader = true, value = "Ready")).assertIsDisplayed()
 
-    composeRule.runOnIdle {
-      gateway.healthReady = false
-      model.refreshChat()
+      composeRule.runOnIdle {
+        gateway.healthReady = false
+        model.refreshChat()
+      }
+      awaitConnectedHealthFailure(model, showHeader = true)
+      composeRule.onNode(chatStatusMatcher(showHeader = true, value = "Not ready")).assertIsDisplayed()
+    } catch (failure: AssertionError) {
+      runCatching {
+        println("Chat header failure: initialHeader=$readyDescription, connected=${model.gatewayConnectionDisplay.value.isConnected}, health=${model.chatHealthOk.value}")
+        println("Chat header work: historyLoading=${model.chatHistoryLoading.value}, pendingRuns=${model.pendingRunCount.value}, sessionCreating=${model.chatSessionCreating.value}")
+        println("Chat header display: ${app.resources.configuration}, metrics=${app.resources.displayMetrics}")
+      }.onFailure(failure::addSuppressed)
+      for (unmerged in listOf(false, true)) {
+        runCatching {
+          println(
+            composeRule.onAllNodes(isRoot(), useUnmergedTree = unmerged).printToString(maxDepth = Int.MAX_VALUE),
+          )
+        }.onFailure(failure::addSuppressed)
+      }
+      throw failure
     }
-    awaitConnectedHealthFailure(model, showHeader = true)
-    composeRule.onNodeWithContentDescription(readyDescription.removeSuffix(ready) + nativeString("Not ready")).assertIsDisplayed()
   }
 
   private fun chatHealthStatusValue(value: String) = composeRule.onNode(chatStatusMatcher(showHeader = false, value = value))
@@ -658,7 +677,9 @@ class SettingsScreensContrastTest {
     val renderedTogether =
       try {
         gateway.terminal = true
-        composeRule.onNodeWithText("Refresh").performScrollTo().performClick()
+        // Connection bootstrap can refresh concurrently; this test targets publication coherence.
+        // The operational-caption test covers the actual Refresh button.
+        composeRule.runOnIdle { model.refreshExecApprovals() }
         composeRule.waitUntil(10_000) {
           composeRule.onAllNodesWithText("Approval approval-1").fetchSemanticsNodes().isNotEmpty() && noticeReached.count == 0L
         }

@@ -13,7 +13,6 @@ import {
   loadSqliteVecExtension,
   MEMORY_INDEX_VECTOR_TABLE,
   type MemorySessionSyncTarget,
-  type MemoryEntryProvenance,
   type MemorySource,
   type MemorySyncParams,
   type MemorySyncProgressUpdate,
@@ -26,6 +25,7 @@ import {
   type EmbeddingProviderRuntime,
 } from "./embeddings.js";
 import { MemoryManagerDatabaseContext } from "./manager-database-context.js";
+import type { MemoryIndexEntry } from "./manager-index-preparation.js";
 import {
   resolveMemoryPrimaryProviderRequest,
   type MemoryProviderLifecycleState,
@@ -40,11 +40,7 @@ import {
   type MemoryIndexProviderIdentity,
 } from "./manager-reindex-state.js";
 import { MemorySyncOutcomeLedger } from "./manager-sync-outcome.js";
-import {
-  markMemoryVectorRebuildRequired,
-  memoryTableExists,
-  requiresMemoryVectorRebuild,
-} from "./manager-vector-rebuild-state.js";
+import { memoryTableExists, requiresMemoryVectorRebuild } from "./manager-vector-rebuild-state.js";
 import { buildMemorySourceFilter } from "./source-filter.js";
 import type { MemoryWatchSettleQueue } from "./watch-settle.js";
 
@@ -53,20 +49,6 @@ export type MemorySyncProgressState = {
   total: number;
   label?: string;
   report: (update: MemorySyncProgressUpdate) => void;
-};
-
-export type MemoryIndexEntry = {
-  path: string;
-  absPath: string;
-  mtimeMs: number;
-  size: number;
-  hash: string;
-  kind?: "markdown" | "multimodal";
-  content?: string;
-  contentText?: string;
-  lineMap?: number[];
-  lineProvenance?: MemoryEntryProvenance[];
-  sessionId?: string;
 };
 
 export type MemoryIndexWorkItem = {
@@ -97,6 +79,9 @@ const VECTOR_LOAD_TIMEOUT_MS = 30_000;
 const log = createSubsystemLogger("memory");
 
 export abstract class MemoryManagerSyncBase extends MemoryManagerDatabaseContext {
+  protected closing = false;
+  protected activeManagerOperations = 0;
+  protected managerIdleWaiters = new Set<() => void>();
   protected readonly acquireLocalService?: MemoryCoreAcquireLocalService;
   protected abstract readonly cfg: OpenClawConfig;
   protected abstract readonly agentId: string;
@@ -127,7 +112,6 @@ export abstract class MemoryManagerSyncBase extends MemoryManagerDatabaseContext
   protected fallbackReason?: string;
   protected intervalTimer: NodeJS.Timeout | null = null;
   protected memoryWatchPressureStartupTimer: NodeJS.Timeout | null = null;
-  protected closed = false;
   protected dirty = false;
   // A success clears only the failure visible when it started. This keeps a
   // concurrent failure visible even when older or no-op work settles later.
@@ -178,6 +162,25 @@ export abstract class MemoryManagerSyncBase extends MemoryManagerDatabaseContext
     prefixIndexItems?: MemoryIndexWorkItem[];
   }): Promise<MemorySourceSyncPlan>;
 
+  protected async withManagerOperation<T>(run: () => Promise<T>): Promise<T> {
+    if (this.closing || this.closed) {
+      throw new Error("Memory index manager is closed");
+    }
+    this.activeManagerOperations += 1;
+    try {
+      return await this.withPublishedDatabase(run);
+    } finally {
+      this.activeManagerOperations -= 1;
+      if (this.activeManagerOperations === 0) {
+        const waiters = Array.from(this.managerIdleWaiters);
+        this.managerIdleWaiters.clear();
+        for (const resolve of waiters) {
+          resolve();
+        }
+      }
+    }
+  }
+
   protected async indexFiles(items: MemoryIndexWorkItem[]): Promise<void> {
     for (const item of items) {
       await this.indexFile(item.entry, { source: item.source });
@@ -206,6 +209,10 @@ export abstract class MemoryManagerSyncBase extends MemoryManagerDatabaseContext
     this.clearMemoryRetryState();
     this.clearSessionRetryState();
     return snapshot;
+  }
+
+  adoptReindexRetryState(snapshot: MemoryReindexRetryState): void {
+    this.restoreReindexRetryState(snapshot);
   }
 
   protected restoreReindexRetryState(snapshot: MemoryReindexRetryState): void {
@@ -448,8 +455,14 @@ export abstract class MemoryManagerSyncBase extends MemoryManagerDatabaseContext
       return false;
     }
     if (!this.database.vectorReady) {
-      this.database.vectorReady = this.withTimeout(
-        this.loadVectorExtension(),
+      const database = this.database;
+      // The timeout-facing promise may settle first. Private admission retains
+      // the actual setup so late native extension work cannot race writes/close.
+      const setup = database.isShadow
+        ? database.withPrivateAccess(() => this.loadVectorExtension(), { reentrant: true })
+        : this.loadVectorExtension();
+      database.vectorReady = this.withTimeout(
+        setup,
         VECTOR_LOAD_TIMEOUT_MS,
         `sqlite-vec load timed out after ${Math.round(VECTOR_LOAD_TIMEOUT_MS / 1000)}s`,
       );
@@ -468,11 +481,13 @@ export abstract class MemoryManagerSyncBase extends MemoryManagerDatabaseContext
     if (ready && typeof dimensions === "number" && dimensions > 0) {
       // Another process may have published a vectorless index while this
       // connection retained the previous dimensions in memory.
-      const persistedMeta = this.readMeta();
-      if (persistedMeta && persistedMeta.vectorDims !== this.vector.dims) {
-        this.vector.dims = persistedMeta.vectorDims;
-      }
-      this.ensureVectorTable(dimensions);
+      await this.withDatabaseWrite(() => {
+        const persistedMeta = this.readMeta();
+        if (persistedMeta && persistedMeta.vectorDims !== this.vector.dims) {
+          this.vector.dims = persistedMeta.vectorDims;
+        }
+        this.ensureVectorTable(dimensions);
+      });
     }
     return ready;
   }
@@ -506,7 +521,10 @@ export abstract class MemoryManagerSyncBase extends MemoryManagerDatabaseContext
         this.markConfiguredSourcesForFullReindex();
         return false;
       }
-      if (!this.database.readOnly && this.dropLegacyVectorTable()) {
+      if (
+        !this.database.readOnly &&
+        (await this.withDatabaseWrite(() => this.dropLegacyVectorTable()))
+      ) {
         // A broad dirty sync can skip unchanged files whose source hashes were
         // migrated. Force the next sync to republish the derived vector rows.
         this.dirty = true;
@@ -520,31 +538,6 @@ export abstract class MemoryManagerSyncBase extends MemoryManagerDatabaseContext
       log.warn(`sqlite-vec unavailable: ${message}`);
       return false;
     }
-  }
-
-  protected deleteVectorRowsForSource(pathname: string, source: MemorySource): void {
-    if (!memoryTableExists(this.db, VECTOR_TABLE)) {
-      return;
-    }
-    if (!this.vector.enabled || this.vector.available !== true) {
-      this.markVectorRebuildRequired();
-      return;
-    }
-    try {
-      this.db
-        .prepare(
-          `DELETE FROM ${VECTOR_TABLE} WHERE id IN (
-             SELECT id FROM memory_index_chunks WHERE path = ? AND source = ?
-           )`,
-        )
-        .run(pathname, source);
-    } catch {
-      this.markVectorRebuildRequired();
-    }
-  }
-
-  protected markVectorRebuildRequired(): void {
-    markMemoryVectorRebuildRequired(this.db);
   }
 
   private hasVectorRebuildMarker(): boolean {

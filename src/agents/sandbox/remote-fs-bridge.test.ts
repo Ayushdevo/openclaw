@@ -4,9 +4,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
+import { GUEST_FILESYSTEM_CREATE_EXISTS_EXIT_CODE } from "../../infra/guest-filesystem.js";
 import { createSandboxedReadTool, createSandboxedWriteTool } from "../agent-tools.read.js";
+import { createCoreCodingTools } from "../core-coding-tools.js";
 import { resolveSandboxFileMutationQueueKey } from "./file-mutation-identity.js";
-import { SANDBOX_CREATE_EXISTS_EXIT_CODE } from "./fs-bridge-mutation-python.js";
 import { createSandbox } from "./fs-bridge.test-helpers.js";
 import {
   createRemoteShellSandboxFsBridge,
@@ -81,6 +82,101 @@ function createWorkspaceReadBridge(workspaceDir: string) {
 }
 
 describe("remote sandbox fs bridge", () => {
+  it.each([false, true])(
+    "keeps equal-root descriptor and resolver ownership aligned with protected=%s",
+    (protectedRoot) => {
+      const workspaceDir = path.resolve("mapping-workspace");
+      const agentWorkspaceDir = path.resolve("mapping-agent");
+      const resourceRoot = path.resolve("mapping-resource");
+      const bridge = createRemoteShellSandboxFsBridge({
+        sandbox: createSandbox({
+          workspaceDir,
+          agentWorkspaceDir,
+          workspaceAccess: "ro",
+          readOnlyResourceMounts: protectedRoot
+            ? [{ hostPath: resourceRoot, containerPath: "/runtime" }]
+            : [],
+        }),
+        runtime: {
+          remoteWorkspaceDir: "/runtime",
+          remoteAgentWorkspaceDir: "/runtime",
+          runRemoteShellScript: async () => {
+            throw new Error("Path projection must not execute transport");
+          },
+        },
+      });
+      expect(bridge.pathMappings?.filter((mount) => mount.containerRoot === "/runtime")).toEqual([
+        { hostRoot: protectedRoot ? resourceRoot : agentWorkspaceDir, containerRoot: "/runtime" },
+      ]);
+      expect(bridge.resolvePath({ filePath: "/runtime/note.txt" })).toEqual({
+        containerPath: "/runtime/note.txt",
+        relativePath: protectedRoot ? "note.txt" : "/runtime/note.txt",
+      });
+    },
+  );
+
+  // This composition executes the bridge's GNU stat/readlink scripts locally.
+  it.runIf(process.platform === "linux")(
+    "admits the backend's nondefault agent root without a local host path",
+    async () => {
+      await withTempDir("openclaw-remote-mapping-", async (stateDir) => {
+        const root = await fs.realpath(stateDir);
+        const workspaceDir = path.join(root, "local-workspace");
+        const agentWorkspaceDir = path.join(root, "local-agent");
+        const remoteWorkspaceDir = path.join(root, "remote-workspace");
+        const remoteAgentWorkspaceDir = path.join(root, "remote-agent");
+        for (const dir of [
+          workspaceDir,
+          agentWorkspaceDir,
+          remoteWorkspaceDir,
+          remoteAgentWorkspaceDir,
+        ]) {
+          await fs.mkdir(dir);
+        }
+        await fs.writeFile(path.join(remoteAgentWorkspaceDir, "note.txt"), "REMOTE_AGENT_MARKER");
+        const { calls, runtime } = createLocalRemoteRuntime({
+          remoteWorkspaceDir,
+          remoteAgentWorkspaceDir,
+        });
+        const sandbox = createSandbox({
+          workspaceDir,
+          agentWorkspaceDir,
+          workspaceAccess: "ro",
+          containerWorkdir: remoteWorkspaceDir,
+        });
+        const bridge = createRemoteShellSandboxFsBridge({ sandbox, runtime });
+        sandbox.fsBridge = bridge;
+        const tools = createCoreCodingTools({
+          codingRoot: workspaceDir,
+          containmentRoot: workspaceDir,
+          includeBaseCodingTools: true,
+          shellTools: "disabled",
+          workspaceOnly: true,
+          readOnly: false,
+          sandbox,
+          applyPatchEnabled: false,
+          applyPatchWorkspaceOnly: true,
+          execDefaults: {},
+          processDefaults: {},
+        });
+        const target = path.join(remoteAgentWorkspaceDir, "note.txt");
+        expect(bridge.resolvePath({ filePath: target }).hostPath).toBeUndefined();
+        const read = tools.find((tool) => tool.name === "read")!;
+        expect(
+          JSON.stringify((await read.execute("read-agent", { path: target })).content),
+        ).toContain("REMOTE_AGENT_MARKER");
+        const before = calls.length;
+        await expect(
+          tools
+            .find((tool) => tool.name === "ls")!
+            .execute("deny-agent", { path: remoteAgentWorkspaceDir }),
+        ).rejects.toThrow("Path escapes sandbox root");
+        expect(calls).toHaveLength(before);
+        expect(await fs.readFile(target, "utf8")).toBe("REMOTE_AGENT_MARKER");
+      });
+    },
+  );
+
   it.runIf(process.platform !== "win32").each([
     { workspaceAccess: "rw", mutation: "write" },
     { workspaceAccess: "none", mutation: "write" },
@@ -169,7 +265,7 @@ describe("remote sandbox fs bridge", () => {
       remoteAgentWorkspaceDir: "/workspace",
       spawn: () => ({
         error: pipeError,
-        status: SANDBOX_CREATE_EXISTS_EXIT_CODE,
+        status: GUEST_FILESYSTEM_CREATE_EXISTS_EXIT_CODE,
         signal: null,
         stdout: Buffer.alloc(0),
         stderr: Buffer.alloc(0),
@@ -183,7 +279,7 @@ describe("remote sandbox fs bridge", () => {
         stdin: Buffer.alloc(1_048_576),
         allowFailure: true,
       }),
-    ).resolves.toMatchObject({ code: SANDBOX_CREATE_EXISTS_EXIT_CODE });
+    ).resolves.toMatchObject({ code: GUEST_FILESYSTEM_CREATE_EXISTS_EXIT_CODE });
   });
 
   it.each([
@@ -205,7 +301,7 @@ describe("remote sandbox fs bridge", () => {
     {
       name: "a different exit status",
       command: {},
-      result: { status: SANDBOX_CREATE_EXISTS_EXIT_CODE + 1 },
+      result: { status: GUEST_FILESYSTEM_CREATE_EXISTS_EXIT_CODE + 1 },
     },
     {
       name: "a signaled child",
@@ -223,7 +319,8 @@ describe("remote sandbox fs bridge", () => {
     });
     const spawnResult: LocalRemoteShellSpawnResult = {
       error: spawnError,
-      status: result.status === undefined ? SANDBOX_CREATE_EXISTS_EXIT_CODE : result.status,
+      status:
+        result.status === undefined ? GUEST_FILESYSTEM_CREATE_EXISTS_EXIT_CODE : result.status,
       signal: result.signal === undefined ? null : result.signal,
       stdout: Buffer.alloc(0),
       stderr: Buffer.alloc(0),

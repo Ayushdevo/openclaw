@@ -51,6 +51,10 @@ then replaces the previous app. `scripts/restart-mac.sh` uses
 the same path; `SKIP_TSC=1` does not bypass the runtime build. Existing
 content-checked build caches still avoid unnecessary declaration work.
 
+Set `OPENCLAW_NODE_VERSION=<version>` when packaging to select a supported Node
+version for every private worker. If unset or empty, the CLI installer's default
+applies. Packaging installs and verifies the complete worker with that runtime.
+
 Each worker keeps native binaries that support its architecture and omits
 incompatible macOS, Linux, and Windows prebuilds. This prevents unused Intel-only
 dependencies from triggering macOS compatibility warnings in Apple silicon
@@ -127,8 +131,8 @@ Each invocation selects private `HOME` and `CFFIXED_USER_HOME`,
 bundle loads. Tools honoring `TMPDIR` use that launcher-owned directory;
 Foundation uses Darwin's per-user temp directory, owned and discarded by the
 disposable OS worker. The full suite explicitly selects the default profile, preserving
-its local Gateway lifecycle contracts. AppState isolation tests run separately
-with a unique named profile; no test is run twice. The child environment excludes
+its local Gateway lifecycle contracts. AppState lifecycle tests and the interactive
+XCTest chat fixture run separately with a unique named profile; no test is run twice. The child environment excludes
 inherited app settings and credentials while retaining toolchain and runtime
 loader paths. Before Swift starts, the launcher creates an empty-password test
 Keychain under its private `HOME/Library/Keychains`, unlocks it, disables automatic
@@ -152,7 +156,7 @@ test build:
 ```bash
 node scripts/test-macos-native.mts named \
   --package-path apps/macos --build-system native --enable-code-coverage \
-  --skip-build --filter AppStateIsolationTests
+  --skip-build --filter "AppStateIsolationTests|ProfileChatPreferencesTests"
 ```
 
 The ordinary CI invocation bounds Swift Testing parallelism to the runner's logical

@@ -7,7 +7,10 @@ import type { AgentRuntimeIdentity } from "../agent-runtime-identity-token.js";
 import type { AuthenticatedGitHubIdentitySync } from "../github-user-identity.js";
 import type { GatewayOperatorRoleActor } from "../operator-role-actor.js";
 import type { PluginNodeCapabilitySurface } from "../plugin-node-capability.js";
-import type { GatewayWsBrowserOrigin } from "../server/ws-types.js";
+import type {
+  GatewayWsBrowserOrigin,
+  PreparedSessionProfile,
+} from "../server/client-identity-types.js";
 import type { TrustedSessionCreation } from "./session-creation-provenance.js";
 
 /** Trusted in-process spawn control plane that already owns this run's task row.
@@ -19,6 +22,8 @@ export type GatewayAgentRunTaskOwner = "plugin_subagent" | "native_subagent";
 export type TrustedAgentToolCaller = Readonly<{
   agentId: string;
   sessionKey: string;
+  /** Exact admitted requester lifetime; identity alone does not establish live authority. */
+  assertCurrent?: () => void;
 }>;
 
 /** Closure-bound streaming hooks attached only to trusted plugin-owned synthetic clients. */
@@ -47,6 +52,8 @@ export type GatewayClient = {
   /** Verified Tailscale provider identity; generic proxy identities must not infer this. */
   authenticatedUserIsTailscaleProvider?: boolean;
   authenticatedGitHubIdentitySync?: AuthenticatedGitHubIdentitySync;
+  /** Prepared at identity admission and profile publication, before session reads or events. */
+  preparedSessionProfile?: PreparedSessionProfile;
   authenticatedUserProfile?: {
     profileId: string;
     displayName: string | null;
@@ -61,6 +68,8 @@ export type GatewayClient = {
   internal?: {
     /** Handshake-attested direct-local transport; never accepted from wire params. */
     isLocalClient?: true;
+    /** Authenticated Control UI operator ingress; never accepted from wire params. */
+    authenticatedControlUi?: true;
     /** Authenticated Control UI admin admission; never accepted from wire params. */
     controlUiAdmin?: true;
     /** Marks the server-constructed client used by trusted in-process dispatch. */

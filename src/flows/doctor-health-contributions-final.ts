@@ -373,21 +373,26 @@ export function resolveFinalDoctorHealthContributions(params: {
         async detect(ctx) {
           const { collectWhatsappResponsivenessHealthFindings } =
             await import("../commands/doctor-whatsapp-responsiveness.js");
-          let status: import("../status/types.js").StatusSummary | undefined;
+          const { bindAgentToolGatewayRequest } =
+            await import("../agents/tools/in-process-gateway.js");
+          const requestGateway = bindAgentToolGatewayRequest({ hostedOnly: true });
+          let status: import("../status/summary.js").StatusSummary | undefined;
           if (
             !(
               (await hasActiveGatewayExecCredential({ cfg: ctx.cfg })) &&
               ctx.allowExecSecretRefs !== true
             )
           ) {
-            const { callGateway } = await import("../gateway/call.js");
-            status = await callGateway<import("../status/types.js").StatusSummary>({
+            const request = {
               method: "status",
               params: { includeChannelSummary: false },
               timeoutMs: 3000,
               config: ctx.cfg,
               deviceIdentity: null,
-            }).catch(() => undefined);
+            };
+            status = await requestGateway<import("../status/summary.js").StatusSummary>(
+              request,
+            ).catch(() => undefined);
           }
           return collectWhatsappResponsivenessHealthFindings({ cfg: ctx.cfg, status });
         },

@@ -55,6 +55,8 @@ default account. A blank value is rejected instead of falling back to the defaul
 the dead-letter commands, so an unset shell variable cannot silently select an account you
 did not name.
 
+With `--json`, every channel entry includes `label` alongside its accounts, install state, and origin. Entries also include `docsPath` when verified official channel metadata provides a validated root-relative docs path. Automation can join this path with `https://docs.openclaw.ai` without trusting plugin-supplied URLs. Untracked or inconsistent installed-plugin provenance omits `docsPath`; repair verified legacy provenance with `openclaw doctor --fix` or reinstall the official package.
+
 ## Status / capabilities / resolve / logs
 
 `capabilities` and `resolve` reject explicitly empty or whitespace-only `--account`
@@ -226,6 +228,8 @@ Use the same `accountId` in both calls. Omit it from both to select the default 
 `channels.stop` returns `{ channel, accountId, stopped }`; `channels.start` returns `{ channel, accountId, started, outcome }`. These booleans reflect the account's runtime snapshot after the operation: `started` is true only when `running` is true, and `stopped` is true when `running` is not true. A `started: false` response does not by itself establish that the account is stopped, and `started: true` does not establish that the provider connection is healthy. Check channel status and logs after recovery.
 
 An explicitly started account appears in runtime status while the Gateway owns its lifecycle, even if the plugin's static account list does not yet include it. After a successful stop, that unlisted account disappears from status. Default-account selection and automatic health-monitor and host-thaw recovery continue to use the plugin's static account list.
+
+Host-thaw recovery detects maintenance gaps at least 45 seconds beyond the normal cadence. If process CPU time consumed at least half of the gap, the Gateway logs event-loop load and skips thaw recovery, preserving event-loop health measurements. Otherwise, it refreshes health and presence and attempts channel recovery when tracked work is idle. Busy checks leave work admission open. Channel restart retries expire ten minutes after thaw detection, including time spent waiting for admission to reopen; deferral and abandonment are each logged once per thaw. Ordinary channel health monitoring continues after this window expires.
 
 `outcome` explains the lifecycle owner's decision for the requested account:
 

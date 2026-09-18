@@ -128,6 +128,7 @@
       }
     },
     "install": {
+      "clawhubSpec": "clawhub:@openclaw/nextcloud-talk",
       "npmSpec": "@openclaw/nextcloud-talk",
       "defaultChoice": "npm",
       "minHostVersion": ">=2026.4.10"
@@ -144,6 +145,6 @@
     }
   },
   "dependencies": {
-    "zod": "4.4.3"
+    "zod": "4.5.4"
   }
 }

@@ -11,7 +11,8 @@ import { resolveSessionStorePathCore } from "../../../config/sessions.js";
 import { loadSessionEntryReadOnly as loadSessionEntry } from "../../../config/sessions/session-accessor.js";
 import { resolvePersistedSessionStoreOwnerForKey } from "../../../config/sessions/session-store-owner.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
-import { callGateway } from "../../../gateway/call.js";
+import type { callGateway } from "../../../gateway/call.js";
+import { bindGatewayLifecycleRequest } from "../../../gateway/server-recovery-runtime-context.js";
 import { resolveExternalBestEffortDeliveryTarget } from "../../../infra/outbound/best-effort-delivery.js";
 import { createBoundDeliveryRouter } from "../../../infra/outbound/bound-delivery-router.js";
 import { resolveConversationIdFromTargets } from "../../../infra/outbound/conversation-id.js";
@@ -28,6 +29,7 @@ import {
   formatEmbeddedAgentQueueFailureSummary,
   isEmbeddedAgentRunActive,
   queueEmbeddedAgentMessageWithOutcomeAsync,
+  queueGuardedEmbeddedAgentMessageWithOutcomeAsync,
   resolveEmbeddedRunAbandonment,
   type EmbeddedAgentQueueMessageOutcome,
 } from "../../embedded-agent-runner/runs.js";
@@ -66,6 +68,7 @@ export type SubagentAnnounceDeliveryDeps = {
     text: string,
     options?: EmbeddedAgentQueueMessageOptions,
   ) => EmbeddedAgentQueueMessageOutcome | Promise<EmbeddedAgentQueueMessageOutcome>;
+  queueGuardedEmbeddedAgentMessageWithOutcome: typeof queueGuardedEmbeddedAgentMessageWithOutcomeAsync;
   sendMessage: typeof sendMessage;
 };
 
@@ -133,7 +136,7 @@ function loadDefaultRequesterSessionEntry(
 }
 
 const defaultSubagentAnnounceDeliveryDeps: SubagentAnnounceDeliveryDeps = {
-  callGateway: ((...args) => callGateway(...args)) as typeof callGateway,
+  callGateway: (request) => bindGatewayLifecycleRequest()(request),
   dispatchGatewayMethodInProcess: ((...args) =>
     dispatchGatewayMethodInProcess(...args)) as typeof dispatchGatewayMethodInProcess,
   getRuntimeConfig: () => getRuntimeConfig(),
@@ -166,6 +169,8 @@ const defaultSubagentAnnounceDeliveryDeps: SubagentAnnounceDeliveryDeps = {
   loadRequesterSessionEntry: loadDefaultRequesterSessionEntry,
   queueEmbeddedAgentMessageWithOutcome: (...args) =>
     queueEmbeddedAgentMessageWithOutcomeAsync(...args),
+  queueGuardedEmbeddedAgentMessageWithOutcome: (...args) =>
+    queueGuardedEmbeddedAgentMessageWithOutcomeAsync(...args),
   sendMessage: (...args) => sendMessage(...args),
 };
 
@@ -251,7 +256,16 @@ export async function queueSubagentAnnounceMessage(
   sessionId: string,
   text: string,
   options?: EmbeddedAgentQueueMessageOptions,
+  canInject?: () => boolean,
 ): Promise<EmbeddedAgentQueueMessageOutcome> {
+  if (canInject) {
+    return await subagentAnnounceDeliveryDeps.queueGuardedEmbeddedAgentMessageWithOutcome(
+      sessionId,
+      text,
+      options,
+      canInject,
+    );
+  }
   return await subagentAnnounceDeliveryDeps.queueEmbeddedAgentMessageWithOutcome(
     sessionId,
     text,

@@ -2,16 +2,13 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
-import * as gatewayService from "../../daemon/service.js";
-import * as systemdExec from "../../daemon/systemd-exec.js";
-import {
-  readSystemdServiceExecStart,
-  resolveSystemdUnitPath,
-} from "../../daemon/systemd-service-files.js";
+import { cronOwnerHardeningEntrypoints } from "../../cron/owner-hardening-runtime.test-support.js";
+import { resolvePathViaExistingAncestorSync } from "../../infra/boundary-path.js";
+import { resolveRuntimeWorkerUrl } from "../../infra/runtime-worker-url.js";
+import { triageTestRuntimeEntrypoints } from "../../infra/triage-runtime.test-support.js";
 import { UPDATE_RUN_ID_ENV } from "../../infra/update-control-plane-sentinel.js";
 import { createRetainedUpdateRecovery } from "../../infra/update-retained-recovery.test-support.js";
 import * as updateRunLedger from "../../infra/update-run-ledger.js";
@@ -23,7 +20,10 @@ import {
 import { renderUpdateRunReport } from "../../infra/update-run-report.js";
 import { defaultRuntime } from "../../runtime.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
+import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
 import { createUpdateProgress } from "./progress.js";
+import { captureTargetDatabaseSchemaContext } from "./schema-preflight.js";
+import { updateExecutorNativeEntrypoints } from "./update-command-executor-native-runtime.test-support.js";
 import {
   admitUpdateCommandRun,
   completeUpdateCommandRun,
@@ -33,6 +33,12 @@ import {
 } from "./update-command-run.js";
 import * as servicePlan from "./update-command-service-plan.js";
 import { publishUpdateCommandTerminalResult } from "./update-command-terminal.js";
+
+const sourceImportArgs = resolveRuntimeWorkerUrl(
+  updateExecutorNativeEntrypoints.commandRun,
+).pathname.endsWith(".ts")
+  ? ["--import", path.resolve("scripts/tsx.mjs")]
+  : [];
 
 const dirs = useAutoCleanupTempDirTracker(afterEach);
 it.each([
@@ -231,6 +237,58 @@ it("presents committed steps without reopening the ledger for display", () => {
     }
   }
 });
+it.each(["state", "config", "include", "environment"])(
+  "refuses changed %s ownership after target initialization before writing update history",
+  async (changed) => {
+    const root = dirs.make("update-initialization-admission-");
+    const stateDir = path.join(root, "profile");
+    const configPath = path.join(root, "openclaw.json");
+    const includePath = path.join(root, "gateway.json");
+    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+    vi.stubEnv("OPENCLAW_CONFIG_PATH", configPath);
+    vi.stubEnv("FIXTURE_WORKSPACE_DIR", path.join(root, "workspace"));
+    vi.stubEnv("OPENCLAW_UPDATE_RUN_ID", undefined);
+    vi.spyOn(servicePlan, "isGatewayServiceManagementAllowedForUpdate").mockReturnValue(false);
+    fs.writeFileSync(includePath, JSON.stringify({ gateway: { mode: "local" } }));
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({
+        $include: "./gateway.json",
+        agents: { defaults: { workspace: "${FIXTURE_WORKSPACE_DIR}" } },
+      }),
+    );
+    const env = { ...process.env };
+    const context = await captureTargetDatabaseSchemaContext(env);
+    const databasePath = resolveOpenClawStateSqlitePath(env);
+    const initialization = {
+      env,
+      runId: randomUUID(),
+      databasePath: resolvePathViaExistingAncestorSync(databasePath),
+      configPath: resolvePathViaExistingAncestorSync(configPath),
+      target: { configSnapshot: context.configSnapshot },
+    };
+    if (changed === "state") {
+      vi.stubEnv("OPENCLAW_STATE_DIR", path.join(root, "replacement-profile"));
+    } else if (changed === "config") {
+      vi.stubEnv("OPENCLAW_CONFIG_PATH", path.join(root, "replacement.json"));
+    } else if (changed === "include") {
+      fs.writeFileSync(includePath, JSON.stringify({ gateway: { mode: "local", port: 19222 } }));
+    } else {
+      vi.stubEnv("FIXTURE_WORKSPACE_DIR", path.join(root, "replacement-workspace"));
+    }
+    const configBefore = fs.readFileSync(configPath);
+    const includeBefore = fs.readFileSync(includePath);
+
+    await expect(
+      admitUpdateCommandRun({ opts: {}, root, initialization }).then(() => "admitted"),
+    ).rejects.toThrow(/changed/);
+
+    expect(fs.existsSync(databasePath)).toBe(false);
+    expect(fs.existsSync(resolveOpenClawStateSqlitePath(process.env))).toBe(false);
+    expect(fs.readFileSync(configPath)).toEqual(configBefore);
+    expect(fs.readFileSync(includePath)).toEqual(includeBefore);
+  },
+);
 
 it.each([false, true])(
   "keeps restored-generation completion with its helper across CLI unwind (handoff=%s)",
@@ -397,11 +455,11 @@ it.skipIf(process.platform === "win32").each([
       caller,
       `
       import fs from 'node:fs';
-      import { registerSignalExitGate } from ${JSON.stringify(new URL("../signal-exit-barrier.ts", import.meta.url).href)};
-      import { createUpdateRun, finishUpdateRun, getUpdateRun, recordUpdateRunPhase } from ${JSON.stringify(new URL("../../infra/update-run-ledger.ts", import.meta.url).href)};
-      import { createRetainedUpdateRecovery } from ${JSON.stringify(new URL("../../infra/update-retained-recovery.test-support.ts", import.meta.url).href)};
-      import { closeOpenClawStateDatabaseForTest } from ${JSON.stringify(new URL("../../state/openclaw-state-db.ts", import.meta.url).href)};
-      import { admitUpdateCommandRun, withUpdatePreviewSignals } from ${JSON.stringify(new URL("./update-command-run.ts", import.meta.url).href)};
+      import { registerSignalExitGate } from ${JSON.stringify(resolveRuntimeWorkerUrl(updateExecutorNativeEntrypoints.signalExitBarrier).href)};
+      import { createUpdateRun, finishUpdateRun, getUpdateRun, recordUpdateRunPhase } from ${JSON.stringify(resolveRuntimeWorkerUrl(triageTestRuntimeEntrypoints.updateRunLedger).href)};
+      import { createRetainedUpdateRecovery } from ${JSON.stringify(resolveRuntimeWorkerUrl(updateExecutorNativeEntrypoints.retainedRecovery).href)};
+      import { closeOpenClawStateDatabaseForTest } from ${JSON.stringify(resolveRuntimeWorkerUrl(cronOwnerHardeningEntrypoints.stateDatabase).href)};
+      import { admitUpdateCommandRun, withUpdatePreviewSignals } from ${JSON.stringify(resolveRuntimeWorkerUrl(updateExecutorNativeEntrypoints.commandRun).href)};
       const opts = { dryRun: true };
       const mode = ${JSON.stringify(mode)};
       if (mode === 'inherited') process.env.OPENCLAW_UPDATE_RUN_ID = createUpdateRun({trigger:'cli'}).runId;
@@ -432,7 +490,7 @@ it.skipIf(process.platform === "win32").each([
       });
     `,
     );
-    const child = spawn(process.execPath, ["--import", "./scripts/tsx.mjs", caller], {
+    const child = spawn(process.execPath, [...sourceImportArgs, caller], {
       cwd: process.cwd(),
       env: {
         ...process.env,
@@ -541,218 +599,3 @@ it.each([false, true])(
     expect([process.listeners("SIGINT"), process.listeners("SIGTERM")]).toEqual(before);
   },
 );
-
-it.each([
-  "owned",
-  "owned-pending",
-  "foreign",
-  "absent",
-  "unloaded-local",
-  "unloaded-global",
-  "denied",
-  "timeout",
-  "malformed",
-  "unresolved-root",
-  "native-rejection",
-  "native-value-rejection",
-  "root-probe-error",
-] as const)("admits only resolved loaded service ownership (%s)", async (scenario) => {
-  const home = dirs.make("update-loaded-admission-");
-  const callerState = path.join(home, ".openclaw-caller");
-  const serviceState = path.join(home, ".openclaw-service");
-  const root = path.join(home, "package");
-  const foreignRoot = path.join(home, "foreign");
-  for (const packageRoot of [root, foreignRoot]) {
-    fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
-    fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ name: "openclaw" }));
-    fs.writeFileSync(path.join(packageRoot, "dist", "entry.js"), "// fixture");
-  }
-  vi.spyOn(os, "userInfo").mockReturnValue({ ...os.userInfo(), homedir: home });
-  for (const key of [
-    "OPENCLAW_HOME",
-    "OPENCLAW_SYSTEMD_UNIT",
-    "OPENCLAW_LAUNCHD_LABEL",
-    "OPENCLAW_WINDOWS_TASK_NAME",
-    "OPENCLAW_SUPERVISOR_MODE",
-    UPDATE_RUN_ID_ENV,
-  ]) {
-    vi.stubEnv(key, undefined);
-  }
-  vi.stubEnv("HOME", home);
-  vi.stubEnv("OPENCLAW_PROFILE", "caller");
-  vi.stubEnv("OPENCLAW_STATE_DIR", callerState);
-  vi.stubEnv("OPENCLAW_CONFIG_PATH", path.join(callerState, "openclaw.json"));
-  const serviceEnv = {
-    ...process.env,
-    OPENCLAW_PROFILE: "service",
-    OPENCLAW_STATE_DIR: serviceState,
-    OPENCLAW_CONFIG_PATH: path.join(serviceState, "openclaw.json"),
-  };
-  let pending: ReturnType<typeof createRetainedUpdateRecovery> | undefined;
-  if (scenario === "owned-pending") {
-    const runId = createUpdateRun({ trigger: "cli" }, { env: serviceEnv }).runId;
-    const from = { root, nodePath: process.execPath, version: "1.0.0", buildId: null };
-    pending = createRetainedUpdateRecovery(
-      { runId, from, to: { ...from, version: "2.0.0" } },
-      { env: serviceEnv },
-    );
-    closeOpenClawStateDatabaseForTest();
-  }
-  const sourcePath = resolveSystemdUnitPath(process.env);
-  if (scenario === "unloaded-local") {
-    fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
-    fs.writeFileSync(
-      sourcePath,
-      `[Service]\nExecStart=${process.execPath} ${root}/dist/entry.js gateway\n`,
-    );
-  }
-  const snapshot = () =>
-    fs
-      .readdirSync(home, { recursive: true })
-      .map(String)
-      .toSorted()
-      .map((name) => {
-        const filename = path.join(home, name);
-        const stat = fs.statSync(filename);
-        return [
-          name,
-          stat.ino,
-          stat.mtimeMs,
-          stat.mode,
-          stat.isFile()
-            ? createHash("sha256").update(fs.readFileSync(filename)).digest("hex")
-            : null,
-        ];
-      });
-  const before = snapshot();
-  const nativeFailure =
-    scenario === "native-value-rejection"
-      ? { detail: "inspection-secret-canary" }
-      : new Error("inspection-secret-canary");
-  const rootFailure = new Error("later ownership resolution failed");
-  if (scenario === "root-probe-error") {
-    vi.spyOn(servicePlan, "gatewayServiceCommandUsesRoot").mockRejectedValue(rootFailure);
-  }
-  const command =
-    scenario === "unresolved-root"
-      ? ["opaque-launcher"]
-      : [
-          process.execPath,
-          path.join(scenario === "foreign" ? foreignRoot : root, "dist", "entry.js"),
-          "gateway",
-        ];
-  const response = (values: { type: string; data: unknown }[]) => ({
-    code: 0,
-    termination: "exit" as const,
-    stderr: "",
-    stdout: values.map((value) => JSON.stringify(value)).join("\n"),
-  });
-  const bus = vi.spyOn(systemdExec, "execBusctlUser").mockImplementation(async (_env, args) => {
-    if (scenario === "denied" || scenario === "timeout") {
-      return {
-        code: 1,
-        termination: scenario === "timeout" ? "timeout" : "exit",
-        stdout: "",
-        stderr: scenario === "timeout" ? "inspection timed out" : "Call failed: Permission denied",
-      };
-    }
-    if (scenario === "malformed") {
-      return { code: 0, termination: "exit", stdout: "not json", stderr: "" };
-    }
-    if (["absent", "unloaded-local", "unloaded-global"].includes(scenario)) {
-      if (args.includes("GetUnitFileState") && scenario === "unloaded-global") {
-        return response([{ type: "s", data: ["disabled"] }]);
-      }
-      const unit = "openclaw-gateway-caller.service";
-      return {
-        code: 1,
-        termination: "exit",
-        stdout: "",
-        stderr: args.includes("GetUnitFileState")
-          ? `Call failed: Unit file ${unit} does not exist.`
-          : `Call failed: Unit ${unit} ${args.includes("GetUnit") ? "not loaded" : "not found"}.`,
-      };
-    }
-    if (args.includes("GetUnit") || args.includes("LoadUnit")) {
-      return response([{ type: "o", data: ["/org/freedesktop/systemd1/unit/gateway"] }]);
-    }
-    if (args.includes("FragmentPath")) {
-      return response([
-        { type: "s", data: sourcePath },
-        { type: "as", data: [] },
-        { type: "b", data: false },
-        { type: "s", data: "loaded" },
-      ]);
-    }
-    return response([
-      { type: "a(sasbttttuii)", data: [[command[0], command, false, 0, 0, 0, 0, 0, 0, 0]] },
-      { type: "s", data: "" },
-      {
-        type: "as",
-        data: Object.entries(serviceEnv)
-          .filter(([key]) =>
-            ["OPENCLAW_PROFILE", "OPENCLAW_STATE_DIR", "OPENCLAW_CONFIG_PATH"].includes(key),
-          )
-          .map(([key, value]) => `${key}=${value}`),
-      },
-      { type: "a(sb)", data: [] },
-      { type: "as", data: [] },
-    ]);
-  });
-  if (scenario === "native-rejection" || scenario === "native-value-rejection") {
-    bus.mockRejectedValue(nativeFailure);
-  }
-  // Use the real manager reader on every platform; only the native bus is simulated.
-  const service = gatewayService.resolveGatewayService();
-  let inspectionFailure: unknown;
-  vi.spyOn(gatewayService, "resolveGatewayService").mockReturnValue({
-    ...service,
-    readCommand: async (...args) => {
-      try {
-        return await readSystemdServiceExecStart(...args);
-      } catch (error) {
-        inspectionFailure = error;
-        throw error;
-      }
-    },
-  });
-  if (scenario === "owned" || scenario === "foreign" || scenario === "absent") {
-    const run = await admitUpdateCommandRun({ opts: {}, root });
-    const expectedState = scenario === "owned" ? serviceState : callerState;
-    expect(run.env.OPENCLAW_STATE_DIR).toBe(expectedState);
-    expect(run.env.OPENCLAW_PROFILE).toBe(scenario === "owned" ? "service" : "caller");
-    expect(getUpdateRun(run.runId, { env: run.env })?.status).toBe("running");
-    expect(
-      fs.existsSync(path.join(scenario === "owned" ? callerState : serviceState, "state")),
-    ).toBe(false);
-  } else {
-    const failure: unknown = await admitUpdateCommandRun({ opts: {}, root }).then(
-      () => "admitted",
-      (error: unknown) => error,
-    );
-    if (scenario === "owned-pending") {
-      expect(failure).toBeInstanceOf(UpdateRecoveryRequiredError);
-    } else if (scenario === "root-probe-error") {
-      expect(failure).toBe(rootFailure);
-    } else {
-      expect(failure).toBeInstanceOf(servicePlan.GatewayServiceUpdateOwnershipError);
-      if (!(failure instanceof servicePlan.GatewayServiceUpdateOwnershipError)) {
-        throw new Error("Expected safe service ownership error");
-      }
-      if (scenario !== "unresolved-root") {
-        expect(failure.message).toContain("openclaw gateway status --deep");
-        expect(failure.cause).toBe(inspectionFailure);
-        expect(Object.getOwnPropertyDescriptor(failure, "cause")?.enumerable).toBe(false);
-      }
-      expect(String(failure)).not.toContain("inspection-secret-canary");
-      expect(JSON.stringify(failure)).not.toContain("inspection-secret-canary");
-      expect(failure.stack).not.toContain("inspection-secret-canary");
-    }
-    expect(snapshot()).toEqual(before);
-    if (pending) {
-      expect(loadUpdateRecovery(pending.runId, { env: serviceEnv })).toEqual(pending);
-    }
-  }
-  expect(bus).toHaveBeenCalled();
-  expect(bus.mock.calls.every(([, args]) => !args.includes("LoadUnit"))).toBe(true);
-});

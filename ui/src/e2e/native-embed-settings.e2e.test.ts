@@ -29,7 +29,6 @@ const routes = [
   "devices",
   "cloud-workers",
   "agents",
-  "labs",
   "model-providers",
   "plugin-settings",
   "skill-settings",
@@ -40,6 +39,7 @@ const routes = [
   "secrets",
   "approvals",
   "infrastructure",
+  "labs",
   "advanced",
   "debug",
   "logs",
@@ -254,8 +254,20 @@ suite.define(() => {
               expect(
                 await page
                   .locator(
-                    ".shell-nav, openclaw-app-topbar, .shell-chrome-controls, resizable-divider, .settings-sidebar__footer, openclaw-macos-titlebar-controls, openclaw-keyboard-shortcuts-dialog",
+                    ".shell-nav, openclaw-app-topbar, .shell-chrome-controls, .settings-sidebar__footer, openclaw-macos-titlebar-controls, openclaw-keyboard-shortcuts-dialog",
                   )
+                  .count(),
+              ).toBe(0);
+              expect(
+                await page
+                  .locator(
+                    "resizable-divider:visible, .assistant-panel:visible, .debug-overlay:visible",
+                  )
+                  .count(),
+              ).toBe(0);
+              expect(
+                await page
+                  .locator("openclaw-assistant-panel-content, openclaw-debug-overlay-content")
                   .count(),
               ).toBe(0);
               if (route === "settings") {

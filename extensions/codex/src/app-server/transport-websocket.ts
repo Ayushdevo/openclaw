@@ -7,7 +7,7 @@ import net from "node:net";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
-import WebSocket, { type RawData } from "ws";
+import { type ClientOptions, type RawData, WebSocket } from "openclaw/plugin-sdk/websocket-runtime";
 import { resolveCodexAppServerUserHomeDir, type CodexAppServerStartOptions } from "./config.js";
 import type { CodexAppServerTransport } from "./transport.js";
 
@@ -32,7 +32,7 @@ export function createWebSocketTransport(
     ...options.headers,
     ...(options.authToken ? { Authorization: `Bearer ${options.authToken}` } : {}),
   };
-  const websocketOptions: WebSocket.ClientOptions = {
+  const websocketOptions: ClientOptions = {
     headers,
     // Codex app-server closes Unix upgrade handshakes that offer compression.
     perMessageDeflate: false,
@@ -51,6 +51,7 @@ export function createWebSocketTransport(
   const stdinDecoder = new StringDecoder("utf8");
   let pendingLine = "";
   let killed = false;
+  let exitCode: number | null = null;
   let pingTimeout: NodeJS.Timeout | undefined;
   let pongTimeout: NodeJS.Timeout | undefined;
   let expectedPong: Buffer | undefined;
@@ -152,6 +153,7 @@ export function createWebSocketTransport(
   socket.once("close", (code, reason) => {
     clearConnectionHealthTimers();
     killed = true;
+    exitCode = code;
     events.emit("exit", code, reason.toString("utf8"));
   });
   socket.on("message", (data) => {
@@ -199,12 +201,20 @@ export function createWebSocketTransport(
     get killed() {
       return killed;
     },
-    kill: () => {
+    get exitCode() {
+      return exitCode;
+    },
+    kill: (signal) => {
       killed = true;
       clearConnectionHealthTimers();
-      socket.close();
+      if (signal === "SIGKILL") {
+        socket.terminate();
+      } else {
+        socket.close();
+      }
     },
     once: (event, listener) => events.once(event, listener),
+    off: (event, listener) => events.off(event, listener),
   };
 }
 

@@ -2,6 +2,7 @@ import { html, nothing } from "lit";
 import type { GatewayAgentRow } from "../../api/types.ts";
 import type { ApplicationContext } from "../../app/context.ts";
 import { t } from "../../i18n/index.ts";
+import { registerNewSessionSetupEnglish } from "../../i18n/locales/en-new-session-setup.ts";
 import { normalizeAgentTargetLabel } from "../../lib/agents/display.ts";
 import type { AgentIdentityCapability } from "../../lib/agents/identity.ts";
 import { canCallGatewayMethod } from "../../lib/gateway-methods.ts";
@@ -13,9 +14,10 @@ import type { DraftPlaceState } from "./draft-place-state.ts";
 import type { NewSessionRouteData } from "./location.ts";
 import "../../components/agent-select-registration.ts";
 import { renderProjectChip, resolveProjectChip } from "./project-chip.ts";
-import { resolveCloudPlacementDisabledReason } from "./submit-gates.ts";
 import { renderNewSessionTerminalHost } from "./terminal-start.ts";
 import { renderWhereChip, resolveWhereChip } from "./where-chip.ts";
+
+registerNewSessionSetupEnglish();
 
 type DraftAgent = GatewayAgentRow;
 
@@ -31,7 +33,7 @@ export function renderAgentSelect(params: {
   return html`
     <span class="new-session-page__select new-session-page__select--agent">
       <openclaw-agent-select
-        class="agent-select--compact"
+        .variant=${"compact"}
         .options=${params.agents.map((agent) => ({
           value: normalizeAgentId(agent.id),
           label: normalizeAgentTargetLabel(agent, params.agentIdentity?.get(agent.id)),
@@ -102,6 +104,7 @@ export function renderNewSessionPlaceControls({
     projects,
     recents,
     projectQuery: browser.projectQuery,
+    freshWorkspace: place.freshWorkspace,
   });
   const checkoutState = resolveCheckoutChip({
     destination: place.remotePlacement ? "remote" : "local",
@@ -133,18 +136,22 @@ export function renderNewSessionPlaceControls({
           deviceId: place.deviceId,
           autoDevice: place.autoDevice,
           autoPlacementMode: place.modelControl.autoPlacementSelectionMode(),
-          worktreeAvailable: place.worktreeAvailable(),
-          cloudDisabledReason: resolveCloudPlacementDisabledReason(place),
+          cloudDisabledReason: place.modelControl.cloudRuntimeUnsupportedReason(),
           cloudProfileDisabledReason: (profile) =>
             place.modelControl.cloudRuntimeUnsupportedReason(profile),
           submitting,
           pendingPlacement,
+          catalogLoading: place.canWrite() && gateway.cloudProfilesPending,
           isAdmin: place.isAdmin(),
           ...browser.popoverCallbacks("where"),
           onSelectDevice: (deviceId) => place.selectDevice(deviceId),
-          onToggleAutoDevice: (enabled) =>
-            place.selectDevice("", enabled, { keepPickerOpen: true }),
-          onSelectCloudProfile: (profileId) => place.selectCloudProfile(profileId),
+          onSelectAutoDevice: () => place.selectDevice("", true),
+          onSelectCloudProfile: (profileId, useDefaults) => {
+            if (useDefaults) {
+              place.cloudMachines.applyPending(profileId);
+            }
+            place.selectCloudProfile(profileId);
+          },
           onSelectCloudOs: (osId) =>
             place.cloudMachines.selectOs(
               place.cloudProfileId,
@@ -162,6 +169,10 @@ export function renderNewSessionPlaceControls({
               requestUpdate,
             ),
           onConnectMachine,
+          onManageCloudWorkers: () => {
+            browser.close();
+            context?.navigate("cloud-workers");
+          },
         })
   }${
     nativeTerminal && place.terminalOnNode
@@ -206,6 +217,8 @@ export function renderNewSessionPlaceControls({
           projectSearchLoading: browser.projectSearchLoading,
           projectSearchError: browser.projectSearchError,
           projectId: browser.projectId,
+          freshWorkspace: place.freshWorkspace,
+          onNewWorkspace: place.remotePlacement ? () => place.selectNewWorkspace() : undefined,
           gatewayLabel,
           submitting,
           pendingPlacement,
@@ -225,7 +238,7 @@ export function renderNewSessionPlaceControls({
           onClose: () => browser.close(),
         })
   }${
-    checkoutState && !(nativeTerminal && place.terminalOnNode)
+    checkoutState && !place.freshWorkspace && !(nativeTerminal && place.terminalOnNode)
       ? renderCheckoutChip({
           state: checkoutState,
           remotePlacement: place.remotePlacement,

@@ -7,11 +7,16 @@ import {
   resolveWindowsSpawnProgramCandidate,
 } from "../../../plugin-sdk/windows-spawn.js";
 import { createDeferredCore } from "../../../shared/deferred.js";
-import { onDecodedOutput } from "../../decoded-output.js";
-import { signalProcessTree } from "../../kill-tree.js";
+import {
+  createAwaitedDecodedOutput,
+  joinProcessCompletionAndOutput,
+  onDecodedOutput,
+} from "../../decoded-output.js";
+import { killProcessTree, signalProcessTree } from "../../kill-tree.js";
 import { prepareOomScoreAdjustedSpawn } from "../../linux-oom-score.js";
 import { pipeProcessOutput } from "../../pipe-output.js";
 import { scheduleAdoptedChildZombieReapAfterExit } from "../../scoped-child-reaper.js";
+import { SpawnBrokerError } from "../../spawn-broker/protocol.js";
 import { prepareSecretInputStdio, type SpawnStdioEntry } from "../../spawn-secret-input.js";
 import { spawnWithFallback } from "../../spawn-utils.js";
 import {
@@ -20,9 +25,12 @@ import {
   resolveTrustedWindowsCmdExe,
   resolveWindowsCommandShim,
 } from "../../windows-command.js";
+import { GRACEFUL_CANCEL_TIMEOUT_MS } from "../cancellation-policy.js";
 import { createServiceChildRelayAdapter } from "../service-child-relay-host.js";
 import type {
+  AwaitedStdoutConsumer,
   ProcessAdapterConstruction,
+  ProcessAdapterStartup,
   SpawnProcessAdapter,
   SpawnSecretInput,
 } from "../types.js";
@@ -83,6 +91,7 @@ type WorkerChildAdapter = ChildAdapter & {
   closeStartGate?: () => void;
   openStartGate?: () => Promise<void>;
 };
+export type AwaitedStdoutChildAdapter = WorkerChildAdapter & AwaitedStdoutConsumer;
 
 const WORKER_START_MESSAGE = { type: "openclaw-worker-start-v1" } as const;
 
@@ -105,14 +114,23 @@ type ChildAdapterInput = ProcessAdapterConstruction & {
   secretInput?: SpawnSecretInput;
   stderrDestination?: Writable;
 } & (
-    | { argv: string[]; anchoredShellCommand?: never }
-    | { argv?: never; anchoredShellCommand: string }
+    | { argv: string[]; anchoredShellCommand?: never; stdoutConsumption?: "awaited" }
+    | { argv?: never; anchoredShellCommand: string; stdoutConsumption?: never }
   );
 
-export async function createChildAdapter(params: ChildAdapterInput): Promise<WorkerChildAdapter> {
+export function createChildAdapter(
+  params: ChildAdapterInput & { stdoutConsumption: "awaited" },
+): Promise<ProcessAdapterStartup<AwaitedStdoutChildAdapter>>;
+export function createChildAdapter(
+  params: ChildAdapterInput,
+): Promise<ProcessAdapterStartup<WorkerChildAdapter>>;
+export async function createChildAdapter(
+  params: ChildAdapterInput,
+): Promise<ProcessAdapterStartup<WorkerChildAdapter>> {
   if (params.anchoredShellCommand !== undefined) {
-    return await createServiceChildRelayAdapter({
+    const startup = await createServiceChildRelayAdapter({
       assertCurrent: params.assertCurrent,
+      beforeSpawn: params.beforeSpawn,
       command: process.platform === "win32" ? params.anchoredShellCommand : "/bin/sh",
       args: process.platform === "win32" ? [] : ["-c", params.anchoredShellCommand],
       windowsShellCommand: process.platform === "win32" ? params.anchoredShellCommand : undefined,
@@ -124,6 +142,7 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
       onSpawnCleanup: params.onSpawnCleanup,
       stderrDestination: params.stderrDestination,
     });
+    return startup;
   }
 
   const baseEnv = params.env ? toStringEnv(params.env) : undefined;
@@ -151,8 +170,9 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
     params.ownedWorker === undefined &&
     (params.ownProcessTree === true || process.env.OPENCLAW_SERVICE_MARKER?.trim())
   ) {
-    return await createServiceChildRelayAdapter({
+    const startup = await createServiceChildRelayAdapter({
       assertCurrent: params.assertCurrent,
+      beforeSpawn: params.beforeSpawn,
       command: preparedSpawn.command,
       args: preparedSpawn.args,
       argv0: preparedSpawn.argv0,
@@ -165,7 +185,9 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
       abortSignal: params.abortSignal,
       onSpawnCleanup: params.onSpawnCleanup,
       stderrDestination: params.stderrDestination,
+      stdoutConsumption: params.stdoutConsumption,
     });
+    return startup;
   }
 
   // A detached POSIX child is still a descendant in the service cgroup/job, but
@@ -196,7 +218,10 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
     }
   };
   const spawned = await spawnWithFallback({
-    assertCurrent,
+    assertCurrent: () => {
+      assertCurrent();
+      params.beforeSpawn?.();
+    },
     argv: [preparedSpawn.command, ...preparedSpawn.args],
     options,
     fallbacks: useDetached && params.ownedWorker === undefined ? [{ detached: false }] : [],
@@ -233,6 +258,14 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
   const childStdin = spawned.child.stdin;
   const stdin = createManagedChildStdin(childStdin);
   const outputUnsubscribers: Array<() => void> = [];
+  const awaitedStdout =
+    params.stdoutConsumption === "awaited"
+      ? createAwaitedDecodedOutput(child.stdout, () => {
+          if (!hardKillRequested) {
+            kill("SIGKILL");
+          }
+        })
+      : undefined;
   if (params.stderrDestination) {
     outputUnsubscribers.push(
       pipeProcessOutput(child.stderr, params.stderrDestination, (error) =>
@@ -241,6 +274,9 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
     );
   }
   const onStdout: ChildAdapter["onStdout"] = (listener, onRaw) => {
+    if (awaitedStdout) {
+      throw new Error("Process stdout requires its awaited consumer");
+    }
     outputUnsubscribers.push(onDecodedOutput(child.stdout, listener, onRaw));
   };
 
@@ -252,12 +288,16 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
   const cleanup = createDeferredCore();
   // Worker errors can precede wait(), including while secret delivery is still pending.
   void completion.promise.catch(() => {});
-  void cleanup.promise.catch(() => {});
   let waitSettled = false;
   let processClosed = false;
   let forceKillWaitFallbackTimer: NodeJS.Timeout | null = null;
   let forcedWindowsCloseTimer: NodeJS.Timeout | null = null;
   let hardKillRequested = false;
+  let treeSignaling: Promise<void> | undefined;
+  const cleanupOutcome = Promise.allSettled([cleanup.promise]).then((outcomes) => {
+    clearForceKillWaitFallback();
+    return outcomes;
+  });
   let windowsTreeKillCompleted = false;
   let childExitState: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   let childCloseState: { code: number | null; signal: NodeJS.Signals | null } | null = null;
@@ -287,32 +327,39 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
       return;
     }
     waitSettled = true;
-    clearForceKillWaitFallback();
     clearForcedWindowsCloseTimer();
     completion.resolve(value);
   };
 
   const settleObservedClose = (value: { code: number | null; signal: NodeJS.Signals | null }) => {
     processClosed = true;
-    cleanup.resolve();
+    // Native close fences new signals; join all already-admitted deliveries before success.
+    if (treeSignaling) {
+      treeSignaling = treeSignaling.then(() => cleanup.resolve(), cleanup.reject);
+    } else {
+      cleanup.resolve();
+    }
     settleWait(value);
   };
 
-  const rejectPendingWait = (error: Error) => {
+  const rejectPendingWait = (error: unknown) => {
     if (waitSettled) {
       return;
     }
     waitSettled = true;
-    clearForceKillWaitFallback();
     clearForcedWindowsCloseTimer();
     completion.reject(error);
   };
 
   const scheduleForceKillWaitFallback = (signal: NodeJS.Signals) => {
-    clearForceKillWaitFallback();
+    // Repeated hard cancellation must not postpone the owner's terminal result.
+    if (forceKillWaitFallbackTimer || waitSettled) {
+      return;
+    }
     // Some Windows child processes never emit `close` after a hard kill.
     forceKillWaitFallbackTimer = setTimeout(() => {
       cleanup.reject(new Error("child cleanup could not be confirmed before the kill deadline"));
+      awaitedStdout?.close();
       settleWait({ code: null, signal });
     }, FORCE_KILL_WAIT_FALLBACK_MS);
     forceKillWaitFallbackTimer.unref?.();
@@ -405,7 +452,7 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
   // Worker IPC failures close authority; ordinary post-spawn errors are nonterminal.
   child.on("error", (error) => {
     events.emitError(error, "process");
-    if (params.ownedWorker) {
+    if (params.ownedWorker || error instanceof SpawnBrokerError) {
       rejectPendingWait(error);
     }
   });
@@ -424,7 +471,12 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
     settleObservedClose(resolveObservedExitState(childCloseState));
   });
 
-  const wait = async () => await completion.promise;
+  const wait = async () => {
+    if (!awaitedStdout) {
+      return await completion.promise;
+    }
+    return await joinProcessCompletionAndOutput(completion.promise, awaitedStdout.drain());
+  };
 
   // The actual detachment of the spawned child can differ from `useDetached`:
   // when the detached spawn fails, `spawnWithFallback` retries with the
@@ -432,17 +484,42 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
   // gateway's process group regardless of intent, so the kill must avoid
   // group-kill. (#71662 follow-up — caught by Greptile review)
   const childIsDetached = useDetached && !spawned.usedFallback;
+  const attachedLinuxFallback = process.platform === "linux" && !childIsDetached;
+  let attachedTerminationStarted = false;
+  let attachedTermination: ReturnType<typeof killProcessTree>;
   const scheduleAdoptedReapForChild = () => {
     // Reap after Node exit/adoption — not at signal time — and never waitpid
     // the tracked root (libuv owns that ChildProcess).
     scheduleAdoptedChildZombieReapAfterExit(child, childIsDetached);
   };
   const signalProcessTreeForChild = (pid: number, signal: "SIGTERM" | "SIGKILL") => {
+    if (attachedLinuxFallback) {
+      if (attachedTerminationStarted) {
+        if (signal === "SIGKILL") {
+          attachedTermination?.force();
+        }
+      } else if (!childExitState) {
+        // Retain one identity-bound snapshot across root settlement. Its timer
+        // must survive disposal when the supervisor clears its own grace timer.
+        attachedTerminationStarted = true;
+        attachedTermination = killProcessTree(pid, {
+          detached: false,
+          graceMs: GRACEFUL_CANCEL_TIMEOUT_MS,
+          force: signal === "SIGKILL",
+        });
+      }
+      return;
+    }
     signalProcessTree(pid, signal, { detached: childIsDetached });
     scheduleAdoptedReapForChild();
   };
   const signalProcessTreeForChildAndWait = (pid: number, signal: "SIGTERM" | "SIGKILL") =>
     new Promise<void>((resolve) => {
+      if (attachedLinuxFallback) {
+        signalProcessTreeForChild(pid, signal);
+        resolve();
+        return;
+      }
       signalProcessTree(pid, signal, {
         detached: childIsDetached,
         onComplete: () => {
@@ -454,6 +531,9 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
   const kill = (signal?: NodeJS.Signals) => {
     // A delayed private-input failure must not signal a PID whose child has closed.
     if (processClosed) {
+      if (signal === undefined || signal === "SIGKILL") {
+        attachedTermination?.force();
+      }
       return;
     }
     const pid = child.pid ?? undefined;
@@ -464,20 +544,29 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
         // Let the tree owner traverse the live root before directly killing it.
         // On Windows, killing the root first can make `taskkill /T` lose the
         // descendant relationship. (#71662)
-        void signalProcessTreeForChildAndWait(pid, "SIGKILL").then(() => {
+        const previousSignal = treeSignaling;
+        treeSignaling = (async () => {
           try {
-            child.kill("SIGKILL");
-          } catch {
-            // ignore kill errors
+            await signalProcessTreeForChildAndWait(pid, "SIGKILL");
+            try {
+              child.kill("SIGKILL");
+            } catch {
+              // The native close observation still owns confirmation.
+            }
+            windowsTreeKillCompleted = true;
+            if (childCloseState) {
+              settleObservedClose(resolveObservedExitState(childCloseState));
+              return;
+            }
+            maybeSettleAfterExit();
+            scheduleForcedWindowsCloseSettlement();
+          } catch (error) {
+            cleanup.reject(error);
+            rejectPendingWait(error);
+          } finally {
+            await previousSignal;
           }
-          windowsTreeKillCompleted = true;
-          if (childCloseState) {
-            settleObservedClose(resolveObservedExitState(childCloseState));
-            return;
-          }
-          maybeSettleAfterExit();
-          scheduleForcedWindowsCloseSettlement();
-        });
+        })();
       } else {
         windowsTreeKillCompleted = true;
         try {
@@ -501,7 +590,7 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
   };
 
   const dispose = () => {
-    clearForceKillWaitFallback();
+    awaitedStdout?.close();
     clearForcedWindowsCloseTimer();
     if (params.ownedWorker !== undefined) {
       disconnectWorkerIpc();
@@ -515,33 +604,6 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
     child.removeAllListeners();
     events.clear();
   };
-
-  params.onSpawnCleanup?.(cleanup.promise);
-  try {
-    // Construction may outlive admission; publish cleanup before any private input.
-    assertCurrent();
-    if (params.ownedWorker !== undefined && (!child.connected || !child.channel)) {
-      throw new Error("worker lifecycle IPC channel was not created");
-    }
-    if (params.input !== undefined) {
-      childStdin?.write(params.input);
-      stdin?.end();
-    } else if (stdinMode === "pipe-closed") {
-      stdin?.end();
-    }
-    if (params.secretInput) {
-      assertCurrent();
-      await secretDelivery?.deliverTo(child, { abortSignal: params.abortSignal });
-    }
-  } catch (error) {
-    kill("SIGKILL");
-    try {
-      await cleanup.promise;
-    } finally {
-      dispose();
-    }
-    throw error;
-  }
 
   const closeStartGate = params.ownedWorker ? disconnectWorkerIpc : undefined;
 
@@ -572,12 +634,13 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
       }
     : undefined;
 
-  return {
+  const adapter: WorkerChildAdapter = {
     pid: child.pid ?? undefined,
     stdin,
     oomScoreWrapperSelected: preparedSpawn.wrapped,
     supportsRawOutput: true,
     onStdout,
+    ...(awaitedStdout ? { consumeStdout: awaitedStdout.consume } : {}),
     onStderr,
     onExit: events.onExit,
     onError: events.onError,
@@ -587,4 +650,38 @@ export async function createChildAdapter(params: ChildAdapterInput): Promise<Wor
     closeStartGate,
     openStartGate,
   };
+  params.onSpawnCleanup?.(cleanup.promise);
+  const ready = (async () => {
+    try {
+      // Construction may outlive admission; publish cleanup before any private input.
+      assertCurrent();
+      if (params.ownedWorker !== undefined && (!child.connected || !child.channel)) {
+        throw new Error("worker lifecycle IPC channel was not created");
+      }
+      if (params.input !== undefined) {
+        childStdin?.write(params.input);
+        stdin?.end();
+      } else if (stdinMode === "pipe-closed") {
+        stdin?.end();
+      }
+      if (params.secretInput) {
+        assertCurrent();
+        // deliverTo transfers its pipe synchronously; readiness retains the writer.
+        await secretDelivery?.deliverTo(child, { abortSignal: params.abortSignal });
+      }
+    } catch (error) {
+      kill("SIGKILL");
+      try {
+        const [outcome] = await cleanupOutcome;
+        if (outcome.status === "rejected") {
+          throw outcome.reason;
+        }
+      } finally {
+        dispose();
+      }
+      throw error;
+    }
+  })();
+  void ready.catch(() => {});
+  return { adapter, ready };
 }

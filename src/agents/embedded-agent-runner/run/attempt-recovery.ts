@@ -1,7 +1,7 @@
-import { isProviderRefusalAssistantError } from "@openclaw/llm-core/diagnostics";
+import { isResponsesOutputLimitToolCallError } from "@openclaw/ai/diagnostics";
 import { emitAgentEvent } from "../../../infra/agent-events.js";
 import { formatErrorMessage, toErrorObject } from "../../../infra/errors.js";
-import { isRetryableAssistantError } from "../../../llm/utils/retry.js";
+import { isRetryableAssistantError, isTerminalAssistantError } from "../../../llm/utils/retry.js";
 import { projectAgentRunAttemptTerminal } from "../../agent-run-terminal-outcome.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../../defaults.js";
 import type { FailoverReason } from "../../embedded-agent-helpers.js";
@@ -13,7 +13,6 @@ import { LiveSessionModelSwitchError } from "../../live-model-switch-error.js";
 import { shouldSwitchToLiveModel, clearLiveModelSwitchPending } from "../../live-model-switch.js";
 import type { normalizeUsage } from "../../usage.js";
 import { log } from "../logger.js";
-import { getEmbeddedSessionPromptState } from "../session-prompt-state.js";
 import type { EmbeddedAgentRunResult, TraceAttempt } from "../types.js";
 import type { createUsageAccumulator } from "../usage-accumulator.js";
 import type { normalizeEmbeddedRunAttempt } from "./attempt-normalization.js";
@@ -41,7 +40,7 @@ type NormalizedAttempt = Extract<
   { action: "proceed" }
 >;
 type Dispatch = Awaited<ReturnType<typeof prepareAndDispatchEmbeddedRunAttempt>>;
-type SessionPromptState = ReturnType<typeof createEmbeddedRunSessionPromptState>;
+type SessionPromptState = Awaited<ReturnType<typeof createEmbeddedRunSessionPromptState>>;
 type FailoverRetryController = ReturnType<typeof createEmbeddedRunFailoverRetryController>;
 type CompactionRuntime = ReturnType<typeof createEmbeddedRunCompactionRuntime>;
 
@@ -117,12 +116,34 @@ export async function recoverEmbeddedRunAttempt(input: {
   } = projectAgentRunAttemptTerminal(attempt.terminal);
   const terminalInterrupted = isEmbeddedRunTerminalInterrupted(terminalState.outcome);
   const currentAttemptReplaySafe = isCurrentAttemptReplaySafe(attempt);
+  const settledEvidence = resolveSettledToolBatchEvidence(attempt);
+  // Embedded settings disable session retries; this owner must resume output limits.
+  const outputLimitAssistant = currentAttemptCompletedAssistant ?? attemptAssistant;
+  const outputLimitFailure = Boolean(
+    outputLimitAssistant && isResponsesOutputLimitToolCallError(outputLimitAssistant),
+  );
+  const canContinueOutputLimit =
+    !runtime.pluginHarnessOwnsTransport &&
+    !terminalInterrupted &&
+    !promptError &&
+    (currentAttemptReplaySafe || settledEvidence.allToolsProvenSettled) &&
+    attempt.itemLifecycle.activeCount === 0 &&
+    !settledEvidence.intentionalTermination &&
+    !hasAsyncActivity(attempt.toolMetas) &&
+    !attempt.didSendDeterministicApprovalPrompt;
+  // A model idle timeout after settled tools can resume their recorded results.
+  // Side effects still forbid replaying the original prompt or switching models.
+  const canContinueSettledIdleTimeout =
+    idleTimedOut &&
+    settledEvidence.allToolsProvenSettled &&
+    !settledEvidence.intentionalTermination &&
+    !hasAsyncActivity(attempt.toolMetas) &&
+    !attempt.didSendDeterministicApprovalPrompt;
   // Mid-turn overflow continues from the persisted tool results and never
   // replays the assistant call. Generic tools must still be fully settled; only
   // a batch whose exec result parked a Code Mode run (producer-recorded) may
   // continue with lifecycle items active — the nested call stays owned by the
   // code-mode run registry and resumes through `wait`, exactly as across turns.
-  const settledEvidence = resolveSettledToolBatchEvidence(attempt);
   const midTurnBatchSettled =
     settledEvidence.allToolsProvenSettled || settledEvidence.parkedCodeModeRun;
   const canContinueSettledMidTurnOverflow =
@@ -130,6 +151,18 @@ export async function recoverEmbeddedRunAttempt(input: {
     attempt.preflightRecovery?.source === "mid-turn" &&
     midTurnBatchSettled &&
     !hasAsyncActivity(attempt.toolMetas);
+  // A provider can reject the next prompt after writes have settled. Compact
+  // their recorded results under this owner without replaying the original task.
+  const canRecoverSettledToolResults =
+    !runtime.pluginHarnessOwnsTransport &&
+    !terminalInterrupted &&
+    (!promptError || promptErrorSource === "prompt") &&
+    settledEvidence.allToolsProvenSettled &&
+    !settledEvidence.intentionalTermination &&
+    !hasAsyncActivity(attempt.toolMetas) &&
+    !attempt.yieldDetected &&
+    !attempt.clientToolCalls &&
+    !attempt.didSendDeterministicApprovalPrompt;
   const { signalOwnedInterruption } = terminalState;
   const assistantOverflowCandidate =
     currentAttemptCompletedAssistant !== undefined
@@ -264,7 +297,6 @@ export async function recoverEmbeddedRunAttempt(input: {
     contextTokenBudget: runtime.contextTokenBudget,
     genericCompactionRecoveryAllowed: preparedRuntime.genericCompactionRecoveryAllowed,
     attempt,
-    toolResultPromptProjectionState: getEmbeddedSessionPromptState(params.sessionId).toolResults,
     runtimeAuthPlan: runtimePlan.auth,
     resolvedSessionKey: runInput.resolvedSessionKey,
     sessionAgentId: input.sessionAgentId,
@@ -300,6 +332,7 @@ export async function recoverEmbeddedRunAttempt(input: {
   ) {
     return retry();
   }
+  const recoveryReason = outputLimitFailure ? "output_limit" : failureReason;
   // The finished attempt has released its tools. Continue its transcript, including
   // partial output and uncertain effects; never resubmit the original user request.
   if (
@@ -308,16 +341,19 @@ export async function recoverEmbeddedRunAttempt(input: {
     !timedOutByRunBudget &&
     !timedOutDuringCompaction &&
     !timedOutDuringToolExecution &&
-    (!terminalInterrupted || (currentAttemptReplaySafe && !runtime.pluginHarnessOwnsTransport)) &&
+    (!terminalInterrupted ||
+      (!runtime.pluginHarnessOwnsTransport &&
+        (currentAttemptReplaySafe || canContinueSettledIdleTimeout))) &&
     !attempt.yieldDetected &&
     !attempt.clientToolCalls &&
     !attempt.codexAppServerFailure &&
     !findCliTerminalStopError(promptError) &&
     (!promptError || promptErrorSource === "prompt") &&
-    !isProviderRefusalAssistantError(attemptAssistant) &&
-    failureReason &&
+    !isTerminalAssistantError(attemptAssistant) &&
+    (!outputLimitFailure || canContinueOutputLimit) &&
+    recoveryReason &&
     (await failoverRetryController.maybeRetryTransient({
-      reason: failureReason,
+      reason: recoveryReason,
       message: promptError ? formatErrorMessage(promptError) : assistantSignal?.message,
       retryAfterMs: promptError
         ? resolveRetryAfterMs(formatErrorMessage(promptError), Date.now(), promptError)
@@ -328,7 +364,7 @@ export async function recoverEmbeddedRunAttempt(input: {
           data: {
             phase: "retrying",
             message:
-              reason === "rate_limit"
+              reason === "rate_limit" || reason === "output_limit"
                 ? `Retrying… ${retryAttempt + 1}/${maxRetries + 1}`
                 : `Provider temporarily unavailable. Retrying in ${Math.ceil(delayMs / 1_000)}s (${retryAttempt}/${maxRetries}).`,
             retryAttempt,
@@ -349,9 +385,15 @@ export async function recoverEmbeddedRunAttempt(input: {
     sessionPromptState.continueFromCurrentTranscript({
       includeToolFailureInstruction: Boolean(attempt.lastToolError),
     });
-    return retry({ lastRetryFailoverReason: failureReason });
+    return retry({
+      lastRetryFailoverReason: outputLimitFailure ? input.lastRetryFailoverReason : failureReason,
+    });
   }
-  if (!currentAttemptReplaySafe && !canContinueSettledMidTurnOverflow) {
+  if (
+    !currentAttemptReplaySafe &&
+    !canContinueSettledMidTurnOverflow &&
+    !canRecoverSettledToolResults
+  ) {
     return { action: "proceed" };
   }
 

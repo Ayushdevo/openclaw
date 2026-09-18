@@ -6,14 +6,68 @@ import {
   type OpenClawAgentDatabase,
   type OpenClawAgentDatabaseOptions,
 } from "../../state/openclaw-agent-db.js";
-import type { ExactSessionEntry } from "./session-accessor.sqlite-contract.js";
-import { readExactSessionEntryRowValidated } from "./session-accessor.sqlite-entry-store.js";
-import { resolveSqliteScope, toDatabaseOptions } from "./session-accessor.sqlite-scope.js";
-import type { SessionEntryReadScope } from "./session-accessor.types.js";
-import { assertCanonicalSqliteSessionKeysCurrent } from "./session-canonical-key.js";
+import type { ExactSessionEntry, SessionAccessScope } from "./session-accessor.sqlite-contract.js";
+import { readExactSessionEntryCandidatesInDatabase } from "./session-accessor.sqlite-entry-cache.js";
+import {
+  readExactSessionEntryRowValidated,
+  readSessionEntryRow,
+} from "./session-accessor.sqlite-entry-read.js";
+import {
+  resolveSqliteScope,
+  toDatabaseOptions,
+  type SessionSqliteTargetResolutionCache,
+} from "./session-accessor.sqlite-scope.js";
+import type { SessionEntryReadScope, SessionEntryReadSource } from "./session-accessor.types.js";
+import {
+  assertCanonicalSqliteSessionKeysCurrent,
+  readWithCanonicalSessionAdmission,
+} from "./session-canonical-key.js";
+import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
-/** Address of the physical store admitted by an entry read; never retains its handle. */
-export type SessionEntryReadSource = Readonly<{ agentId: string; path: string }>;
+type ResolvedSqliteSessionEntry = {
+  existing: SessionEntry | undefined;
+  legacyKeys: string[];
+  normalizedKey: string;
+};
+
+/** Resolves one exact canonical entry without materializing the store. */
+export function resolveSessionEntry(
+  scope: SessionAccessScope,
+  options: {
+    readOnly?: boolean;
+    databaseAgentId?: string;
+    projection?: SessionEntryReadScope["projection"];
+  } = {},
+): ResolvedSqliteSessionEntry {
+  const resolved = resolveSqliteScope(scope);
+  if (options.databaseAgentId) {
+    resolved.databaseAgentId = options.databaseAgentId;
+  }
+  const read = (
+    database: Pick<OpenClawAgentDatabase, "agentId" | "db" | "path">,
+  ): ResolvedSqliteSessionEntry => {
+    const selected = readSessionEntryRow(
+      database,
+      resolved.sessionKey,
+      options.readOnly ? options.projection : "full",
+    );
+    return {
+      existing: selected?.entry,
+      legacyKeys: [],
+      normalizedKey: resolved.sessionKey,
+    };
+  };
+  if (options.readOnly) {
+    const result = withOpenClawAgentDatabaseReadOnly(
+      (database) => readWithCanonicalSessionAdmission(database, () => read(database)),
+      toDatabaseOptions(resolved),
+    );
+    return result.found
+      ? result.value
+      : { existing: undefined, legacyKeys: [], normalizedKey: resolved.sessionKey };
+  }
+  return read(openOpenClawAgentDatabase(toDatabaseOptions(resolved)));
+}
 
 type PhysicalSessionEntryReadScope = {
   readSource: SessionEntryReadSource;
@@ -60,7 +114,10 @@ export function loadExactSessionEntryCandidates(
   if (!scope.readOnly) {
     return read(openOpenClawAgentDatabase(options));
   }
-  const result = withOpenClawAgentDatabaseReadOnly(read, options);
+  const result = withOpenClawAgentDatabaseReadOnly(
+    (database) => readWithCanonicalSessionAdmission(database, () => read(database)),
+    options,
+  );
   return result.found ? result.value : [];
 }
 
@@ -76,13 +133,14 @@ export function loadExactSessionEntryReadOnly(
 }
 
 /** Read requested keys through synchronous store/projection groups. */
-export function loadExactSessionEntryCandidatesReadOnlyBatch(
-  scopes: readonly (Omit<SessionEntryReadScope, "sessionKey"> & {
-    sessionKeys: readonly string[];
-    onReadSource?: (source: SessionEntryReadSource) => void;
-  })[],
-): Array<Result<ExactSessionEntry[], unknown>> {
+export type ExactSessionEntryBatchScope = Omit<SessionEntryReadScope, "sessionKey"> & {
+  sessionKeys: readonly string[];
+  onReadSource?: (source: SessionEntryReadSource) => void;
+};
+
+function groupExactSessionEntryReadRequests(scopes: readonly ExactSessionEntryBatchScope[]) {
   const results: Array<Result<ExactSessionEntry[], unknown>> = scopes.map(() => ok([]));
+  const targetCache: SessionSqliteTargetResolutionCache = new Map();
   const groups = new Map<
     string,
     {
@@ -98,7 +156,7 @@ export function loadExactSessionEntryCandidatesReadOnlyBatch(
       continue;
     }
     try {
-      const options = toDatabaseOptions(resolveSqliteScope({ ...scope, sessionKey }));
+      const options = toDatabaseOptions(resolveSqliteScope({ ...scope, sessionKey }, targetCache));
       const groupKey = [
         options.agentId,
         resolveOpenClawAgentSqlitePath(options),
@@ -111,6 +169,13 @@ export function loadExactSessionEntryCandidatesReadOnlyBatch(
       results[index] = err(error);
     }
   }
+  return { groups, results };
+}
+
+export function loadExactSessionEntryCandidatesReadOnlyBatch(
+  scopes: readonly ExactSessionEntryBatchScope[],
+): Array<Result<ExactSessionEntry[], unknown>> {
+  const { groups, results } = groupExactSessionEntryReadRequests(scopes);
   for (const group of groups.values()) {
     try {
       withOpenClawAgentDatabaseReadOnly((database) => {
@@ -118,41 +183,16 @@ export function loadExactSessionEntryCandidatesReadOnlyBatch(
         // suppress healthy logical targets after a warm handle was validated.
         assertCanonicalSqliteSessionKeysCurrent(database);
         const source = { agentId: database.agentId, path: database.path };
-        const entries = new Map<string, Result<ExactSessionEntry | undefined, unknown>>();
-        const readEntry = (sessionKey: string): Result<ExactSessionEntry | undefined, unknown> => {
-          const cached = entries.get(sessionKey);
-          if (cached) {
-            return cached;
-          }
-          let result: Result<ExactSessionEntry | undefined, unknown>;
-          try {
-            const entry = readExactSessionEntryRowValidated(
-              database,
-              sessionKey,
-              group.projection,
-            )?.entry;
-            result = ok(entry ? { sessionKey, entry } : undefined);
-          } catch (error) {
-            result = err(error);
-          }
-          entries.set(sessionKey, result);
-          return result;
-        };
-        for (const { index, sessionKeys } of group.requests) {
-          const matches: ExactSessionEntry[] = [];
-          results[index] = ok(matches);
-          for (const sessionKey of sessionKeys) {
-            const entry = readEntry(sessionKey);
-            if (!entry.ok) {
-              results[index] = err(entry.error);
-              break;
-            }
-            if (entry.value) {
-              matches.push(entry.value);
-            }
-          }
-          if (results[index]!.ok) {
-            scopes[index]!.onReadSource?.(source);
+        const grouped = readExactSessionEntryCandidatesInDatabase(
+          database,
+          group.requests.map((request) => request.sessionKeys),
+          group.projection,
+        );
+        for (const [ordinal, request] of group.requests.entries()) {
+          const result = grouped[ordinal]!;
+          results[request.index] = result;
+          if (result.ok) {
+            scopes[request.index]!.onReadSource?.(source);
           }
         }
       }, group.options);

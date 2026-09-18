@@ -379,6 +379,9 @@ function insideOwnedPath(target) {
 
 const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
 const shellPath = (value) => value.replaceAll("\\", "/");
+// GitHub's macOS runners use the system Bash. Homebrew Bash 5.3 can block while
+// writing a workflow policy heredoc before the Python consumer starts.
+const workflowShell = process.platform === "darwin" ? "/bin/bash" : "bash";
 
 function writeConsumer(target, tool) {
   const argv = [process.execPath, fixture, tool, root, policyScenario].map((value) =>
@@ -915,7 +918,7 @@ async function command() {
     operation === "diff" &&
     ((options.docsPublish &&
       args.join(" ") === "--quiet -- docs .openclaw-sync package.json package-lock.json") ||
-      (options.docsAgent && args.join(" ") === "--quiet") ||
+      (options.docsAgent && args.join(" ") === "HEAD --quiet") ||
       options.maturity)
   ) {
     await boundary("diff");
@@ -1287,7 +1290,7 @@ async function supervise() {
             checkoutScript,
           ]
         : [checkoutScript];
-    shell = spawn("bash", ["--noprofile", "--norc", "-eo", "pipefail", ...shellArgs], {
+    shell = spawn(workflowShell, ["--noprofile", "--norc", "-eo", "pipefail", ...shellArgs], {
       cwd: path.join(workspace, options.workingDirectory ?? ""),
       detached: true,
       stdio: ["ignore", output, output],

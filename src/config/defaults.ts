@@ -29,6 +29,7 @@ import type { OpenClawConfig } from "./types.openclaw.js";
 
 type WarnState = { warned: boolean };
 type ProviderPolicyDefaultsOptions = {
+  env?: NodeJS.ProcessEnv;
   manifestRegistry?: Pick<PluginManifestRegistry, "plugins">;
   loadManifestRegistry?: () => Pick<PluginManifestRegistry, "plugins"> | undefined;
 };
@@ -176,6 +177,7 @@ type CatalogSeedModel = Pick<
 function buildManifestCatalogModelLookup(
   manifestRegistry: Pick<PluginManifestRegistry, "plugins"> | undefined,
   policies: ReturnType<typeof collectManifestModelIdNormalizationPolicies> | undefined,
+  configuredProviderIds: ReadonlySet<string>,
 ): (providerId: string, modelId: string) => Partial<CatalogSeedModel> | undefined {
   const plugins = manifestRegistry?.plugins;
   if (!plugins || plugins.length === 0) {
@@ -193,6 +195,9 @@ function buildManifestCatalogModelLookup(
         for (const [catalogProviderId, provider] of Object.entries(
           plugin.modelCatalog?.providers ?? {},
         )) {
+          if (!configuredProviderIds.has(normalizeProviderId(catalogProviderId))) {
+            continue;
+          }
           for (const model of provider.models) {
             const key = keyFor(catalogProviderId, model.id);
             if (!index.has(key)) {
@@ -223,6 +228,7 @@ export function applyModelDefaults(
     const resolveCatalogModel = buildManifestCatalogModelLookup(
       manifestRegistry,
       modelIdNormalizationPolicies,
+      new Set(Object.keys(providerConfig).map(normalizeProviderId)),
     );
     const nextProviders = { ...providerConfig };
     for (const [providerId, provider] of Object.entries(providerConfig)) {
@@ -502,7 +508,7 @@ export function applyAgentDefaults(cfg: OpenClawConfig): OpenClawConfig {
   };
 }
 
-function hasAnthropicDefaultSignal(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): boolean {
+export function hasAnthropicDefaultSignal(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): boolean {
   if (env.ANTHROPIC_API_KEY?.trim() || env.ANTHROPIC_OAUTH_TOKEN?.trim()) {
     return true;
   }
@@ -535,14 +541,15 @@ export function applyContextPruningDefaults(
   if (!cfg.agents?.defaults) {
     return cfg;
   }
-  if (!hasAnthropicDefaultSignal(cfg, process.env)) {
+  const env = options.env ?? process.env;
+  if (!hasAnthropicDefaultSignal(cfg, env)) {
     return cfg;
   }
   return (
     applyProviderConfigDefaultsForConfig({
       provider: "anthropic",
       config: cfg,
-      env: process.env,
+      env,
       manifestRegistry: options.manifestRegistry,
       loadManifestRegistry: options.loadManifestRegistry,
     }) ?? cfg

@@ -24,6 +24,16 @@ OpenClaw Android is the officially released Google Play app. It connects to an O
 
 Long-press a row on the **Threads** page and choose **Color**, then select a swatch or **Default** to clear it. The eight colors are red, blue, green, yellow, purple, orange, pink, and cyan. Colored sessions show a narrow leading stripe in the sidebar and Threads page, plus a colored ring around the agent avatar in the open chat header. Unset colors add no indicator. Colors sync through the Gateway and remain visible in the local session cache while offline.
 
+## Completed work in Chat
+
+In the app's own conversation, agent main sessions, and dashboard conversations,
+completed commentary and tool activity fold into a **Worked** or **Worked for…**
+row. Tap the row to expand or collapse the details. Prompts, final answers,
+and attachments remain visible. Failures without a later answer stay visible;
+earlier tool failures remain available in expanded work. Active work stays expanded,
+including a run continued by a steering message. Channel conversations retain
+their full transcript.
+
 ## Review changes
 
 When the connected Gateway advertises `sessions.diff`, open a conversation's
@@ -216,6 +226,14 @@ scene has 12 local branch alternatives and no active run. Switching updates the
 selected branch and transcript only in fixture memory, never on a live Gateway.
 Start a fresh app process before choosing a scene; restarting only the Activity
 reuses the process runtime. Same-scene re-entry retains the selected branch.
+
+For sidebar attention proof, use `openclaw.screenshotScene=attention`. The native drawer contains inactive sessions with multiple questions and execution, plugin, and Gateway-settings approvals. Tap or keyboard-focus an attention icon to inspect the oldest request. The `attention-expiry` scene uses successive short deadlines to exercise live removal without another Gateway event. These fixtures use the normal request parsers and lifecycle owners with synthetic in-memory responses; start a fresh app process between scenes.
+
+For completed-work proof, use `openclaw.screenshotScene=completed-work`,
+`active-work`, or `work-boundaries`. These scenes use the same Chat screen with
+synthetic history in a node-owned app conversation. They cover disclosure
+expansion, active work, attachments, and failed tools without a live Gateway.
+Start a fresh app process between scenes.
 
 `pnpm android:release:archive` builds signed release artifacts into `apps/android/build/release-artifacts/` and writes `.sha256` checksum files:
 

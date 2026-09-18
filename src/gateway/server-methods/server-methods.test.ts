@@ -4553,14 +4553,17 @@ describe("gateway healthHandlers.status scope handling", () => {
     vi.mocked(statusModule.getStatusSummary).mockClear();
   });
 
-  async function runHealthStatus(scopes: string[]) {
+  async function runHealthStatus(
+    scopes: string[],
+    params: { includeChannelSummary?: boolean } = {},
+  ) {
     const respond = vi.fn();
 
     await expectDefined(healthHandlers.status, "healthHandlers.status test invariant").call(
       healthHandlers,
       {
         req: {} as never,
-        params: {} as never,
+        params,
         respond: respond as never,
         context: {} as never,
         client: { connect: { role: "operator", scopes } } as never,
@@ -4582,29 +4585,21 @@ describe("gateway healthHandlers.status scope handling", () => {
       expect(vi.mocked(statusModule.getStatusSummary)).toHaveBeenCalledWith({
         includeSensitive,
         includeChannelSummary: true,
+        includeCliProjection: false,
       });
       expect(respond).toHaveBeenCalledWith(true, expect.objectContaining({ ok: true }), undefined);
     },
   );
 
   it("can skip channel summary work for liveness-only status requests", async () => {
-    const respond = vi.fn();
-
-    await expectDefined(healthHandlers.status, "healthHandlers.status test invariant").call(
-      healthHandlers,
-      {
-        req: {} as never,
-        params: { includeChannelSummary: false },
-        respond: respond as never,
-        context: {} as never,
-        client: { connect: { role: "operator", scopes: ["operator.read"] } } as never,
-        isWebchatConnect: () => false,
-      },
-    );
+    const respond = await runHealthStatus(["operator.read"], {
+      includeChannelSummary: false,
+    });
 
     expect(vi.mocked(statusModule.getStatusSummary)).toHaveBeenCalledWith({
       includeSensitive: false,
       includeChannelSummary: false,
+      includeCliProjection: false,
     });
     expect(respond).toHaveBeenCalledWith(true, expect.objectContaining({ ok: true }), undefined);
   });
@@ -5020,8 +5015,10 @@ describe("gateway healthHandlers.health cache freshness", () => {
       prefix: "openclaw-health-cached-dq-",
     });
     try {
-      const { moveDeliveryQueueEntryToFailed, upsertDeliveryQueueEntry } =
-        await import("../../infra/delivery-queue-sqlite.js");
+      const { upsertDeliveryQueueEntry } = await import("../../infra/delivery-queue-sqlite.js");
+      const { prepareDeliveryQueueTerminalEntry, terminalizePendingDeliveryQueueEntryInDatabase } =
+        await import("../../infra/delivery-queue-sqlite.kernel.js");
+      const { openOpenClawStateDatabase } = await import("../../state/openclaw-state-db.js");
       const cachedPressure = [
         {
           channelId: "slack",
@@ -5036,11 +5033,20 @@ describe("gateway healthHandlers.health cache freshness", () => {
       const cached = createHealthSnapshot({
         deliveryQueues: { failed: [], ingressPressure: cachedPressure },
       });
-      upsertDeliveryQueueEntry({
-        queueName: "outbound",
-        entry: { id: "dead-1", enqueuedAt: 1_000, retryCount: 5, retainOnFailure: true },
-      });
-      moveDeliveryQueueEntryToFailed("outbound", "dead-1");
+      const entry = {
+        id: "dead-1",
+        enqueuedAt: 1_000,
+        retryCount: 5,
+        retainOnFailure: true as const,
+      };
+      upsertDeliveryQueueEntry({ queueName: "outbound", entry });
+      const database = openOpenClawStateDatabase();
+      expect(
+        terminalizePendingDeliveryQueueEntryInDatabase(
+          database,
+          prepareDeliveryQueueTerminalEntry({ queueName: "outbound", id: entry.id, entry }),
+        ),
+      ).toMatchObject({ status: "terminalized" });
       const { createChannelIngressQueue } = await import("../../channels/message/ingress-queue.js");
       const { DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS } =
         await import("../../channels/message/ingress-retry-policy.js");

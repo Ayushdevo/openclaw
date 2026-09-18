@@ -6,7 +6,7 @@ import {
 import type { ChannelId } from "../channels/plugins/types.core.js";
 import { resolveChannelStreamingChunkMode } from "../channels/streaming.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { resolveAccountEntry } from "../routing/account-lookup.js";
+import { resolveChannelAccountEntry } from "../routing/account-lookup.js";
 import { normalizeAccountId } from "../routing/session-key.js";
 import {
   avoidTrailingHighSurrogateBreak,
@@ -37,6 +37,7 @@ type ProviderChunkConfig = {
 
 function resolveChunkLimitForProvider(
   cfgSection: ProviderChunkConfig | undefined,
+  provider: TextChunkProvider,
   accountId?: string | null,
 ): number | undefined {
   if (!cfgSection) {
@@ -45,7 +46,7 @@ function resolveChunkLimitForProvider(
   const normalizedAccountId = normalizeAccountId(accountId);
   const accounts = cfgSection.accounts;
   if (accounts && typeof accounts === "object") {
-    const direct = resolveAccountEntry(accounts, normalizedAccountId);
+    const direct = resolveChannelAccountEntry(accounts, normalizedAccountId, provider);
     if (typeof direct?.textChunkLimit === "number") {
       return direct.textChunkLimit;
     }
@@ -69,7 +70,7 @@ export function resolveTextChunkLimit(
     }
     const channelsConfig = cfg?.channels as Record<string, unknown> | undefined;
     const providerConfig = channelsConfig?.[provider] as ProviderChunkConfig | undefined;
-    return resolveChunkLimitForProvider(providerConfig, accountId);
+    return resolveChunkLimitForProvider(providerConfig, provider, accountId);
   })();
   if (typeof providerOverride === "number" && providerOverride > 0) {
     return providerOverride;
@@ -79,6 +80,7 @@ export function resolveTextChunkLimit(
 
 function resolveChunkModeForProvider(
   cfgSection: ProviderChunkConfig | undefined,
+  provider: TextChunkProvider,
   accountId?: string | null,
 ): ChunkMode | undefined {
   if (!cfgSection) {
@@ -87,7 +89,7 @@ function resolveChunkModeForProvider(
   const normalizedAccountId = normalizeAccountId(accountId);
   const accounts = cfgSection.accounts;
   if (accounts && typeof accounts === "object") {
-    const direct = resolveAccountEntry(accounts, normalizedAccountId);
+    const direct = resolveChannelAccountEntry(accounts, normalizedAccountId, provider);
     const directMode = resolveChannelStreamingChunkMode(direct);
     if (directMode) {
       return directMode;
@@ -106,7 +108,7 @@ export function resolveChunkMode(
   }
   const channelsConfig = cfg?.channels as Record<string, unknown> | undefined;
   const providerConfig = channelsConfig?.[provider] as ProviderChunkConfig | undefined;
-  const mode = resolveChunkModeForProvider(providerConfig, accountId);
+  const mode = resolveChunkModeForProvider(providerConfig, provider, accountId);
   return mode ?? DEFAULT_CHUNK_MODE;
 }
 
@@ -268,8 +270,8 @@ export function chunkByParagraph(
   };
 
   for (const [index, part] of parts.entries()) {
-    const paragraph = part.replace(/\s+$/g, "");
-    if (!paragraph.trim()) {
+    const paragraph = part.trimEnd();
+    if (!paragraph) {
       continue;
     }
     pushParagraph(paragraph, separators[index - 1]);
@@ -524,11 +526,32 @@ function pickSafeBreakIndex(
   end: number,
   spans: ReturnType<typeof parseFenceSpans>,
 ): number {
+  // Windows may overlap after a soft break, so seek once before advancing through their fences.
+  let fenceIndex = 0;
+  let high = spans.length;
+  while (fenceIndex < high) {
+    const mid = Math.floor((fenceIndex + high) / 2);
+    const span = spans[mid];
+    if (span && span.end <= start) {
+      fenceIndex = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  let fence = fenceIndex < spans.length ? spans[fenceIndex] : undefined;
   const { lastNewline, lastWhitespace } = scanParenAwareBreakpoints(
     text,
     start,
     end,
-    (index) => findFenceSpanAt(spans, index)?.end,
+    spans.length > 0
+      ? (index) => {
+          while (fence && fence.end <= index) {
+            fenceIndex += 1;
+            fence = fenceIndex < spans.length ? spans[fenceIndex] : undefined;
+          }
+          return fence && index > fence.start ? fence.end : undefined;
+        }
+      : undefined,
   );
 
   if (lastNewline > start) {
@@ -548,6 +571,17 @@ function scanParenAwareBreakpoints(
 ): { lastNewline: number; lastWhitespace: number } {
   let lastNewline = -1;
   let lastWhitespace = -1;
+  if (!skipTo) {
+    const window = text.slice(start, end);
+    if (!window.includes("(")) {
+      const newline = window.lastIndexOf("\n");
+      lastNewline = newline < 0 ? -1 : start + newline;
+      // The suffix excludes non-LF whitespace, selecting the final eligible separator.
+      const whitespace = window.search(/[^\S\n][\S\n]*$/);
+      lastWhitespace = whitespace < 0 ? -1 : start + whitespace;
+      return { lastNewline, lastWhitespace };
+    }
+  }
   let depth = 0;
 
   for (let i = start; i < end; i++) {

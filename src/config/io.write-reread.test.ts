@@ -7,6 +7,7 @@ import {
   releaseUpdateCommandPreflightForHandoff,
   withUpdateCommandExecutor,
 } from "../cli/update-cli/update-command-executor.js";
+import { captureUpdateDoctorConfigWrites } from "../infra/update-doctor-result.js";
 import {
   captureManagedUpdateLeaseDatabaseIdentity,
   createManagedHandoffLeaseDatabase,
@@ -16,6 +17,7 @@ import { withEnvAsync } from "../test-utils/env.js";
 import { readConfigSnapshotAuditRecord } from "./config-journal-snapshot.js";
 import { listConfigAuditRecordsForTests } from "./io.audit.test-support.js";
 import { createConfigIO } from "./io.factory.js";
+import { hashConfigRaw } from "./io.read-helpers.js";
 import { readConfigFileSnapshotForWrite, writeConfigFile } from "./io.runtime.js";
 import type { ConfigWriteOptions } from "./io.types.js";
 import { replaceConfigFile } from "./mutate.js";
@@ -74,9 +76,9 @@ describe("writeConfigFile canonical reread", () => {
       // new config into place, every subsequent sync read sees corrupt content,
       // so the canonical reread parses invalid.
       let corrupted = false;
-      const realRename = fsNode.promises.rename.bind(fsNode.promises);
-      vi.spyOn(fsNode.promises, "rename").mockImplementation(async (from, to) => {
-        await realRename(from, to);
+      const realRename = fsNode.renameSync;
+      vi.spyOn(fsNode, "renameSync").mockImplementation((from, to) => {
+        realRename(from, to);
         if (to === configPath) {
           corrupted = true;
         }
@@ -171,17 +173,28 @@ describe("writeConfigFile canonical reread", () => {
             },
           });
 
-          const failure = await writeConfigFile(
-            { gateway: { mode: "local", port: 19001 } },
-            {
-              ...writeOptions,
-              assertCurrent,
-              baseSnapshot: snapshot,
-              observe: false,
-              skipPluginValidation: true,
+          const { failure, capture } = await captureUpdateDoctorConfigWrites(
+            configPath,
+            async (writeCapture) => {
+              const writeFailure = await writeConfigFile(
+                { gateway: { mode: "local", port: 19001 } },
+                {
+                  ...writeOptions,
+                  assertCurrent,
+                  baseSnapshot: snapshot,
+                  observe: false,
+                  skipPluginValidation: true,
+                },
+              ).catch((error: unknown) => error);
+              return { failure: writeFailure, capture: writeCapture };
             },
-          ).catch((error: unknown) => error);
+          );
           expect(failure).toBeInstanceOf(Error);
+          expect(failure).toMatchObject({
+            name: "ConfigWritePostCommitError",
+            configPath,
+            rollbackStatus: revoke ? "unknown" : "restored",
+          });
           expect(failure).toHaveProperty(
             "message",
             expect.stringMatching(/runtime snapshot refresh failed/),
@@ -203,6 +216,9 @@ describe("writeConfigFile canonical reread", () => {
               await expect(fs.stat(configPath)).rejects.toMatchObject({ code: "ENOENT" });
             }
           }
+          expect(capture.hash).toBe(
+            hashConfigRaw(revoke ? String(committedRaw) : existed ? original : null),
+          );
         }),
       );
     },
@@ -215,7 +231,7 @@ describe("writeConfigFile canonical reread", () => {
     { writer: "runtime", authority: "explicit" },
     { writer: "runtime", authority: "ambient" },
   ] as const)(
-    "preserves the compensation fallback policy for $writer writes with $authority authority",
+    "restores through guarded copy fallback for $writer writes with $authority authority",
     async ({ writer, authority }) => {
       await withTempHome(async (home) => {
         const configPath = path.join(home, ".openclaw", "openclaw.json");
@@ -231,13 +247,13 @@ describe("writeConfigFile canonical reread", () => {
             : undefined;
         let committed = false;
         let compensationDenied = false;
-        const rename = fsNode.promises.rename.bind(fsNode.promises);
-        vi.spyOn(fsNode.promises, "rename").mockImplementation(async (source, destination) => {
+        const renameSync = fsNode.renameSync;
+        vi.spyOn(fsNode, "renameSync").mockImplementation((source, destination) => {
           if (destination === configPath && committed) {
             compensationDenied = true;
             throw Object.assign(new Error("compensation rename denied"), { code: "EPERM" });
           }
-          await rename(source, destination);
+          renameSync(source, destination);
           if (destination === configPath) {
             committed = true;
             if (writer === "direct") {
@@ -268,15 +284,28 @@ describe("writeConfigFile canonical reread", () => {
               : writer === "runtime"
                 ? writeConfigFile(nextConfig, options)
                 : replaceConfigFile({ snapshot, writeOptions: options, nextConfig });
-          await expect(pending).rejects.toThrow(
-            writer === "direct" ? /config path changed/ : /runtime snapshot refresh failed/,
+          const failure = await pending.catch((error: unknown) => error);
+          expect(failure).toBeInstanceOf(Error);
+          expect(failure).toMatchObject({
+            name: "ConfigWritePostCommitError",
+            configPath,
+            rollbackStatus: "restored",
+          });
+          expect(failure).toHaveProperty(
+            "message",
+            expect.stringMatching(
+              writer === "direct" ? /config path changed/ : /runtime snapshot refresh failed/,
+            ),
           );
           if (writer === "direct") {
-            await expect(pending).rejects.toBeInstanceOf(ConfigMutationConflictError);
-            await expect(pending).rejects.toMatchObject({
-              message: "config path changed since last load",
-              retryable: false,
-            });
+            expect(failure).toHaveProperty("cause", expect.any(ConfigMutationConflictError));
+            expect(failure).toHaveProperty(
+              "cause",
+              expect.objectContaining({
+                message: "config path changed since last load",
+                retryable: false,
+              }),
+            );
             expect(listConfigAuditRecordsForTests({ env: io.env, homedir: () => home })).toEqual(
               priorAudit,
             );
@@ -294,11 +323,7 @@ describe("writeConfigFile canonical reread", () => {
           });
         }
         expect(compensationDenied).toBe(true);
-        if (authority === "ordinary") {
-          expect(await fs.readFile(configPath, "utf8")).toBe(original);
-        } else {
-          expect(JSON.parse(await fs.readFile(configPath, "utf8")).gateway.port).toBe(19001);
-        }
+        expect(await fs.readFile(configPath, "utf8")).toBe(original);
       });
     },
   );

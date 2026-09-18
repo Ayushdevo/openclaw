@@ -8,6 +8,7 @@ import {
   normalizeUpdateChannel,
   resolveRegistryUpdateChannel,
 } from "../../../infra/update-channels.js";
+import { isBundledPluginInsideDevSourceRoot } from "../../../plugins/dev-source-root.js";
 import {
   resolveDefaultPluginExtensionsDir,
   resolvePluginInstallDir,
@@ -16,9 +17,9 @@ import {
   loadInstalledPluginIndexInstallRecords,
   removePluginInstallRecordFromRecords,
 } from "../../../plugins/installed-plugin-index-records.js";
-import { loadInstalledPluginIndex } from "../../../plugins/installed-plugin-index.js";
 import { readLegacyNpmPluginDeclaration } from "../../../plugins/legacy-npm-declaration.js";
 import { loadManifestMetadataSnapshot } from "../../../plugins/manifest-contract-eligibility.js";
+import { loadPluginManifestRegistryCore } from "../../../plugins/manifest-registry.js";
 import type { PluginPackageInstall } from "../../../plugins/manifest.js";
 import {
   isExternallyDistributedPlugin,
@@ -57,6 +58,7 @@ export type DownloadableInstallCandidate = {
 export type BundledPluginPackageDescriptor = {
   name?: string;
   packageName?: string;
+  preserveExternalInstallRecord?: boolean;
 };
 
 /** Keep doctor diagnostics and actual package repair on the same discovery snapshot. */
@@ -75,14 +77,14 @@ export async function resolveConfiguredPluginInstallContext(params: {
     return safeRealpathSync(resolved, realpathCache) ?? resolved;
   };
   const snapshot = loadManifestMetadataSnapshot({ config: params.cfg, env: params.env });
-  const currentBundledPlugins = loadInstalledPluginIndex({
+  const currentBundledPlugins = loadPluginManifestRegistryCore({
     config: params.cfg,
     env: params.env,
     installRecords: {},
   }).plugins.filter((plugin) => plugin.origin === "bundled");
   const knownIds = new Set([
     ...snapshot.plugins.filter((plugin) => plugin.origin !== "bundled").map((plugin) => plugin.id),
-    ...currentBundledPlugins.map((plugin) => plugin.pluginId),
+    ...currentBundledPlugins.map((plugin) => plugin.id),
   ]);
   const configuredChannelOwnerPluginIds = collectEffectiveConfiguredChannelOwnerPluginIds({
     cfg: params.cfg,
@@ -91,9 +93,28 @@ export async function resolveConfiguredPluginInstallContext(params: {
     configuredChannelIds: params.configuredChannelIds,
   });
   const bundledPluginsById = new Map<string, BundledPluginPackageDescriptor>(
-    currentBundledPlugins
-      .filter((plugin) => !isExternallyDistributedPlugin(plugin))
-      .map((plugin) => [plugin.pluginId, { packageName: plugin.packageName }] as const),
+    currentBundledPlugins.flatMap((plugin) => {
+      const external = isExternallyDistributedPlugin({
+        pluginId: plugin.id,
+        packageName: plugin.packageName,
+        packageBuild: plugin.packageManifest?.build,
+      });
+      const sourceCheckout = isBundledPluginInsideDevSourceRoot({
+        rootDir: plugin.rootDir,
+        env: params.env,
+      });
+      return !external || sourceCheckout
+        ? [
+            [
+              plugin.id,
+              {
+                packageName: plugin.packageName,
+                preserveExternalInstallRecord: external && sourceCheckout,
+              },
+            ] as const,
+          ]
+        : [];
+    }),
   );
   const configuredPluginIdsWithStaleDescriptors =
     collectConfiguredPluginIdsWithMissingChannelConfigDescriptors({
@@ -146,9 +167,10 @@ export async function resolveConfiguredPluginInstallContext(params: {
   for (const plugin of snapshot.plugins) {
     if (
       plugin.origin === "config" ||
-      [plugin.rootDir, plugin.source].some((value) =>
-        configuredLoadPathIdentities.has(resolvePathIdentity(value)),
-      )
+      (configuredLoadPathIdentities.size > 0 &&
+        [plugin.rootDir, plugin.source].some((value) =>
+          configuredLoadPathIdentities.has(resolvePathIdentity(value)),
+        ))
     ) {
       configuredLoadPathPluginsById.set(plugin.id, plugin.rootDir);
     }
@@ -237,9 +259,17 @@ export function collectDownloadableInstallCandidates(params: {
   configuredChannelOwnerPluginIds?: ReadonlyMap<string, ReadonlySet<string>>;
   blockedPluginIds?: ReadonlySet<string>;
 }): DownloadableInstallCandidate[] {
-  const configuredPluginIds = params.configuredPluginIds ?? collectConfiguredPluginIds(params.cfg);
+  const configuredPluginIds =
+    params.configuredPluginIds ?? collectConfiguredPluginIds(params.cfg, params.env);
   const configuredChannelIds =
     params.configuredChannelIds ?? collectConfiguredChannelIds(params.cfg, params.env);
+  if (
+    params.missingPluginIds.size === 0 &&
+    configuredPluginIds.size === 0 &&
+    configuredChannelIds.size === 0
+  ) {
+    return [];
+  }
   const candidates = new Map<string, DownloadableInstallCandidate>();
 
   for (const entry of listRawChannelPluginCatalogEntries({

@@ -1,5 +1,7 @@
 import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { html, nothing } from "lit";
+import { styleMap } from "lit/directives/style-map.js";
 import { stripShellPreamble } from "../../../../../src/agents/tool-display-exec-shell.js";
 import {
   browserTabKey,
@@ -26,7 +28,7 @@ import {
 } from "../../../lib/chat/tool-cards.ts";
 import { resolveToolDisplay } from "../../../lib/chat/tool-display.ts";
 import { renderPluginSurface } from "../../../plugins/control-ui-view.ts";
-import type { PluginToolIcon } from "../chat-tool-icon-controller.ts";
+import type { PluginToolIcons } from "../chat-tool-icon-controller.ts";
 import { renderHighlightedCommand } from "./chat-command-highlight.ts";
 import { renderDiffStatChips } from "./chat-diff-render.ts";
 import {
@@ -34,6 +36,7 @@ import {
   toolWorkspacePath,
   type ToolRenderOptions,
 } from "./chat-tool-content.ts";
+import { renderToolOutcomeSummary } from "./chat-tool-outcome-summary.ts";
 import { renderToolPreview } from "./widget-card.ts";
 
 export {
@@ -86,15 +89,19 @@ export function shouldToggleSelectableDisclosure(event: MouseEvent): boolean {
   );
 }
 
-export function renderToolIcon(name: string, pluginIcon?: PluginToolIcon) {
-  if (pluginIcon) {
-    return html`<img
-      src=${pluginIcon.url}
-      alt=""
-      width="16"
-      height="16"
-      @error=${pluginIcon.onError}
-    />`;
+export function renderToolIcon(
+  name: string,
+  tool?: { toolName: string; pluginToolIcons?: PluginToolIcons },
+) {
+  const activityIcon = tool?.pluginToolIcons?.get(tool.toolName);
+  if (activityIcon) {
+    return html`<span
+      class="chat-tool-activity-icon"
+      aria-hidden="true"
+      style=${styleMap({ maskImage: `url("${activityIcon.url}")` })}
+    >
+      <img hidden src=${activityIcon.url} alt="" @error=${activityIcon.onError} />
+    </span>`;
   }
   // SAFETY: Unknown display icon names produce undefined and use the fallback.
   return icons[name as IconName] ?? icons.puzzle;
@@ -172,8 +179,11 @@ const TOOL_ROW_ICONS: Partial<Record<ToolCallView["kind"], string>> = {
   fetch: "globe",
 };
 
-function firstCommandLine(command: string): string {
-  return (stripShellPreamble(command).command || command).split("\n")[0]?.trim() ?? "";
+function commandPreview(command: string): string {
+  return truncateUtf16Safe(
+    (stripShellPreamble(command).command || command).replace(/\s+/gu, " ").trim(),
+    200,
+  );
 }
 
 function compactToolTarget(target: string, kind: ToolCallView["kind"]): string {
@@ -207,10 +217,11 @@ function renderToolRowContent(
   }
 
   if (view.kind === "command" && view.command) {
-    const commandPreview = firstCommandLine(view.command);
     return html`
       <span class="chat-tool-row__prompt" aria-hidden="true">$</span>
-      <code class="chat-tool-row__cmd">${renderHighlightedCommand(commandPreview)}</code>
+      <code class="chat-tool-row__cmd"
+        >${renderHighlightedCommand(commandPreview(view.command))}</code
+      >
     `;
   }
 
@@ -301,19 +312,21 @@ function renderProgressCardReceipt(card: ToolCard, outcome: ToolCardOutcome) {
     steps.find((step) => step.status === "pending") ??
     steps.findLast((step) => step.status === "completed");
   const label =
-    outcome === "failed"
-      ? t("sessionProgressCard.receipt.failed")
-      : outcome === "running"
-        ? t("sessionProgressCard.receipt.updating")
-        : steps.length > 0
-          ? t("sessionProgressCard.receipt.updated", {
-              completed: String(completed),
-              current: current?.step ?? "",
-              total: String(steps.length),
-            })
-          : markdown
-            ? t("sessionProgressCard.receipt.noteUpdated")
-            : t("sessionProgressCard.receipt.cleared");
+    outcome === "skipped"
+      ? t("sessionProgressCard.receipt.skipped")
+      : outcome === "failed"
+        ? t("sessionProgressCard.receipt.failed")
+        : outcome === "running"
+          ? t("sessionProgressCard.receipt.updating")
+          : steps.length > 0
+            ? t("sessionProgressCard.receipt.updated", {
+                completed: String(completed),
+                current: current?.step ?? "",
+                total: String(steps.length),
+              })
+            : markdown
+              ? t("sessionProgressCard.receipt.noteUpdated")
+              : t("sessionProgressCard.receipt.cleared");
   // The label already names the running/failed state, so the row stays neutral
   // like every other transcript activity row instead of adding its own chrome.
   return html`<div class="chat-tool-msg-collapse chat-progress-card-receipt">
@@ -354,20 +367,13 @@ function resolveCollapsedToolSummaryParts(params: {
   };
 }
 
-export function isRunningToolCard(card: ToolCard, runActive: boolean | undefined): boolean {
-  // Only live tool-stream cards can be running; historical transcript calls
-  // without results (aborted runs) must stay inert during later runs. The
-  // result event ends the running state — partial streamed output does not.
-  return resolveToolCardOutcome(card, runActive) === "running";
-}
-
-export function resolveToolRowText(card: ToolCard, runActive?: boolean): string {
+function resolveToolRowText(card: ToolCard, runActive?: boolean): string {
   const view = resolveToolCallView({ name: card.name, args: card.args, details: card.details });
   if (view.title) {
     return view.title;
   }
   if (view.kind === "command" && view.command) {
-    return `$ ${firstCommandLine(view.command)}`;
+    return `$ ${commandPreview(view.command)}`;
   }
   const verb = resolveToolRowVerb(view, resolveToolCardOutcome(card, runActive));
   if (verb && view.target) {
@@ -440,23 +446,28 @@ export function renderToolCard(
     expanded: boolean;
     onToggleExpanded: (id: string) => void;
     showApprovalReviews?: boolean;
+    children?: unknown;
+    activityCards?: readonly ToolCard[];
   },
 ) {
   const outcome = resolveToolCardOutcome(card, opts.runActive);
   const progressReceipt = renderProgressCardReceipt(card, outcome);
-  if (progressReceipt) {
+  if (progressReceipt && !opts.children) {
     return renderPluginToolResult(card, opts, progressReceipt);
   }
   const view = resolveToolCallView({ name: card.name, args: card.args, details: card.details });
   const display = resolveToolDisplay({ name: card.name, args: card.args, detailMode: "explain" });
-  const isRunning = outcome === "running";
+  const activityCards = opts.activityCards ?? [card];
+  const isRunning = activityCards.some(
+    (item) => resolveToolCardOutcome(item, opts.runActive) === "running",
+  );
   const expanded = opts.expanded;
   const icon = TOOL_ROW_ICONS[view.kind] ?? display.icon;
   const workspaceFilePath = toolWorkspacePath(card, view);
   const isFileRow = Boolean(workspaceFilePath);
   const rowContent = html`
     <span class="chat-tool-msg-summary__icon"
-      >${renderToolIcon(icon, opts.pluginToolIcons?.get(card.name))}</span
+      >${renderToolIcon(icon, { toolName: display.name, pluginToolIcons: opts.pluginToolIcons })}</span
     >
     <span class="chat-tool-disclosure__content"
       >${renderToolRowContent(
@@ -467,6 +478,7 @@ export function renderToolCard(
         opts.onOpenWorkspaceFile,
       )}</span
     >
+    ${expanded ? nothing : renderToolOutcomeSummary(activityCards, Boolean(opts.children))}
     <span class="chat-tool-row__chevron" aria-hidden="true">${icons.chevronRight}</span>
   `;
 
@@ -514,9 +526,19 @@ export function renderToolCard(
         }
         ${
           expanded
-            ? html`
-                <div class="chat-tool-msg-body">${renderExpandedToolCardContent(card, opts)}</div>
-              `
+            ? opts.children
+              ? html`<div class="chat-tool-children">
+                  ${opts.children}
+                  <details class="chat-tool-wrapper-details">
+                    <summary>${t("chat.toolCards.toolInput")}</summary>
+                    <div class="chat-tool-msg-body">
+                      ${renderExpandedToolCardContent(card, opts)}
+                    </div>
+                  </details>
+                </div>`
+              : html`<div class="chat-tool-msg-body">
+                  ${renderExpandedToolCardContent(card, opts)}
+                </div>`
             : nothing
         }
         ${opts.showApprovalReviews === false ? nothing : renderToolApprovalReviews(card)}

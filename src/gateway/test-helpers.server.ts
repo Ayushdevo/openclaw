@@ -10,7 +10,7 @@ import {
 } from "@openclaw/normalization-core/string-coerce";
 import "./test-helpers.mocks.js";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, vi } from "vitest";
-import { WebSocket } from "ws";
+import { WebSocket, type RawData } from "../../packages/gateway-client/src/websocket.js";
 import { PROTOCOL_VERSION } from "../../packages/gateway-protocol/src/index.js";
 import { acquireGatewayTestWebSocket } from "../../test/helpers/gateway-websocket.js";
 import { runQaGatewayFixture } from "../../test/helpers/qa-gateway-cleanup.js";
@@ -57,7 +57,12 @@ import {
   toAgentStoreSessionKey,
 } from "../routing/session-key.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
-import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
+import {
+  closeOpenClawAgentDatabasesAsync,
+  closeOpenClawAgentDatabasesForTest,
+} from "../state/openclaw-agent-db.js";
+import { closeOpenClawStateDatabaseByPathAsync } from "../state/openclaw-state-db.js";
+import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import {
   resetTaskFlowRegistryForTests,
   resetTaskRegistryForTests,
@@ -516,7 +521,12 @@ async function cleanupGatewayTestHome(options: { restoreEnv: boolean }) {
   resetTaskFlowRegistryForTests({ persist: false });
   if (tempHome) {
     // Release leases before deleting their store, and revoke trust in recreated paths.
+    await closeOpenClawAgentDatabasesAsync(tempHome);
     closeOpenClawAgentDatabasesForTest(tempHome);
+    // External agent stores can retain workers whose lease coordinator belongs to this home.
+    await closeOpenClawStateDatabaseByPathAsync(
+      resolveOpenClawStateSqlitePath({ OPENCLAW_STATE_DIR: path.join(tempHome, ".openclaw") }),
+    );
   }
   if (options.restoreEnv) {
     gatewayEnvSnapshot?.restore();
@@ -731,7 +741,7 @@ export function onceMessage<T extends GatewayTestMessage = GatewayTestMessage>(
       cleanup();
       reject(new Error(`closed ${code}: ${reason.toString()}`));
     }
-    function handler(data: WebSocket.RawData) {
+    function handler(data: RawData) {
       const obj = JSON.parse(rawDataToString(data)) as T;
       if (filter(obj)) {
         cleanup();

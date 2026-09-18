@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
@@ -8,19 +8,30 @@ import { afterEach, assert, beforeEach, describe, expect, it, vi } from "vitest"
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { resolveServiceManagerEnv } from "../../daemon/service-process-env.js";
+import * as sqliteLocation from "../../infra/node-sqlite.js";
+import { resolveRuntimeWorkerUrl } from "../../infra/runtime-worker-url.js";
 import * as tempRoot from "../../infra/tmp-openclaw-dir.js";
 import { CONTROL_PLANE_UPDATE_SENTINEL_META_ENV } from "../../infra/update-control-plane-sentinel.js";
-import { captureManagedUpdateLeaseDatabaseIdentity } from "../../infra/update-managed-service-handoff-database.js";
+import {
+  captureManagedUpdateLeaseDatabaseIdentity,
+  createManagedHandoffLeaseDatabase,
+} from "../../infra/update-managed-service-handoff-database.js";
 import { createManagedHandoffLeaseStore } from "../../infra/update-managed-service-handoff-lease.js";
 import { MANAGED_HANDOFF_RUNTIME_ENTRY } from "../../infra/update-managed-service-handoff-runtime-assets.js";
 import { stageManagedHandoffRuntime } from "../../infra/update-managed-service-handoff-runtime.js";
+import { createUpdateRun, finishUpdateRun, getUpdateRun } from "../../infra/update-run-ledger.js";
 import type { UpdateRecoveryFence } from "../../infra/update-run-recovery.js";
+import { renderUpdateRunReport } from "../../infra/update-run-report.js";
+import * as windowsProcess from "../../infra/windows-port-pids.js";
 import { isChildProcessTreeAlive } from "../../process/child-process-tree.js";
 import { runUtf8CommandWithTimeout } from "../../process/exec.js";
-import { waitForPidToExit } from "../../test-utils/process-tree.js";
+import * as pidAlive from "../../shared/pid-alive.js";
+import { withMockedPlatform } from "../../test-utils/vitest-spies.js";
+import { updateExecutorNativeEntrypoints } from "./update-command-executor-native-runtime.test-support.js";
 import {
   captureUpdateCommandExecutorAuthority,
   releaseUpdateCommandPreflightForHandoff,
+  withDelegatedUpdateCommandExecutor,
   withUpdateCommandExecutor,
   withUpdateCommandExecutorChild,
 } from "./update-command-executor.js";
@@ -42,6 +53,19 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
+// The installed parent prepares the database before a sealed actor can acquire a lease.
+function prepareStagedLeaseFixture() {
+  const databasePath = path.join(temporary, "managed-update-handoffs.sqlite");
+  const existingIdentity = createManagedHandoffLeaseDatabase(databasePath)(true, () =>
+    captureManagedUpdateLeaseDatabaseIdentity(databasePath),
+  );
+  stageManagedHandoffRuntime(root);
+  return {
+    runtimeEntry: path.join(root, "runtime", MANAGED_HANDOFF_RUNTIME_ENTRY),
+    options: { databasePath, serviceManagerEnv: resolveServiceManagerEnv(), existingIdentity },
+  };
+}
+
 function replaceOwner(installationRoot = root) {
   const db = new DatabaseSync(path.join(temporary, "managed-update-handoffs.sqlite"));
   try {
@@ -55,6 +79,65 @@ function replaceOwner(installationRoot = root) {
 }
 
 describe("live update executor", () => {
+  it("finishes an attributed Windows candidate and records its missing start identity warning", async () => {
+    const hostPlatform = process.platform;
+    const existingUri = sqliteLocation.resolveExistingSqliteFileUri;
+    // Keep SQLite on the host VFS while exercising Windows process identity.
+    vi.spyOn(sqliteLocation, "resolveExistingSqliteFileUri").mockImplementation((pathname) =>
+      existingUri(pathname, hostPlatform),
+    );
+    const env = { HOME: root, OPENCLAW_STATE_DIR: root };
+    vi.stubEnv("OPENCLAW_STATE_DIR", root);
+    const run = createUpdateRun({ trigger: "cli" }, { env });
+    const candidatePid = 424242;
+    const argv = [
+      "C:\\node.exe",
+      "C:\\openclaw\\entry.js",
+      "gateway",
+      "install",
+      "--update-executor",
+      "check",
+    ];
+    const readStart = pidAlive.getFileLockProcessStartTime;
+    const isDead = pidAlive.isPidDefinitelyDead;
+    let candidateAlive = true;
+    vi.spyOn(pidAlive, "getFileLockProcessStartTime").mockImplementation((pid, ...args) =>
+      pid === candidatePid ? null : readStart(pid, ...args),
+    );
+    vi.spyOn(pidAlive, "isPidDefinitelyDead").mockImplementation((pid) =>
+      pid === candidatePid ? !candidateAlive : isDead(pid),
+    );
+    vi.spyOn(windowsProcess, "readWindowsProcessArgsSync").mockReturnValue(argv);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await withUpdateCommandExecutor(run.runId, async (executor) => {
+      const fence = await executor.enter(root);
+      await withMockedPlatform("win32", () =>
+        withUpdateCommandExecutorChild(fence, root, async (_grant, bindChild) => {
+          try {
+            bindChild(candidatePid, argv);
+          } finally {
+            candidateAlive = false;
+          }
+        }),
+      );
+      fence.assertCurrent();
+    });
+    finishUpdateRun(run.runId, { status: "succeeded" }, { env });
+    const recorded = getUpdateRun(run.runId, { env });
+    assert(recorded);
+    expect(recorded.status).toBe("succeeded");
+    expect(recorded.steps).toContainEqual(
+      expect.objectContaining({
+        step: `warning:process-start-identity:${candidatePid}`,
+        status: "completed",
+        detail: expect.stringContaining("launcher attribution"),
+      }),
+    );
+    expect(renderUpdateRunReport(recorded).markdown).toContain("launcher attribution");
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining(String(candidatePid)));
+    expect(createManagedHandoffLeaseStore().read(root)).toEqual({ kind: "absent" });
+  });
+
   it("recovery acquires a fresh owner without reactivating the original fence", async () => {
     const store = createManagedHandoffLeaseStore();
     const runId = randomUUID();
@@ -168,12 +251,7 @@ describe("live update executor", () => {
   });
 
   it("reclaims a dead direct executor through the existing process-liveness owner", async () => {
-    stageManagedHandoffRuntime(root);
-    const runtimeEntry = path.join(root, "runtime", MANAGED_HANDOFF_RUNTIME_ENTRY);
-    const options = {
-      databasePath: path.join(temporary, "managed-update-handoffs.sqlite"),
-      serviceManagerEnv: resolveServiceManagerEnv(),
-    };
+    const { runtimeEntry, options } = prepareStagedLeaseFixture();
     const result = spawnSync(
       process.execPath,
       [
@@ -196,8 +274,7 @@ describe("live update executor", () => {
   });
 
   it("borrows only a live helper's exact assigned executor and leaves release to that helper", async () => {
-    stageManagedHandoffRuntime(root);
-    const runtimeEntry = path.join(root, "runtime", MANAGED_HANDOFF_RUNTIME_ENTRY);
+    const { runtimeEntry, options } = prepareStagedLeaseFixture();
     const runId = randomUUID();
     const owner = randomUUID();
     const metadata = path.join(root, "handoff.json");
@@ -207,10 +284,6 @@ describe("live update executor", () => {
     );
     vi.stubEnv("OPENCLAW_UPDATE_RUN_HANDOFF", "1");
     vi.stubEnv(CONTROL_PLANE_UPDATE_SENTINEL_META_ENV, metadata);
-    const options = {
-      databasePath: path.join(temporary, "managed-update-handoffs.sqlite"),
-      serviceManagerEnv: resolveServiceManagerEnv(),
-    };
     const child = spawn(
       process.execPath,
       [
@@ -270,7 +343,7 @@ describe("live update executor", () => {
 
   it("preserves an unreadable existing coordination database without repairing it", async () => {
     const database = path.join(temporary, "managed-update-handoffs.sqlite");
-    fs.writeFileSync(database, "unreadable native owner");
+    fs.writeFileSync(database, "unreadable native owner", { mode: 0o600 });
     const before = fs.readFileSync(database);
     await expect(
       withUpdateCommandExecutor(randomUUID(), async (executor) => executor.enter(root)),
@@ -355,7 +428,205 @@ describe("live update executor", () => {
 });
 
 describe("candidate executor delegation", () => {
-  const moduleUrl = new URL("./update-command-executor.ts", import.meta.url).href;
+  const moduleUrl = resolveRuntimeWorkerUrl(updateExecutorNativeEntrypoints.executor).href;
+  it.each([
+    { mismatched: false, becomesReadable: false, revoked: false },
+    { mismatched: true, becomesReadable: false, revoked: false },
+    { mismatched: false, becomesReadable: true, revoked: false },
+    { mismatched: false, becomesReadable: false, revoked: true },
+  ])(
+    "consumes the parent's bound creation identity when the Windows receiver cannot read its own (mismatch=$mismatched, fallback becomes readable=$becomesReadable, revoked=$revoked)",
+    async ({ mismatched, becomesReadable, revoked }) => {
+      const hostPlatform = process.platform;
+      const existingUri = sqliteLocation.resolveExistingSqliteFileUri;
+      vi.spyOn(sqliteLocation, "resolveExistingSqliteFileUri").mockImplementation((pathname) =>
+        existingUri(pathname, hostPlatform),
+      );
+      const readStart = pidAlive.getFileLockProcessStartTime;
+      const parentStart = readStart(process.ppid);
+      const receiverStart = readStart(process.pid);
+      assert(parentStart !== null);
+      assert(receiverStart !== null);
+      const store = createManagedHandoffLeaseStore();
+      const runId = randomUUID();
+      const childKey = `${root}/.openclaw-update-child-${randomUUID()}`;
+      assert(store.acquire(root, randomUUID(), { kind: "update" }).kind === "acquired");
+      assert(store.acquire(childKey, runId, { kind: "update" }).kind === "acquired");
+      const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+      let currentReceiverStart = mismatched ? receiverStart + 1 : null;
+      vi.spyOn(pidAlive, "getFileLockProcessStartTime").mockImplementation((pid, ...args) => {
+        if (pid === process.pid) {
+          return currentReceiverStart;
+        }
+        if (pid === process.ppid) {
+          return parentStart;
+        }
+        platform.mockReturnValue(hostPlatform);
+        try {
+          return readStart(pid, ...args);
+        } finally {
+          platform.mockReturnValue("win32");
+        }
+      });
+      const parentIdentity = { pid: process.ppid, startIdentity: String(parentStart) };
+      const receiverIdentity =
+        becomesReadable || revoked
+          ? createManagedHandoffLeaseStore().processIdentity()
+          : { pid: process.pid, startIdentity: String(receiverStart) };
+      const databasePath = path.join(temporary, "managed-update-handoffs.sqlite");
+      const db = new DatabaseSync(databasePath);
+      try {
+        // Reproduce the rows already bound by the parent before releasing private stdin.
+        const update = db.prepare(
+          "UPDATE managed_update_handoffs SET payload_json = ? WHERE install_root = ?",
+        );
+        for (const [key, executor] of [
+          [root, parentIdentity],
+          [childKey, receiverIdentity],
+        ] as const) {
+          update.run(
+            JSON.stringify({
+              version: 2,
+              helper: parentIdentity,
+              executor,
+              action: { kind: "update" },
+            }),
+            key,
+          );
+        }
+      } finally {
+        db.close();
+      }
+      const parent = store.read(root);
+      assert(parent.kind === "current");
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const effectPath = path.join(root, "authorized-effect");
+      let nestedStarted = false;
+      const operation = vi.fn(async (fence: UpdateRecoveryFence) => {
+        fence.assertCurrent();
+        if (becomesReadable) {
+          currentReceiverStart = receiverStart;
+        }
+        if (revoked) {
+          replaceOwner();
+        }
+        let nestedKey: string | undefined;
+        await withUpdateCommandExecutorChild(fence, root, async (grant, bindChild) => {
+          nestedStarted = true;
+          nestedKey = grant.childKey;
+          const candidate = spawn(process.execPath, ["-e", "process.stdin.resume()"], {
+            stdio: ["pipe", "ignore", "ignore"],
+          });
+          const exited = once(candidate, "exit");
+          try {
+            await once(candidate, "spawn");
+            assert(candidate.pid);
+            bindChild(candidate.pid, candidate.spawnargs);
+            const nested = store.read(grant.childKey);
+            assert(nested.kind === "current");
+            expect(nested.lease.helper).toEqual(receiverIdentity);
+            candidate.stdin.end();
+            await exited;
+          } finally {
+            if (candidate.exitCode === null && candidate.signalCode === null) {
+              candidate.kill("SIGKILL");
+            }
+            await exited;
+          }
+        });
+        assert(nestedKey);
+        expect(store.read(nestedKey)).toEqual({ kind: "absent" });
+        fence.assertCurrent();
+        fs.writeFileSync(effectPath, "owned");
+        return "completed";
+      });
+      const result = withDelegatedUpdateCommandExecutor(
+        { runId, root, databasePath, parent: parent.lease, childKey },
+        runId,
+        root,
+        operation,
+      );
+      if (mismatched) {
+        await expect(result).rejects.toBeInstanceOf(UpdateCommandRecoveryPendingError);
+      } else if (revoked) {
+        await expect(result).rejects.toThrow(
+          /ownership|Unable to finish stopping the update process and its children/,
+        );
+      } else {
+        await expect(result).resolves.toBe("completed");
+      }
+      expect(operation).toHaveBeenCalledTimes(mismatched ? 0 : 1);
+      expect(nestedStarted).toBe(!mismatched && !revoked);
+      expect(fs.existsSync(effectPath)).toBe(!mismatched && !revoked);
+      if (!mismatched && !becomesReadable && !revoked) {
+        expect(warning).toHaveBeenCalledWith(
+          expect.stringContaining("established by the live parent"),
+        );
+      }
+    },
+  );
+
+  it("refuses a revoked requester before delegated Doctor changes operator config", async () => {
+    const configPath = path.join(root, "openclaw.json");
+    const original = JSON.stringify({
+      commands: { ownerAllowFrom: ["replacement"] },
+      plugins: { enabled: false },
+    });
+    fs.writeFileSync(configPath, original);
+    const workerUrl = resolveRuntimeWorkerUrl(updateExecutorNativeEntrypoints.migratedFinalize);
+    const resultUrl = resolveRuntimeWorkerUrl(updateExecutorNativeEntrypoints.doctorResult);
+    // Prepare the worker before its deadline; watch mode still loads live source.
+    const sourceImportArgs = workerUrl.pathname.endsWith(".ts")
+      ? ["--import", path.resolve("scripts/tsx.mjs")]
+      : [];
+    const childProgram = `
+      import fs from "node:fs";
+      import {createUpdatePostInstallDoctorResultPath, UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH_ENV} from ${JSON.stringify(resultUrl.href)};
+      const resultPath = createUpdatePostInstallDoctorResultPath();
+      process.env[UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH_ENV] = resultPath;
+      process.argv[2] = "--doctor";
+      process.once("exit", () => {
+        if (fs.existsSync(resultPath)) {
+          process.stdout.write(fs.readFileSync(resultPath, "utf8"));
+          fs.rmSync(resultPath);
+        }
+      });
+      await import(${JSON.stringify(workerUrl.href)});
+    `;
+    const runId = randomUUID();
+    await withUpdateCommandExecutor(runId, async (executor) => {
+      const fence = await executor.enter(root);
+      const result = await withUpdateCommandExecutorChild(fence, root, (grant, beforeInput) =>
+        runUtf8CommandWithTimeout(
+          [process.execPath, ...sourceImportArgs, "--input-type=module", "-e", childProgram],
+          {
+            input: JSON.stringify({
+              executor: grant,
+              runId,
+              root,
+              configInputHash: createHash("sha256").update(original).digest("hex"),
+              requester: { channel: "synthetic", senderId: "owner" },
+              repair: true,
+            }),
+            beforeInput,
+            env: { HOME: root, OPENCLAW_STATE_DIR: root, OPENCLAW_CONFIG_PATH: configPath },
+            timeoutMs: 15_000,
+            killProcessTree: true,
+            requireProcessTreeExtinction: true,
+          },
+        ),
+      );
+      expect(result.code, result.stderr).toBe(1);
+      expect(result.stdout, result.stderr).toContain('"reason":"requester-revoked"');
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        status: "error",
+        configWriteRefusal: { reason: "requester-revoked", keys: [] },
+      });
+      expect(fs.readFileSync(configPath, "utf8")).toBe(original);
+      fence.assertCurrent();
+    });
+  });
+
   const program = `
     import fs from "node:fs";
     import {spawn} from "node:child_process";
@@ -423,10 +694,10 @@ describe("candidate executor delegation", () => {
           await Promise.race([
             ready.promise,
             pending.then((result) => {
-              throw new Error(result.stderr);
+              throw new Error(`Candidate exited before admission: ${JSON.stringify(result)}`);
             }),
           ]);
-          expect(() => fence.assertCurrent()).toThrow("suspended");
+          expect(() => fence.assertCurrent()).toThrow("The update process is still running.");
           const store = createManagedHandoffLeaseStore();
           const primary = store.read(root);
           expect(primary.kind).toBe("current");
@@ -450,9 +721,9 @@ describe("candidate executor delegation", () => {
       });
       if (revoked) {
         await expect(work).rejects.toThrow(/ownership|release/);
-        // The shipped worker owns the activated generation; the parent still
-        // refuses completion if its independent recovery owner was replaced.
-        expect(fs.existsSync(output)).toBe(revoked === "original");
+        // The current receiver also retains the original recovery owner after
+        // activation: changing either owner must refuse the child effect.
+        expect(fs.existsSync(output)).toBe(false);
         expect(
           createManagedHandoffLeaseStore().read(revoked === "original" ? root : candidateRoot),
         ).toMatchObject({
@@ -477,61 +748,6 @@ describe("candidate executor delegation", () => {
     },
   );
 
-  it.skipIf(process.platform === "win32").each([false, true])(
-    "does not release either installation while a candidate descendant is alive (changed root=%s)",
-    async (changedRoot) => {
-      const candidateRoot = changedRoot ? path.join(root, "activated") : root;
-      if (changedRoot) {
-        fs.mkdirSync(candidateRoot);
-      }
-      let descendant: number | undefined;
-      try {
-        await expect(
-          withUpdateCommandExecutor(randomUUID(), async (executor) => {
-            const fence = await executor.enter(root);
-            await withUpdateCommandExecutorChild(
-              fence,
-              candidateRoot,
-              async (grant, beforeInput) => {
-                const result = await runUtf8CommandWithTimeout(
-                  [
-                    process.execPath,
-                    "-e",
-                    `const fs=require('node:fs');const {spawn}=require('node:child_process');
-                  JSON.parse(fs.readFileSync(0,'utf8'));
-                  const child=spawn(process.execPath,['-e',"setInterval(()=>{},1000);process.send('ready')"],{stdio:['ignore','ignore','ignore','ipc']});
-                  child.once('message',()=>{process.stdout.write(String(child.pid));child.disconnect();child.unref();});`,
-                  ],
-                  {
-                    input: JSON.stringify(grant),
-                    beforeInput,
-                    killProcessTree: true,
-                    timeoutMs: 15_000,
-                  },
-                );
-                descendant = Number(result.stdout);
-                expect(result.code, result.stderr).toBe(0);
-                expect(Number.isSafeInteger(descendant) && descendant > 0).toBe(true);
-                process.kill(descendant, 0);
-                return result;
-              },
-            );
-          }),
-        ).rejects.toThrow(/settled|release/);
-        const store = createManagedHandoffLeaseStore();
-        expect(store.acquire(root, "next-owner", { kind: "update" }).kind).toBe("busy");
-        expect(store.acquire(candidateRoot, "next-candidate", { kind: "update" }).kind).toBe(
-          "busy",
-        );
-      } finally {
-        if (descendant) {
-          process.kill(descendant, "SIGTERM");
-          await waitForPidToExit(descendant);
-        }
-      }
-    },
-  );
-
   it("does not expose a grant when another owner holds the activated installation", async () => {
     const candidateRoot = path.join(root, "activated");
     const output = path.join(root, "exposed-grant");
@@ -547,7 +763,7 @@ describe("candidate executor delegation", () => {
             fs.writeFileSync(output, "exposed");
           });
         }),
-      ).rejects.toThrow("owns the candidate installation");
+      ).rejects.toThrow("owns the update installation");
       expect(fs.existsSync(output)).toBe(false);
       expect(store.current(foreign.lease)).toBe(true);
       expect(store.read(root)).toEqual({ kind: "absent" });
@@ -644,12 +860,7 @@ describe("candidate executor delegation", () => {
   it.skipIf(process.platform === "win32")(
     "retains a candidate group after both the updater and its direct child exit",
     async () => {
-      stageManagedHandoffRuntime(root);
-      const runtimeEntry = path.join(root, "runtime", MANAGED_HANDOFF_RUNTIME_ENTRY);
-      const options = {
-        databasePath: path.join(temporary, "managed-update-handoffs.sqlite"),
-        serviceManagerEnv: resolveServiceManagerEnv(),
-      };
+      const { runtimeEntry, options } = prepareStagedLeaseFixture();
       const command = `
         const {spawn}=require('node:child_process');
         process.stdin.once('data',()=>{
@@ -700,12 +911,7 @@ describe("candidate executor delegation", () => {
   );
 
   it("does not reclaim a dead parent while its delegated child is alive", async () => {
-    stageManagedHandoffRuntime(root);
-    const runtimeEntry = path.join(root, "runtime", MANAGED_HANDOFF_RUNTIME_ENTRY);
-    const options = {
-      databasePath: path.join(temporary, "managed-update-handoffs.sqlite"),
-      serviceManagerEnv: resolveServiceManagerEnv(),
-    };
+    const { runtimeEntry, options } = prepareStagedLeaseFixture();
     const parent = spawnSync(
       process.execPath,
       [

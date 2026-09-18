@@ -7,20 +7,23 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
 import { buildSync } from "esbuild";
-import { verifyBuiltPluginControlPlaneModules } from "./check-built-plugin-control-plane-modules.mts";
-import { copyBundledPluginMetadata } from "./copy-bundled-plugin-metadata.mts";
-import { copyHookMetadata, listHookMetadataOutputs } from "./copy-hook-metadata.ts";
-import { assertRealOutputRoot } from "./lib/output-root-guard.mjs";
-import { escapeRegExp } from "./lib/regexp.mjs";
-import { resolveRepoRoot } from "./lib/repo-root.mjs";
 import {
   readRuntimeDependencyOwnership,
   RUNTIME_DEPENDENCY_OWNERSHIP_RELATIVE_PATH,
   type RuntimeDependencyOwnership,
-} from "./lib/runtime-dependency-ownership-contract.mts";
+} from "../src/infra/runtime-dependency-ownership.ts";
+import { verifyBuiltPluginControlPlaneModules } from "./check-built-plugin-control-plane-modules.mts";
+import { copyBundledPluginMetadata } from "./copy-bundled-plugin-metadata.mts";
+import { copyHookMetadata, listHookMetadataOutputs } from "./copy-hook-metadata.ts";
+import { withDistArtifactOwnership } from "./lib/dist-artifact-ownership.mts";
+import { assertRealOutputRoot } from "./lib/output-root-guard.mjs";
+import { escapeRegExp } from "./lib/regexp.mjs";
+import { resolveRepoRoot } from "./lib/repo-root.mjs";
 import {
   copyStaticExtensionAssets,
   copyStaticExtensionAssetsToRuntimeOverlay,
+  discoverStaticExtensionAssets,
+  shouldCopyStaticExtensionAssets,
 } from "./lib/static-extension-assets.mts";
 import {
   isUpdateCompatibilityChunk,
@@ -730,11 +733,6 @@ export function writeLegacyCliExitCompatChunks(
   }
 }
 
-function shouldCopyStaticExtensionAssets(params: RuntimePostBuildParams) {
-  const env = params.env ?? process.env;
-  return env.OPENCLAW_RUNTIME_POSTBUILD_STATIC_ASSETS !== "0";
-}
-
 /**
  * Runs every runtime postbuild phase after the main dist build.
  */
@@ -785,8 +783,12 @@ export function runRuntimePostBuild(params: RuntimePostBuildParams = {}) {
     if (!shouldCopyStaticExtensionAssets(phaseParams)) {
       return;
     }
-    copyStaticExtensionAssets(phaseParams);
-    copyStaticExtensionAssetsToRuntimeOverlay(phaseParams);
+    const assetParams = {
+      ...phaseParams,
+      assets: discoverStaticExtensionAssets(phaseParams),
+    };
+    copyStaticExtensionAssets(assetParams);
+    copyStaticExtensionAssetsToRuntimeOverlay(assetParams);
   });
   runPhase("stable root runtime imports", () =>
     rewriteRootRuntimeImportsToStableAliases(phaseParams),
@@ -813,5 +815,7 @@ export function runRuntimePostBuild(params: RuntimePostBuildParams = {}) {
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
-  runRuntimePostBuild();
+  await withDistArtifactOwnership(process.cwd(), async () => {
+    runRuntimePostBuild();
+  });
 }

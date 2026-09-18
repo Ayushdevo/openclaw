@@ -12,9 +12,17 @@ export type PersistedInstalledPluginIndexCacheEntry = {
   index?: InstalledPluginIndex | null;
 };
 
+export type PluginCacheFact<T> = { value: T } | { pending: Promise<{ value: T }> };
+
+type BundledDiscoveryModeFact = {
+  value: "compat" | "allowlist" | undefined;
+  generation: object;
+};
+
 export type PluginCacheManagement<TCache> = {
   installRecords: Map<string, Record<string, PluginInstallRecord>>;
-  persistedInstalledIndex: Map<string, PersistedInstalledPluginIndexCacheEntry>;
+  persistedInstalledIndex: Map<string, PluginCacheFact<PersistedInstalledPluginIndexCacheEntry>>;
+  preparedBundledDiscoveryModes: Map<string, PluginCacheFact<BundledDiscoveryModeFact>>;
   desiredMetadata?: {
     boot: PluginMetadataSnapshot;
     cache: TCache;
@@ -24,11 +32,3 @@ export type PluginCacheManagement<TCache> = {
   officialCatalog?: Promise<OfficialCatalogResult>;
   pluginVersionCategories?: Map<string, Promise<Map<string, string[] | null>>>;
 };
-
-export function createPluginCacheManagement<TCache>(): PluginCacheManagement<TCache> {
-  return {
-    installRecords: new Map(),
-    persistedInstalledIndex: new Map(),
-    dependencyStatus: new WeakMap(),
-  };
-}

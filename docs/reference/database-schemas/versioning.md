@@ -13,13 +13,71 @@ Each database records its published schema in two places:
 - `PRAGMA user_version` is the SQLite schema version.
 - The primary `schema_meta` row records `role`, `agent_id`, `schema_version`, and `app_version`. `app_version` is the OpenClaw build that last wrote the schema metadata.
 
-OpenClaw applies forward-only migrations when it opens an older supported database. It refuses a database whose `user_version` is newer than the running build and reports a `newer schema version` error. The Gateway checks all registered databases before startup. [`openclaw update`](/cli/update) also refuses a package or source target whose declared schema support is older than an on-disk database. Target packages published before schema metadata was added cannot be preflighted. Updates driven by the 2026.9.2 release line can temporarily defer publication of a shared-state schema version while the old updater finishes; see [Schema bumps and older updaters](#schema-bumps-and-older-updaters).
+OpenClaw applies forward-only migrations when it opens an older supported database. It refuses a database whose `user_version` is newer than the running build and reports a `newer schema version` error. The Gateway checks all registered databases before startup. [`openclaw update`](/cli/update) also refuses a package or source target whose declared schema support is older than an on-disk database. Known stable releases published before schema metadata was added are checked against their shipped schema-1 contract. Updates driven by the 2026.9.2 release line can temporarily defer publication of a shared-state schema version while the old updater finishes; see [Schema bumps and older updaters](#schema-bumps-and-older-updaters).
 
 When Gateway startup encounters a newer database schema, it exits with status 78 so the generated systemd service does not restart it repeatedly. On macOS, it also parks its managed LaunchAgent to stop `KeepAlive` retries. This applies to failures during CLI bootstrap as well as server startup and does not depend on the database-backed crash counter. Start the Gateway with a build that supports the existing schemas. The older install cannot repair them with `doctor --fix`; run Doctor from the compatible install if further migration is required, then restart through the service or deployment owner.
 
 Changes may stay at the same schema version only when downgraded readers remain safe. New tables qualify because older builds ignore them. An explicitly compatible column on an existing table qualifies only when its declaration is exactly one bare nullable SQLite `STRICT` datatype: `ANY`, `BLOB`, `INT`, `INTEGER`, `REAL`, or `TEXT`. The declaration cannot have a default, `NOT NULL`, a primary or unique key, a check, a reference, a collation, a generated expression, or another suffix. Constrained existing-table additions require a schema-version bump or a companion table instead.
 
 Matching numeric versions are necessary but not sufficient. A release can add a lazy or startup-repairable table, column, index, or trigger without advancing `user_version`, so two databases at the same version can still have different shapes. OpenClaw validates the canonical table definitions, constraints, indexes, triggers, virtual tables, and table options owned by the running release.
+
+Session label lookups use a nonunique partial index on
+`session_nodes(label, session_key)` for non-null labels, without changing agent
+schema 20. The existing writable schema owner installs and repairs the index;
+read-only startup accepts its absence until that owner opens the database. A
+present but noncanonical definition still fails strict offline validation;
+Gateway startup admits canonical index repairs to the same writable schema owner
+before readiness and logs the rebuilt indexes and elapsed time. Missing tables
+and incompatible column definitions remain refusals. Canonical
+session JSON, label uniqueness checks, and retention remain unchanged. Older
+same-version readers can ignore the extra index, so binary rollback leaves it
+intact. The accepted design is recorded in the
+[session label index decision](https://github.com/openclaw/openclaw/pull/147837#issuecomment-5658783288).
+
+Task execution ownership uses three bare nullable columns on `task_runs`:
+`execution_owner_host TEXT`, `execution_owner_pid INTEGER`, and
+`execution_owner_start_identity INTEGER`. The first task write ensures them
+idempotently; read-only inspection does not add them. They are declared in the
+canonical schema and included in the existing additive migration path, without
+changing the schema version. Older readers ignore these columns. Legacy rows
+remain unknown until an execution owner explicitly records its identity; restore
+never guesses their owner. Confirmed process-exit settlement uses existing task
+terminal fields and retention rules. Downgrading code does not undo a terminal
+outcome already recorded by restore.
+
+Retained ACP imports use the same-version additive-column exception for the bare
+nullable `session_nodes.legacy_acp_migration_json TEXT` column. Legacy session
+import ensures it on first use and records exact source-component provenance;
+ordinary session edits preserve it, and canonical-key repairs carry it with the
+session. Canonical ACP initialization or closure consumes those components in
+the existing shared-state migration ledger, atomically with the ACP mutation.
+A later Doctor retry reads that completion fact instead of treating an absent
+ACP row as permission to restore legacy metadata. Missing provenance remains
+unknown; readers do not create the column or reconstruct it from legacy files.
+The column follows its session's lifetime, while completed receipts retain the
+existing migration-ledger lifecycle. No schema-version bump is required.
+
+Older same-version readers can ignore the nullable column and open the database.
+Older ACP writers do not record this supersession; complete pending migrations
+before returning to an older writer when that protection is needed.
+
+[Cold transcript storage](/reference/database-schemas/agent-schema-history#cold-transcript-storage)
+requires agent schema 20 even though it adds a companion table. Older readers
+would interpret extracted transcript rows as missing history and cannot safely
+ignore the new representation. The supported updater's Doctor phase performs
+the schema migration; changing the cold-storage age setting afterward needs no
+Gateway restart. These are separate operations: live configuration reload does
+not authorize an active schema migration.
+
+Agent schema 21 makes the canonical-validation pending table and its node,
+window and main-key invalidation triggers required. This needs a version bump:
+older schema inspectors reject unexpected triggers on canonical tables. The
+maintenance migration marks existing nodes pending without rewriting their
+contents; readiness and Doctor own validation. Already-open older connections
+leave pending markers when they change canonical inputs. Reopening with older
+code is refused. Rollback uses the verified pre-migration backup and matching
+build, not marker changes or removal of the derived table alone. See
+[incremental canonical-session validation](/reference/database-schemas/agent-schema-history#incremental-canonical-session-validation).
 
 Agent schema 19 records collected input consumption in the nullable
 `session_pending_inputs.consumed_event_id TEXT` column. Doctor and the feature's
@@ -29,6 +87,45 @@ so the supported beta upgrade runs Doctor from 2026.8.2 or newer. Intermediate b
 already validate the optional pending-input table may reject the added column
 despite sharing version 19. Consumed source receipts remain until their session
 window is deleted, so rewriting a transcript cannot make an old input runnable again.
+
+Cron run receipts use the optional `cron_run_trigger_state_retirements` companion
+without changing state schema 17 or the released receipt table's shape. Its only
+column is `receipt_id`, a primary key referencing the existing receipt with
+`ON DELETE CASCADE`. A committed condition, script-payload, or shared-state edit
+creates a retirement row in the same transaction as the job edit. This includes
+an exact receipt already closed by an agent-owner edit but still awaiting run
+reconciliation. Normal completion and restart recovery preserve the replacement's
+state while retaining the old run's history. The first eligible edit creates the
+table; queued edits do not retire a future evaluation. The job's private runtime
+state retains the exact running receipt ID until scheduler reconciliation, including
+when an agent-owner edit closes the receipt first. Recovery and later state edits
+use that association even when run timestamps collide. Receipt pruning preserves
+that pending receipt; ordinary history retains its existing 64-receipt bound and
+deletes retirement rows with their receipts.
+
+Rows written before this association was recorded retain their legacy recovery
+fallback. The association adds no SQL table, column, or schema version. Current
+builds omit it from public job state and the public state-patch schema.
+
+A missing table or row means no recorded retirement; earlier edits cannot be
+reconstructed from the final job definition. Older compatible readers ignore the
+companion but do not enforce this protection. To preserve edited watcher state,
+complete active runs and pending scheduler reconciliation on the current build
+before downgrading. A terminal task or receipt can still leave job state
+unreconciled.
+
+Scheduling edits made while a run awaits reconciliation record a private
+`runningScheduleChangeId` in the existing job runtime state, in the same
+transaction as the edit. The fresh value distinguishes successive committed
+edits even when a passive editor's snapshot spans two runs. Completion and
+recovery preserve the edited scheduling state; a new run and pending-run cleanup
+clear the marker. This adds no table, column, or public job field.
+
+Pending runs without this marker retain their previous recovery behavior.
+Edits acknowledged by older builds cannot be reconstructed reliably from
+timestamps or the final schedule. New edits to those pending jobs record the
+marker normally. Older compatible readers ignore it; finish pending runs before
+downgrading if their edited cadence must be preserved.
 
 Worker preparation uses the same-version rule for the bare nullable
 `worker_environments.preparation_purpose TEXT` column in the shared state
@@ -74,6 +171,16 @@ with off-thread parsing and bounded write chunks. Total rebuild cost remains
 proportional to history. Rewrites invalidate or rebuild the projection in their
 own transaction, and transcript deletion removes its eligibility rows. Downgrade
 leaves the additive column and index intact; re-upgrade reconciles unknown rows.
+
+Multi-account person profiles add the bare nullable
+`user_profiles.primary_github_account_id INTEGER` column on first profile use,
+without changing the shared-state schema version. Existing single-account profiles
+have an unambiguous primary; explicit merges retain all verified account rows and
+keep the target primary. This deliberately accepts a downgrade limitation:
+older single-account writers can discard secondary account links or split a linked
+person again. Re-upgrading cannot reconstruct discarded links. Keep a backup
+before downgrading, and explicitly relink affected profiles after upgrading.
+The version number does not certify preservation of multi-account relationships.
 
 User profiles use the same rule for the nullable bare `user_profiles.role TEXT`
 column in state schema 9. Operator-role assignment lazily ensures the column on

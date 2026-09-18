@@ -2,11 +2,11 @@ import type { DevicePlacementRequirement } from "../../agents/harness/types.js";
 import { getRuntimeConfig } from "../../config/config.js";
 import type { NodeWorkerSupervisorNodeProof } from "../node-registry-private.js";
 import { WorkerDispatchTargetChangedError } from "../server-worker-placement-session-target.js";
+import { supportsCurrentWorkerLaunch, verifyWorkerAdmissionHandshake } from "./admission.js";
 import {
-  supportsWorkerExecutionContextLaunch,
-  verifyWorkerAdmissionHandshake,
-} from "./admission.js";
-import { resolveDevicePlacementEligibility } from "./device-placement-eligibility.js";
+  DevicePlacementUnavailableError,
+  resolveDevicePlacementEligibility,
+} from "./device-placement-eligibility.js";
 import { DEVICE_WORKER_PROVIDER_ID } from "./device-provider-identity.js";
 import type {
   PlacementFailureActions,
@@ -83,10 +83,10 @@ function requireProvisionedEnvironment(
     environment.environmentId !== expectedEnvironmentId ||
     environment.destroyRequestedAtMs !== null ||
     !environment.bootstrapReceipt ||
-    !supportsWorkerExecutionContextLaunch(environment.bootstrapReceipt)
+    !supportsCurrentWorkerLaunch(environment.bootstrapReceipt)
   ) {
     throw new Error(
-      `Worker environment is not dispatchable with the current execution-context contract: ${environment.state}`,
+      `Worker environment is not dispatchable with the current worker launch contract: ${environment.state}`,
     );
   }
   if (
@@ -164,7 +164,7 @@ export function createWorkerPlacementDispatchStartup(options: {
       config: getRuntimeConfig(),
     });
     if (!eligibility.ok) {
-      throw new Error(eligibility.error);
+      throw new DevicePlacementUnavailableError(request.deviceId, eligibility.error);
     }
   };
   const requireNodePlacementEligibility = async (
@@ -192,14 +192,21 @@ export function createWorkerPlacementDispatchStartup(options: {
     const eligibility = await resolveDevicePlacementEligibility({
       environmentService: environments,
       deviceId,
-      requirement,
+      requirement: admittedNode ? { ...requirement, consumesWorkerSlot: false } : requirement,
       config: getRuntimeConfig(),
       ...(admittedNode ? { currentNode: admittedNode } : {}),
     });
     if (!eligibility.ok) {
-      throw new Error(eligibility.error);
+      throw admittedNode
+        ? new Error(eligibility.error)
+        : new DevicePlacementUnavailableError(deviceId, eligibility.error);
     }
-    return { node: eligibility.node, requirement };
+    // Workspace preparation consumes no worker slot. Keep identity and commands live;
+    // the node's launch owner admits the eventual turn against physical capacity.
+    return {
+      node: eligibility.node,
+      requirement: { ...requirement, consumesWorkerSlot: false },
+    };
   };
 
   const bindPreparedPlacement = async (params: {
@@ -227,7 +234,7 @@ export function createWorkerPlacementDispatchStartup(options: {
         !environment.nodeDeviceId ||
         !environment.leaseId ||
         !environment.bootstrapReceipt ||
-        !supportsWorkerExecutionContextLaunch(environment.bootstrapReceipt) ||
+        !supportsCurrentWorkerLaunch(environment.bootstrapReceipt) ||
         !verifyWorkerAdmissionHandshake(environment.bootstrapReceipt, expectedBuild)
       ) {
         continue;
@@ -496,7 +503,7 @@ export function createWorkerPlacementDispatchStartup(options: {
           !options.isCurrentNodePlacement?.(admittedNode.node, admittedNode.requirement)
         ) {
           throw new Error(
-            "Worker dispatch lost its current node connection, pairing generation, command authorization, or capacity before activation",
+            "Worker dispatch lost its current node connection, pairing generation, or command authorization before activation",
           );
         }
         const active = placements.transition({

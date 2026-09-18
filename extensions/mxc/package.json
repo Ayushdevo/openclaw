@@ -11,14 +11,15 @@
     "@openclaw/plugin-sdk": "workspace:*"
   },
   "dependencies": {
-    "@microsoft/mxc-sdk": "0.7.0",
-    "zod": "4.4.3"
+    "@microsoft/mxc-sdk": "0.8.0",
+    "zod": "4.5.4"
   },
   "openclaw": {
     "extensions": [
       "./index.ts"
     ],
     "install": {
+      "clawhubSpec": "clawhub:@openclaw/mxc-sandbox",
       "npmSpec": "@openclaw/mxc-sandbox",
       "defaultChoice": "npm",
       "minHostVersion": ">=2026.6.11"

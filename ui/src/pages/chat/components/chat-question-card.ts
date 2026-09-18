@@ -18,6 +18,7 @@ type QuestionPanelViewModel = {
   sessionKey?: string;
   secretStoreAllowedHostsDraft?: string;
   collapsed: boolean;
+  autoFocus?: boolean;
   disabled: boolean;
   submitting?: boolean;
   answersById?: Record<string, string[]>;
@@ -156,9 +157,12 @@ export function renderChatQuestionSummary(prompt: QuestionPrompt) {
     <div class="chat-question-summary" aria-label=${t("chat.questions.summaryLabel")}>
       ${prompt.questions.map(
         (question) => html`
-          <div class="chat-question-summary__line">
-            <strong>${question.header}:</strong>
-            <span>${terminalAnswer(prompt, question)}</span>
+          <div class="chat-question-summary__item">
+            <div class="chat-question-summary__prompt">${question.question}</div>
+            <div class="chat-question-summary__line">
+              <strong>${question.header}:</strong>
+              <span>${terminalAnswer(prompt, question)}</span>
+            </div>
           </div>
         `,
       )}
@@ -211,7 +215,7 @@ class ChatQuestionPanel extends LitElement {
       this.pendingAction = null;
       this.syncedAnswersSignature = null;
       this.collapsed = nextCollapsed;
-      this.focusAfterUpdate = !nextCollapsed;
+      this.focusAfterUpdate = !nextCollapsed && model?.autoFocus !== false;
     } else if (this.props?.onCollapsedChange) {
       if (this.collapsed && !nextCollapsed) {
         this.focusAfterUpdate = true;

@@ -8,9 +8,9 @@
   },
   "type": "module",
   "dependencies": {
-    "typebox": "1.3.18",
+    "typebox": "1.3.30",
     "zca-js": "2.1.2",
-    "zod": "4.4.3"
+    "zod": "4.5.4"
   },
   "devDependencies": {
     "@openclaw/plugin-sdk": "workspace:*",
@@ -63,6 +63,7 @@
       }
     },
     "install": {
+      "clawhubSpec": "clawhub:@openclaw/zalouser",
       "npmSpec": "@openclaw/zalouser",
       "defaultChoice": "npm",
       "minHostVersion": ">=2026.4.10"

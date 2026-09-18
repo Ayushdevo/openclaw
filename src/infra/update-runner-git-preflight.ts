@@ -324,6 +324,7 @@ async function testPreflightCandidate(params: {
   runLint: boolean;
   beforeCandidate?: (revision: string) => Promise<void>;
   validateCandidate?: (root: string) => Promise<void>;
+  inspectGitCandidate?: UpdateRunnerOptions["inspectGitCandidate"];
   prepareGitExposure?: UpdateRunnerOptions["prepareGitExposure"];
   prepareCandidate?: (root: string, cleanupRoot: string) => Promise<void>;
   runCommand: CommandRunner;
@@ -459,7 +460,7 @@ async function testPreflightCandidate(params: {
         cwd: params.worktreeDir,
         durationMs: 0,
         exitCode: 1,
-        stderrTail: "Candidate Control UI startup assets are missing or incomplete",
+        stderrTail: "Update Control UI startup assets are missing or incomplete",
       });
       return { status: "failed" };
     }
@@ -487,7 +488,7 @@ async function testPreflightCandidate(params: {
     // Activation checks out candidateSha and promotes only generated runtime paths.
     // Check after repair so validated source edits cannot disappear at activation.
     const cleanCheck = await runCandidateCheck(
-      "candidate clean check",
+      "update clean check",
       gitCleanCheckArgs(params.worktreeDir),
     );
     const status = params.steps.at(-1);
@@ -497,7 +498,7 @@ async function testPreflightCandidate(params: {
       }
       return { status: "failed" };
     }
-    const sourceCheck = await runCandidateCheck("candidate source check", [
+    const sourceCheck = await runCandidateCheck("update source check", [
       "git",
       "-C",
       params.worktreeDir,
@@ -508,9 +509,10 @@ async function testPreflightCandidate(params: {
     ]);
     if (sourceCheck) {
       sourceCheck.stderrTail =
-        "Candidate source differs from the selected commit. Repair the source revision before retrying the update.";
+        "Update source differs from the selected commit. Repair the source revision before retrying the update.";
       return { status: "failed" };
     }
+    await params.inspectGitCandidate?.(params.worktreeDir);
     await params.prepareCandidate?.(params.worktreeDir, params.preflightRoot);
     return { status: "ok", candidateSha };
   } finally {
@@ -523,7 +525,9 @@ export async function runGitCandidatePreflight(params: {
   devTarget?: DevUpdateTarget;
   targetRevision?: string;
   beforeSha?: string | null;
+  beforeGitStaging?: UpdateRunnerOptions["beforeGitStaging"];
   validateCandidate?: (root: string) => Promise<void>;
+  inspectGitCandidate?: UpdateRunnerOptions["inspectGitCandidate"];
   prepareGitExposure?: UpdateRunnerOptions["prepareGitExposure"];
   prepareCandidate?: (root: string, cleanupRoot: string) => Promise<void>;
   needsCheckoutMain: boolean;
@@ -595,6 +599,13 @@ export async function runGitCandidatePreflight(params: {
   // A resolved no-op must not enter validation, stop the service, or rewrite its runtime.
   if (!params.prepareGitExposure && preflightBaseSha === params.beforeSha) {
     return { status: "skipped", reason: "already-current" };
+  }
+  if (params.beforeGitStaging) {
+    const admission = await params.beforeGitStaging();
+    params.steps.push(admission.step);
+    if (admission.step.exitCode !== 0) {
+      return { status: "error", reason: admission.failureReason };
+    }
   }
   const rebaseFrom =
     !params.targetRevision && !params.devTarget && localDevBranchExists !== false

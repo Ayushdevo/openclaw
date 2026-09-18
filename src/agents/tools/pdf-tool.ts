@@ -4,10 +4,8 @@
  * Loads local/web PDFs, extracts pages/text, and analyzes them with native or fallback media-understanding models.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalString,
-} from "@openclaw/normalization-core/string-coerce";
+import { normalizeMimeType } from "@openclaw/media-core/mime";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { Type } from "typebox";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { bindModelLlmRuntime } from "../../llm/model-runtime-binding.js";
@@ -26,7 +24,6 @@ import {
   trackAsyncWork,
 } from "../../shared/async-work-scope.js";
 import { createDeferredCore } from "../../shared/deferred.js";
-import { resolveUserPath } from "../../utils.js";
 import type { AuthProfileStore } from "../auth-profiles/types.js";
 import { resolveModelAsync } from "../embedded-agent-runner/model.js";
 import { abortable } from "../embedded-agent-runner/run/abortable.js";
@@ -164,7 +161,7 @@ async function runPdfPrompt(params: {
   getExtractions: () => Promise<PdfExtractedContent[]>;
   signal?: AbortSignal;
   work: AsyncWorkScope;
-  onAcquired: (release: () => void) => void;
+  onAcquired: (resource: AsyncDisposable) => void;
   assertResourcesOpen?: () => void;
 }): Promise<{
   text: string;
@@ -178,14 +175,17 @@ async function runPdfPrompt(params: {
   let preparedRuntime = params.preparedModelRuntime;
   if (!preparedRuntime) {
     const acquireRuntime = params.work.track(async () => {
-      const lease = await acquireAgentRunPreparedModelRuntime({
-        agentDir: params.agentDir,
-        ...(params.agentId ? { agentId: params.agentId } : {}),
-        config: requestedCfg ?? {},
-        ...(params.workspaceDir ? { workspaceDir: params.workspaceDir } : {}),
-      });
+      const lease = await acquireAgentRunPreparedModelRuntime(
+        {
+          agentDir: params.agentDir,
+          ...(params.agentId ? { agentId: params.agentId } : {}),
+          config: requestedCfg ?? {},
+          ...(params.workspaceDir ? { workspaceDir: params.workspaceDir } : {}),
+        },
+        { abortSignal: params.signal },
+      );
       // The execution owns even a late acquisition before setup can admit cleanup work.
-      params.onAcquired(lease.release);
+      params.onAcquired(lease);
       return lease.snapshot;
     });
     preparedRuntime = params.signal
@@ -380,6 +380,7 @@ export function createPdfTool(options?: {
   agentDir?: string;
   authProfileStore?: AuthProfileStore;
   workspaceDir?: string;
+  cwd?: string;
   preparedModelRuntime?: PreparedModelRuntimeSnapshot;
   sandbox?: PdfSandboxConfig;
   fsPolicy?: ToolFsPolicy;
@@ -434,7 +435,7 @@ export function createPdfTool(options?: {
     args: unknown,
     signal: AbortSignal | undefined,
     work: AsyncWorkScope,
-    onAcquired: (release: () => void) => void,
+    onAcquired: (resource: AsyncDisposable) => void,
     assertResourcesOpen: (() => void) | undefined,
   ): Promise<Awaited<ReturnType<AnyAgentTool["execute"]>>> => {
     const record = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
@@ -506,7 +507,7 @@ export function createPdfTool(options?: {
       // aborted, so a dead run cannot keep pulling remote PDFs.
       signal?.throwIfAborted();
       const trimmed = normalizeMediaReferenceSource(pdfRaw);
-      const refInfo = classifyMediaReferenceSource(trimmed);
+      const refInfo = classifyMediaReferenceSource(trimmed, { allowDataUrl: false });
       const { isHttpUrl } = refInfo;
 
       if (refInfo.hasUnsupportedScheme) {
@@ -525,24 +526,13 @@ export function createPdfTool(options?: {
         throw new Error("Sandboxed PDF tool does not allow remote URLs.");
       }
 
-      const resolvedPdf = (() => {
-        if (sandboxConfig) {
-          return trimmed;
-        }
-        if (trimmed.startsWith("~")) {
-          return resolveUserPath(trimmed);
-        }
-        return trimmed;
-      })();
-
       const { resolvedPath, localRoots, rewrittenFrom } = await resolveMediaToolReferenceAccess({
-        input: resolvedPdf,
+        input: trimmed,
         isDataUrl: false,
         workspaceDir: options?.workspaceDir,
+        cwd: options?.cwd,
+        fsPolicy: options?.fsPolicy,
         sandbox: sandboxConfig,
-        rootOptions: {
-          workspaceOnly: options?.fsPolicy?.workspaceOnly === true,
-        },
       });
       if (resolvedPath === null) {
         throw new Error("PDF reference resolved without a path.");
@@ -565,12 +555,8 @@ export function createPdfTool(options?: {
             ...(signal ? { requestInit: { signal } } : {}),
           });
 
-      if (media.kind !== "document") {
-        // Check MIME type more specifically
-        const ct = normalizeLowercaseStringOrEmpty(media.contentType);
-        if (!ct.includes("pdf") && !ct.includes("application/pdf")) {
-          throw new Error(`Expected PDF but got ${media.contentType ?? media.kind}: ${pdfRaw}`);
-        }
+      if (normalizeMimeType(media.contentType) !== "application/pdf") {
+        throw new Error(`Expected PDF but got ${media.contentType ?? media.kind}: ${pdfRaw}`);
       }
 
       const filename =
@@ -594,6 +580,7 @@ export function createPdfTool(options?: {
         // document after the owning agent run has been cancelled.
         signal?.throwIfAborted();
         const extracted = await extractPdfContent({
+          ...(signal ? { signal } : {}),
           buffer: pdf.buffer,
           maxPages: configuredMaxPages,
           maxPixels: PDF_MAX_PIXELS,
@@ -664,20 +651,22 @@ export function createPdfTool(options?: {
         if (parentSignal?.aborted) {
           closeWork();
         }
-        let releaseRuntime: (() => void) | undefined;
+        let runtimeResources: AsyncDisposable | undefined;
         try {
           const suppliedClaim = options?.preparedModelRuntime
             ? retainPreparedModelRuntimeSnapshotResources(options.preparedModelRuntime)
             : undefined;
-          releaseRuntime = suppliedClaim?.release;
+          runtimeResources = suppliedClaim
+            ? { [Symbol.asyncDispose]: () => suppliedClaim.release() }
+            : undefined;
           reported.resolve(
             await work.track(() =>
               executePdf(
                 args,
                 signal,
                 work,
-                (release) => {
-                  releaseRuntime = release;
+                (resource) => {
+                  runtimeResources = resource;
                 },
                 suppliedClaim?.assertOpen,
               ),
@@ -689,7 +678,7 @@ export function createPdfTool(options?: {
           await work.runWhenIdle(() => undefined);
           await runInScope(() => work.drain());
           parentSignal?.removeEventListener("abort", closeWork);
-          releaseRuntime?.();
+          await runtimeResources?.[Symbol.asyncDispose]();
         }
       }).catch((error: unknown) => reported.reject(error));
       return await reported.promise;

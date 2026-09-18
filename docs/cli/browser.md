@@ -233,6 +233,13 @@ openclaw browser close t1
 
 `tabs` returns `suggestedTargetId` first, then the stable `tabId` (such as `t1`), the optional label, and the raw `targetId`. Pass `suggestedTargetId` back into `focus`, `close`, snapshots, and actions. Assign a label with `open --label`, `tab new --label`, or `tab label`. Labels, tab ids, raw target ids, and unique target-id prefixes are all accepted. The request field is still named `targetId` for compatibility, but it accepts any of these tab references.
 
+Profiles configured with `driver: "extension"` can additionally return a numeric
+`webExtensionTabId`. It is scoped to the current browser runtime and is intended
+only for calls into Chrome's WebExtensions API. It can change after the browser
+or extension reconnects and is omitted for other drivers or when extension
+metadata is unavailable. Do not pass it to OpenClaw browser commands; keep using
+`suggestedTargetId` or `tabId` there.
+
 Raw target ids are volatile diagnostic handles, not durable agent memory. Chromium can replace the underlying raw target during a navigation or form submit. OpenClaw then keeps the stable `tabId` or label attached to the replacement tab, when it can prove the match. Prefer `suggestedTargetId`.
 
 ## Snapshot / screenshot / actions
@@ -358,6 +365,10 @@ openclaw browser trace start
 openclaw browser trace stop --out trace.zip
 ```
 
+`responsebody` writes the bounded response prefix to stdout and warns on stderr
+when it is truncated. `--json` includes the response metadata and `truncated`
+flag without a separate warning. Use `--max-chars` to select the prefix limit.
+
 ## Existing Chrome via MCP
 
 Use the built-in `user` profile, or create your own `existing-session` profile:
@@ -395,7 +406,7 @@ Navigation verification has a separate shared allowance of the action budget plu
 
 If the Gateway runs on a different machine than the browser, run a **node host** on the machine that has Chrome/Brave/Edge/Chromium. The Gateway proxies browser actions to that node. No separate browser control server is required.
 
-Use `gateway.nodes.browser.mode` to control auto-routing and `gateway.nodes.browser.node` to pin a specific node if multiple are connected.
+Automatic routing prefers the Gateway host's browser and uses a single connected browser node only when local browser capability is unavailable. Use `gateway.nodes.browser.mode` to control this fallback and `gateway.nodes.browser.node` to explicitly select a node, including when the host has a browser. A stopped local managed browser with an installed executable still stays local.
 
 Security + remote setup: [Browser tool](/tools/browser), [Remote access](/gateway/remote), [Tailscale](/gateway/tailscale), [Security](/gateway/security)
 

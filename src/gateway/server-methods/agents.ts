@@ -863,7 +863,7 @@ export const agentsHandlers: GatewayRequestHandlers = {
     );
     respond(
       true,
-      listAgentsForGateway(cfg, undefined, {
+      await listAgentsForGateway(cfg, undefined, {
         modelCatalogByAgentId,
         includeSystem: hasGatewayClientCap(client?.connect.caps, GATEWAY_CLIENT_CAPS.AGENT_KIND),
         httpAvatarBasePath:
@@ -1103,7 +1103,12 @@ export const agentsHandlers: GatewayRequestHandlers = {
           let databasePlan: AgentDeleteDatabasePlan | undefined;
           try {
             prepareJournaledAgentDirOwnership(lockedConfig, agentId, journal.agentDir);
-            databasePlan = prepareAgentDeleteDatabases(lockedConfig, agentId, journal.agentDir);
+            databasePlan = await prepareAgentDeleteDatabases(
+              lockedConfig,
+              agentId,
+              journal.agentDir,
+            );
+            deletion.assertCurrent();
             deletion.fenceDatabasePaths([
               ...journal.databasePaths,
               ...databasePlan.fileGroups.flat(),

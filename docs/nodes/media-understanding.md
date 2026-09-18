@@ -80,7 +80,7 @@ Each `models[]` entry is a **provider** entry (default) or a **CLI** entry:
     {
       type: "provider", // default if omitted
       provider: "openai",
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       prompt: "Describe the image in <= 500 chars.",
       maxChars: 500,
       maxBytes: 10485760,
@@ -280,7 +280,7 @@ When `mode: "all"`, outputs are labeled `[Image 1/2]`, `[Audio 2/2]`, etc.
       tools: {
         media: {
           models: [
-            { provider: "openai", model: "gpt-5.6-sol", capabilities: ["image"] },
+            { provider: "openai", model: "gpt-6-astra", capabilities: ["image"] },
             {
               provider: "google",
               model: "gemini-3-flash-preview",
@@ -363,7 +363,7 @@ When `mode: "all"`, outputs are labeled `[Image 1/2]`, `[Audio 2/2]`, etc.
       tools: {
         media: {
           models: [
-            { provider: "openai", model: "gpt-5.6-sol", capabilities: ["image"] },
+            { provider: "openai", model: "gpt-6-astra", capabilities: ["image"] },
             { provider: "anthropic", model: "claude-opus-5", capabilities: ["image"] },
             {
               type: "cli",
@@ -412,8 +412,13 @@ When `mode: "all"`, outputs are labeled `[Image 1/2]`, `[Audio 2/2]`, etc.
 When media understanding runs, `/status` includes a per-capability summary line:
 
 ```
-📎 Media: image ok (openai/gpt-5.6-sol) · audio ok (whisper-cli observed=metal)
+📎 Media: image ok (openai/gpt-6-astra) · audio ok (whisper-cli observed=metal)
 ```
+
+Auto-detected local audio tools report their resolved executable path as the
+result's `model`, so status and verbose summaries can include that path alongside
+the tool family and backend. Explicit CLI entries retain their authored command;
+preflight inventory keeps the logical tool names.
 
 For preflight inventory, run `openclaw capability audio providers`. Local rows show the local fallback winner separately from global provider selection, readiness, and separate capable/requested/observed backend fields. The same local selection is available as an informational doctor finding:
 
