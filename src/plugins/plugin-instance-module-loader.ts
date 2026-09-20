@@ -130,18 +130,17 @@ export function bindPluginInstanceModuleLoader(params: PluginInstanceModuleLoade
     artifact,
     bindPluginInstanceModuleLoader,
   );
-  const nativeAliases = nativeHooks
-    ? undefined
-    : preparePluginLoaderAliases({
-        modulePath: params.source,
-        argv1: process.argv[1],
-        moduleUrl: import.meta.url,
-        pluginSdkResolution: params.pluginSdkResolution,
-        devSourceRoot: params.devSourceRoot,
-      });
-  if (nativeAliases?.packageRoot) {
-    artifact.linkHost(nativeAliases.packageRoot);
+  const hostAliases = preparePluginLoaderAliases({
+    modulePath: params.source,
+    argv1: process.argv[1],
+    moduleUrl: import.meta.url,
+    pluginSdkResolution: params.pluginSdkResolution,
+    devSourceRoot: params.devSourceRoot,
+  });
+  if (hostAliases.packageRoot) {
+    artifact.linkHost(hostAliases.packageRoot);
   }
+  const nativeAliases = nativeHooks ? undefined : hostAliases;
   installOpenClawPluginSdkNativeResolver({
     moduleUrl: import.meta.url,
     pluginModulePath: params.source,
