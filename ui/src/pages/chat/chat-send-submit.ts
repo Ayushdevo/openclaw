@@ -131,6 +131,9 @@ export async function handleSendChat(
       opts?.resumeQueuedMessageEditId ||
       !canSubmitBeforeChatHistory(messageOverride ?? host.chatMessage))
   ) {
+    if (opts?.intent?.kind === "session-goal-start") {
+      setChatError(host, t("chat.goals.historyPending"));
+    }
     return undefined;
   }
   const previousDraft = host.chatMessage;
