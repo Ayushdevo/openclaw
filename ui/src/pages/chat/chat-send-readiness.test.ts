@@ -485,6 +485,9 @@ it.each(
       if (action === "blocked" || action === "goal") {
         expect(host.chatMessage).toBe(message);
       }
+      if (action === "goal") {
+        expect(host.chatError).toContain("Wait for this conversation to finish loading");
+      }
     } finally {
       history.resolve({ messages: [] });
       await loading;
