@@ -1,0 +1,157 @@
+title: Cron invalid exec warning diagnostic
+
+scenario:
+  id: cron-invalid-exec-diagnostic-proof
+  surface: cron
+  coverage:
+    primary:
+      - automation.isolated-cron-execution
+    secondary:
+      - automation.cron-rpcs
+  regressionRefs:
+    - openclaw/openclaw#158890
+  gatewayConfigPatch:
+    tools:
+      codeMode:
+        enabled: false
+  objective: Verify an isolated cron run that recovers from a pre-execution exec validation rejection remains ok but persists a sanitized warning diagnostic.
+  successCriteria:
+    - The mock provider asks the real exec tool once with the unsupported timeout key, so validation rejects before spawning a process.
+    - The isolated cron run still completes with status ok after the assistant supplies a normal final reply.
+    - Run history retains an exec warning diagnostic without command arguments.
+    - Persisted job state exposes the same diagnostic summary consumed by automations show.
+  codeRefs:
+    - src/agents/bash-tools.exec-request-preparation.ts
+    - src/agents/embedded-agent-runner/run/run-attempt-result.ts
+    - src/cron/run-diagnostics.ts
+    - src/cli/cron-cli/shared.ts
+  execution:
+    kind: flow
+    suiteIsolation: isolated
+    isolationReason: Forces a real isolated cron exec validation rejection and inspects persisted run diagnostics.
+    retryCount: 0
+    timeoutMs: 180000
+    summary: Run a real Gateway cron turn through mock-openai's deterministic invalid exec timeout call and verify the warning survives in history and job state.
+    config:
+      requiredProviderMode: mock-openai
+      promptSnippet: cron invalid exec diagnostic qa check
+      expectedDiagnostic: exec tool failed
+      expectedReply: CRON-INVALID-EXEC-DIAGNOSTIC-OK
+
+flow:
+  steps:
+    - name: forces a pre-execution exec validation rejection
+      actions:
+        - assert:
+            expr: "env.providerMode === config.requiredProviderMode"
+            message: invalid-exec cron proof requires mock-openai
+        - call: waitForGatewayHealthy
+          args:
+            - ref: env
+            - 60000
+        - call: reset
+        - set: requestCursorBefore
+          value:
+            expr: "(await fetchJson(`${env.mock.baseUrl}/debug/request-cursor`)).cursor"
+        - set: scheduledFor
+          value:
+            expr: "new Date(Date.now() + 10 * 60 * 1000).toISOString()"
+        - call: env.gateway.call
+          saveAs: added
+          args:
+            - cron.add
+            - agentId: qa
+              name:
+                expr: "`qa-cron-invalid-exec-diagnostic-${randomUUID()}`"
+              enabled: true
+              deleteAfterRun: false
+              schedule:
+                kind: at
+                at:
+                  ref: scheduledFor
+              sessionTarget: isolated
+              wakeMode: now
+              payload:
+                kind: agentTurn
+                message: "cron invalid exec diagnostic qa check. tool search qa check target=exec. After the tool result, reply exactly `CRON-INVALID-EXEC-DIAGNOSTIC-OK` marker."
+                toolsAllow:
+                  - exec
+              delivery:
+                mode: none
+            - timeoutMs: 30000
+        - set: jobId
+          value:
+            expr: added.id
+        - set: runStartedAt
+          value:
+            expr: Date.now()
+        - call: env.gateway.call
+          saveAs: runResponse
+          args:
+            - cron.run
+            - id:
+                ref: jobId
+              mode: force
+            - timeoutMs: 30000
+        - assert:
+            expr: "runResponse?.ok === true && runResponse?.ran !== false"
+            message:
+              expr: "`expected cron.run to enqueue one run, got ${JSON.stringify(runResponse)}`"
+
+    - name: proves the real rejected exec reaches run history and job state
+      actions:
+        - call: waitForCronRunCompletion
+          saveAs: completedRun
+          args:
+            - callGateway:
+                expr: env.gateway.call.bind(env.gateway)
+              jobId:
+                ref: jobId
+              afterTs:
+                ref: runStartedAt
+              timeoutMs: 90000
+        - set: scenarioRequests
+          value:
+            expr: "(await fetchJson(`${env.mock.baseUrl}/debug/requests?after=${requestCursorBefore}`)).filter((request) => String(request.allInputText ?? '').includes(config.promptSnippet))"
+        - set: execPlans
+          value:
+            expr: "scenarioRequests.filter((request) => request.plannedToolName === 'exec')"
+        - assert:
+            expr: "execPlans.length === 1 && execPlans[0].plannedToolArgs?.timeout === 5 && execPlans[0].plannedToolArgs?.command === 'echo runtime-tool-fixture'"
+            message:
+              expr: "`expected one real exec plan with the unsupported timeout key, got ${JSON.stringify(execPlans)}`"
+        - set: execContinuations
+          value:
+            expr: "scenarioRequests.filter((request) => request.toolOutputCallId === execPlans[0]?.plannedToolCallId)"
+        - assert:
+            expr: "execContinuations.length === 1 && /timeout/i.test(String(execContinuations[0].allInputText ?? '')) && /unsupported/i.test(String(execContinuations[0].allInputText ?? ''))"
+            message:
+              expr: "`expected the real exec rejection in the model continuation, got ${JSON.stringify(execContinuations)}`"
+        - assert:
+            expr: "completedRun.status === 'ok' && completedRun.completionStatus === 'succeeded'"
+            message:
+              expr: "`expected recovered cron completion to stay ok/succeeded, got ${JSON.stringify(completedRun)}`"
+        - assert:
+            expr: "completedRun.summary === config.expectedReply"
+            message:
+              expr: "`expected the recovered assistant reply, got ${JSON.stringify(completedRun)}`"
+        - assert:
+            expr: "completedRun.diagnostics?.summary === config.expectedDiagnostic && completedRun.diagnostics?.entries?.some((entry) => entry.source === 'exec' && entry.severity === 'warn' && entry.toolName === 'exec' && entry.message === config.expectedDiagnostic)"
+            message:
+              expr: "`run history did not persist the sanitized warning: ${JSON.stringify(completedRun)}`"
+        - call: env.gateway.call
+          saveAs: persistedJob
+          args:
+            - cron.get
+            - id:
+                ref: jobId
+            - timeoutMs: 30000
+        - assert:
+            expr: "persistedJob.state?.lastRunStatus === 'ok' && persistedJob.state?.lastDiagnosticSummary === config.expectedDiagnostic"
+            message:
+              expr: "`job state did not retain the automations-show diagnostic summary: ${JSON.stringify(persistedJob.state)}`"
+        - assert:
+            expr: "persistedJob.state?.lastDiagnostics?.entries?.some((entry) => entry.source === 'exec' && entry.severity === 'warn' && entry.toolName === 'exec')"
+            message:
+              expr: "`job state did not retain the exec warning entry: ${JSON.stringify(persistedJob.state?.lastDiagnostics)}`"
+      detailsExpr: "`status=${completedRun.status} completionStatus=${completedRun.completionStatus} summary=${completedRun.summary} diagnostic=${persistedJob.state.lastDiagnosticSummary} execTimeout=${String(execPlans[0].plannedToolArgs.timeout)}`"
