@@ -448,6 +448,7 @@ export async function runConfigOperations(params: {
       numericObjectKeys: params.successMode === "patch",
       pathTokens: operation.pathTokens,
       quotedNumericSegments: operation.quotedNumericSegments,
+      replaceAdvice: params.successMode === "patch" ? "patch-replace-path" : "set-flags",
       schema: mutationSchema?.schema as JsonSchemaRecord | undefined,
     };
     let suppliedPaths: PathSegment[][];
@@ -459,6 +460,7 @@ export async function runConfigOperations(params: {
         path: operation.setPath,
         value: operation.value,
         allowReplace: options.replace || operation.mutation === "replace",
+        replaceAdvice: params.successMode === "patch" ? "patch-replace-path" : "set-flags",
       });
       setAtPath(next, operation.setPath, operation.value, pathOptions);
       suppliedPaths = [operation.setPath];
