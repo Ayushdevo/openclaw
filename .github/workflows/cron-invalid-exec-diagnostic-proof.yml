@@ -32,6 +32,13 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
+      - name: Show formatter patch for PR test
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm exec oxfmt --write src/agents/embedded-agent-subscribe.handlers.tools.test.ts
+          git diff -- src/agents/embedded-agent-subscribe.handlers.tools.test.ts
+
       - name: Build private QA runtime
         env:
           NODE_OPTIONS: --max-old-space-size=12288
