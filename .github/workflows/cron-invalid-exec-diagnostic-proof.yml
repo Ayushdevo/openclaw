@@ -1,0 +1,53 @@
+name: Cron invalid exec diagnostic proof
+
+on:
+  push:
+    branches:
+      - proof/cron-invalid-exec-diagnostic-158890
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  NODE_VERSION: "24.x"
+  OPENCLAW_BUILD_PRIVATE_QA: "1"
+  OPENCLAW_ENABLE_PRIVATE_QA_CLI: "1"
+
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout proof branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Setup Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          cache-mode: off
+          node-version: ${{ env.NODE_VERSION }}
+          install-bun: "true"
+
+      - name: Build private QA runtime
+        env:
+          NODE_OPTIONS: --max-old-space-size=12288
+        run: pnpm build
+
+      - name: Run real Gateway cron proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_dir=".artifacts/qa-e2e/cron-invalid-exec-diagnostic-proof"
+          pnpm openclaw qa suite \
+            --provider-mode mock-openai \
+            --scenario cron-invalid-exec-diagnostic-proof \
+            --concurrency 1 \
+            --output-dir "${output_dir}"
+          echo "----- QA report -----"
+          cat "${output_dir}/qa-suite-report.md"
+          echo "----- QA summary -----"
+          cat "${output_dir}/qa-suite-summary.json"
