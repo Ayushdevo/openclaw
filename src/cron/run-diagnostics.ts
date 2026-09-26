@@ -270,7 +270,7 @@ export function createCronRunDiagnosticsFromAgentResult(
   }
   const failureSignal =
     meta.failureSignal && typeof meta.failureSignal === "object"
-      ? (meta.failureSignal as { message?: unknown })
+      ? (meta.failureSignal as { message?: unknown; toolName?: unknown })
       : undefined;
   if (typeof failureSignal?.message === "string") {
     diagnostics.push(createCronRunDiagnosticsFromError("tool", failureSignal.message, opts));
