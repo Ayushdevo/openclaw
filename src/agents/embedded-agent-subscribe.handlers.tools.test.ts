@@ -22,11 +22,11 @@ import {
 } from "./agent-tools.before-tool-call.state.js";
 import { addSession, deleteSession, markExited } from "./bash-process-registry.js";
 import { createProcessSessionFixture } from "./bash-process-registry.test-helpers.js";
-import { createProcessTool } from "./bash-tools.process.js";
 import { createExecTool } from "./bash-tools.js";
+import { createProcessTool } from "./bash-tools.process.js";
 import { projectEmbeddedMessageDeliveryFact } from "./embedded-agent-message-delivery.js";
-import { buildTraceToolSummary } from "./embedded-agent-runner/run/run-attempt-result.js";
 import { buildEmbeddedRunPayloads } from "./embedded-agent-runner/run/payloads.js";
+import { buildTraceToolSummary } from "./embedded-agent-runner/run/run-attempt-result.js";
 import {
   handleToolExecutionEnd,
   handleToolExecutionStart,
