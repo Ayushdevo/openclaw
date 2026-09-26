@@ -38,7 +38,22 @@ type SetAtPathOptions = {
   pathTokens?: readonly ConcreteConfigPathSegment[];
   quotedNumericSegments?: ReadonlySet<number>;
   schema?: JsonSchemaRecord;
+  replaceAdvice?: ConfigReplaceAdvice;
 };
+
+type ConfigReplaceAdvice = "set-flags" | "patch-replace-path";
+
+function formatReplaceAdvice(params: {
+  path: readonly PathSegment[];
+  mergeKind: "object values" | "by id";
+  replaceAdvice?: ConfigReplaceAdvice;
+}): string {
+  const setAdvice = `Use --merge to merge ${params.mergeKind} or --replace to replace intentionally.`;
+  if (params.replaceAdvice !== "patch-replace-path" || params.path.length === 0) {
+    return setAdvice;
+  }
+  return `Use --replace-path ${toDotPath(params.path)} to replace this path intentionally.`;
+}
 
 function isIndexSegment(raw: string): boolean {
   return parseConfigPathArrayIndex(raw) !== undefined;
@@ -402,6 +417,7 @@ function mergeConfigValue(
   existing: unknown,
   patch: unknown,
   path: PathSegment[],
+  options?: { replaceAdvice?: ConfigReplaceAdvice },
 ): ConfigMergeResult {
   if (isProviderModelListPath(path) && Array.isArray(existing) && Array.isArray(patch)) {
     return mergeModelArrays(existing, patch, path);
@@ -441,7 +457,13 @@ function mergeConfigValue(
     }
     return { value: next, suppliedPaths };
   }
-  throw new Error(`Cannot merge ${toDotPath(path)}; use --replace to replace intentionally.`);
+  throw new Error(
+    `Cannot merge ${toDotPath(path)}; ${formatReplaceAdvice({
+      path,
+      mergeKind: "object values",
+      replaceAdvice: options?.replaceAdvice,
+    })}`,
+  );
 }
 
 export function mergeAtPath(
@@ -452,7 +474,7 @@ export function mergeAtPath(
 ): PathSegment[][] {
   const existing = getAtPath(root, path);
   const merged = existing.found
-    ? mergeConfigValue(existing.value, value, path)
+    ? mergeConfigValue(existing.value, value, path, options)
     : { value, suppliedPaths: [path] };
   setAtPath(root, path, merged.value, options);
   return merged.suppliedPaths;
@@ -482,6 +504,7 @@ export function assertNonDestructiveReplacement(params: {
   path: PathSegment[];
   value: unknown;
   allowReplace?: boolean;
+  replaceAdvice?: ConfigReplaceAdvice;
 }): void {
   if (params.allowReplace) {
     return;
@@ -498,8 +521,13 @@ export function assertNonDestructiveReplacement(params: {
     const nextKeys = new Set(Object.keys(params.value));
     const removed = Object.keys(existing.value).filter((key) => !nextKeys.has(key));
     if (removed.length > 0) {
+      const advice = formatReplaceAdvice({
+        path: params.path,
+        mergeKind: "object values",
+        replaceAdvice: params.replaceAdvice,
+      });
       throw new Error(
-        `Refusing to replace ${pathLabel}; it would remove existing entries: ${formatRemovedEntries(removed)}. Use --merge to merge object values or --replace to replace intentionally.`,
+        `Refusing to replace ${pathLabel}; it would remove existing entries: ${formatRemovedEntries(removed)}. ${advice}`,
       );
     }
   }
@@ -511,8 +539,13 @@ export function assertNonDestructiveReplacement(params: {
     }
     const removed = [...existingIds].filter((id) => !nextIds.has(id));
     if (removed.length > 0) {
+      const advice = formatReplaceAdvice({
+        path: params.path,
+        mergeKind: "by id",
+        replaceAdvice: params.replaceAdvice,
+      });
       throw new Error(
-        `Refusing to replace ${pathLabel}; it would remove existing entries: ${formatRemovedEntries(removed)}. Use --merge to merge by id or --replace to replace intentionally.`,
+        `Refusing to replace ${pathLabel}; it would remove existing entries: ${formatRemovedEntries(removed)}. ${advice}`,
       );
     }
   }
