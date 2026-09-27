@@ -86,7 +86,12 @@ export async function runConfigSet(opts: {
     if (opts.throwOnError) {
       throw err;
     }
-    handleConfigMutationError({ err, runtime, options: opts.cliOptions });
+    handleConfigMutationError({
+      err,
+      runtime,
+      options: opts.cliOptions,
+      jsonOutput: Boolean(opts.cliOptions.dryRun && opts.cliOptions.json),
+    });
   }
 }
 
@@ -112,7 +117,12 @@ export async function runConfigPatch(opts: {
       successMode: "patch",
     });
   } catch (err) {
-    handleConfigMutationError({ err, runtime, options: opts.cliOptions });
+    handleConfigMutationError({
+      err,
+      runtime,
+      options: opts.cliOptions,
+      jsonOutput: Boolean(opts.cliOptions.json),
+    });
   }
 }
 
@@ -174,6 +184,7 @@ export async function runConfigUnset(opts: {
   path: string;
   cliOptions?: ConfigUnsetOptions;
   runtime?: RuntimeEnv;
+  beforePersistentApply?: () => void;
 }) {
   const runtime = opts.runtime ?? defaultRuntime;
   const cliOptions = opts.cliOptions ?? {};
@@ -192,9 +203,15 @@ export async function runConfigUnset(opts: {
       operations: [buildUnsetOperation(pathTokens.map(String), pathTokens)],
       options: cliOptions,
       successMode: "set",
+      ...(opts.beforePersistentApply ? { beforePersistentApply: opts.beforePersistentApply } : {}),
     });
   } catch (err) {
-    handleConfigMutationError({ err, runtime, options: cliOptions });
+    handleConfigMutationError({
+      err,
+      runtime,
+      options: cliOptions,
+      jsonOutput: Boolean(cliOptions.json),
+    });
   }
 }
 

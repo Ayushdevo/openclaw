@@ -13,6 +13,7 @@ import type { PluginNativeNamespaceFact } from "./plugin-source-admission.types.
 import {
   copyPluginSourceFile,
   hashPluginSourceFile,
+  isPluginSourceEntry,
   linkPluginSourceFile,
   pluginSourceIdentityChangedOnlyByCtime,
   pluginSourceStatIdentity,
@@ -134,7 +135,7 @@ function inspectDirectory(
       directories.set(source, relative);
       ancestors.add(source);
       for (const name of fs.readdirSync(source).toSorted()) {
-        if (name !== ".git" && name !== "node_modules") {
+        if (isPluginSourceEntry(name)) {
           visit(path.join(source, name), path.join(relative, name), packageBoundary);
         }
       }
@@ -145,9 +146,12 @@ function inspectDirectory(
         const manifestFile = path.join(root, "package.json");
         if (isPathInside(packageBoundary, root) && fs.existsSync(manifestFile)) {
           // Use the generation owner's declared dependency selection, each with its own boundary.
+          // Only the namespace package and admitted dependencies are selected scopes; other nested
+          // manifests resolve what is installed, and Node reports a truly missing import at load.
           capturePluginDependencies({
             root,
             manifestFile,
+            incidental: Boolean(relative) && !admittedDependency,
             references: new Map(),
             resolve,
             capture(name, dependency) {

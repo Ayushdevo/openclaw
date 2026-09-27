@@ -63,22 +63,6 @@ const reviewed = new Map([
     },
   ],
   [
-    "src/tasks/task-registry.store.sqlite.ts",
-    { priority: 5, evidence: "Mixed native mutations and worker-backed read facade" },
-  ],
-  [
-    "src/tasks/task-registry.store.kernel.ts",
-    { priority: 5, evidence: "Kernel shared by native and worker callers" },
-  ],
-  [
-    "src/tasks/task-flow-registry.store.sqlite.ts",
-    { priority: 5, evidence: "Mixed native mutations and worker-backed read facade" },
-  ],
-  [
-    "src/tasks/task-flow-registry.store.kernel.ts",
-    { priority: 5, evidence: "Kernel shared by native and worker callers" },
-  ],
-  [
     "src/agents/plugin-model-catalog.ts",
     {
       priority: 6,
@@ -108,12 +92,13 @@ const reviewed = new Map([
 ]);
 const workerModules = new Set([
   "src/channels/message/ingress-queue-health.kernel.ts",
+  "src/channels/message/ingress-queue.kernel.ts",
   "src/state/openclaw-state-worker-runtime.ts",
   "src/config/sessions/session-accessor.sqlite-mutation-worker.runtime.ts",
   "src/infra/session-cost-usage-worker.ts",
 ]);
 const exceptionModules = new Set([
-  "src/state/openclaw-state-db-write-coordination.ts",
+  "src/state/openclaw-state-db-transaction.ts",
   "src/state/openclaw-state-lease-store.ts",
   "src/state/openclaw-state-lease-storage.ts",
   "src/state/openclaw-agent-db-lease.ts",
@@ -308,6 +293,8 @@ function render(rows) {
     }),
     "",
     "## Profile priority and current cutover status",
+    "",
+    "Channel ingress `listPending`, `listClaims`, `listFailed`, `listUnsettled`, and claim/recovery preparation share the write broker's FIFO with mutations. They must observe earlier committed writes and retain read-write database admission. Explicit read-only inspection remains noncreating inside that broker. Failed-health, pressure, and account-discovery diagnostics use the read-only worker, where bounded staleness is acceptable.",
     "",
     "The 2026-09-20 five-second Gateway profile on build `ddb31b38a88c` attributed **47% of main-thread time in aggregate** to synchronous state write coordination, including profile creation and exec-approval updates. No separate per-site timing was captured for the read paths below. Their order follows the reported profile triage, not invented individual costs. The T1 table puts these known owners first; all other owners follow alphabetically.",
     "",

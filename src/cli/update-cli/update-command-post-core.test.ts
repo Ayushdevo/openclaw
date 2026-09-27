@@ -16,8 +16,7 @@ import type { PostCorePluginUpdateResult } from "./update-command-plugins.js";
 import {
   continuePostCoreUpdateInFreshProcess,
   preparePostCorePluginInstallRecordsForFreshProcess,
-  postCoreUpdateParentOwnsCompletion,
-  resolvePostCoreUpdateOperatorOptions,
+  resolvePostCoreUpdateHandoff,
   readPostCorePluginInstallRecordsFile,
   shouldResumePostCoreUpdateInFreshProcess,
   writePostCorePluginInstallRecordsFile,
@@ -335,26 +334,6 @@ describe("readPostCorePluginInstallRecordsFile", () => {
       "Run openclaw doctor to inspect and repair plugin installation state.",
     );
   });
-
-  it("live FS: corrupt handoff is not silently dropped as empty records", async () => {
-    // L3: real temp file + real fs.readFile/JSON.parse (no stubs).
-    const dir = await withTempDir();
-    const filePath = path.join(dir, "plugin-install-records.json");
-    await fs.writeFile(filePath, '[{"not":"a-record-map"', "utf-8");
-
-    let threw = false;
-    try {
-      await readPostCorePluginInstallRecordsFile(filePath);
-    } catch (err) {
-      threw = true;
-      expect(String(err)).toContain(`Malformed JSON in plugin install records file: ${filePath}`);
-    }
-    expect(threw).toBe(true);
-
-    console.info(
-      `[post-core install-records live proof] path=${filePath} outcome=malformed-json-rejected`,
-    );
-  });
 });
 
 describe("preparePostCorePluginInstallRecordsForFreshProcess", () => {
@@ -498,19 +477,20 @@ describe("post-core operator deadline provenance", () => {
       JSON.stringify({ completionOwner: "parent", timeout: value }),
     );
     const opts = { json: true, timeout: "2700" };
-    expect(await resolvePostCoreUpdateOperatorOptions({ opts, resultPath })).toEqual({
-      ...opts,
-      timeout: expected,
+    expect(await resolvePostCoreUpdateHandoff({ opts, resultPath })).toEqual({
+      opts: { ...opts, timeout: expected },
+      parentOwnsCompletion: true,
     });
-    // The shipped completion reader ignores added metadata and keeps its ownership contract.
-    expect(await postCoreUpdateParentOwnsCompletion(resultPath)).toBe(true);
   });
 
   it("retains an explicit deadline without private parent ownership", async () => {
     const root = await withTempDir();
     const resultPath = path.join(root, "plugins.json");
     const opts = { timeout: "3" };
-    expect(await resolvePostCoreUpdateOperatorOptions({ opts, resultPath })).toBe(opts);
+    expect(await resolvePostCoreUpdateHandoff({ opts, resultPath })).toEqual({
+      opts,
+      parentOwnsCompletion: false,
+    });
     await fs.writeFile(
       path.join(root, "handoff.json"),
       JSON.stringify({
@@ -518,8 +498,11 @@ describe("post-core operator deadline provenance", () => {
         timeout: { version: 1, serialized: "3", operator: null },
       }),
     );
-    expect(await resolvePostCoreUpdateOperatorOptions({ opts, resultPath })).toBe(opts);
+    expect(await resolvePostCoreUpdateHandoff({ opts, resultPath })).toEqual({
+      opts,
+      parentOwnsCompletion: false,
+    });
     await fs.writeFile(path.join(root, "handoff.json"), "{");
-    await expect(resolvePostCoreUpdateOperatorOptions({ opts, resultPath })).rejects.toThrow();
+    await expect(resolvePostCoreUpdateHandoff({ opts, resultPath })).rejects.toThrow();
   });
 });

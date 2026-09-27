@@ -4,7 +4,6 @@ import { normalizeStringEntries } from "@openclaw/normalization-core/string-norm
 import { stripAnsi } from "../../packages/terminal-core/src/ansi.js";
 import { resolveControlUiAssetHealth } from "./control-ui-assets.js";
 import { hasErrnoCode } from "./errno.js";
-import { gitCommitPrefixesMatch } from "./git-commit.js";
 import { DEV_BRANCH, resolveDevUpstreamRefs } from "./update-channels.js";
 import { resolveDevUpdateTargetRevision, type DevUpdateTarget } from "./update-dev-target.js";
 import {
@@ -25,6 +24,7 @@ import {
   shouldRunDevPreflightLint,
 } from "./update-runner-git-commands.js";
 import { checkGitCandidateNodeRuntime } from "./update-runner-git-node-preflight.js";
+import { runGitCleanCheckStep } from "./update-runner-git-steps.js";
 import type {
   CommandRunner,
   RunStepOptions,
@@ -85,10 +85,6 @@ function buildDevTargetRefResolutionCandidates(devTargetRef: string): string[] {
   }
   // Plain branch names resolve from the freshly fetched remote ref.
   return [`refs/remotes/origin/${trimmed}`, `refs/tags/${trimmed}^{}`, `refs/tags/${trimmed}`];
-}
-
-function resolvePreflightWorktreeDir(preflightRoot: string) {
-  return path.join(preflightRoot, PREFLIGHT_WORKTREE_DIRNAME);
 }
 
 async function createPreflightRoot(artifactRoot: string) {
@@ -481,17 +477,14 @@ async function testPreflightCandidate(
     await params.validateCandidate(params.worktreeDir);
     // Activation checks out candidateSha and promotes only generated runtime paths.
     // Check after repair so validated source edits cannot disappear at activation.
-    const cleanCheck = await runCandidateCheck(
-      "update-clean-check",
-      gitCleanCheckArgs(params.worktreeDir),
-      undefined,
-      params.step,
+    const { result: cleanCheck } = await runGitCleanCheckStep(
+      params.step(
+        "preflight-update-clean-check",
+        gitCleanCheckArgs(params.worktreeDir),
+        params.worktreeDir,
+      ),
     );
-    const status = params.steps.at(-1);
-    if (cleanCheck || status?.stdoutTail?.trim()) {
-      if (status) {
-        status.exitCode = 1;
-      }
+    if (isFailedUpdateStep(cleanCheck)) {
       return { status: "failed" };
     }
     const sourceCheck = await runCandidateCheck(
@@ -519,7 +512,7 @@ export async function runGitCandidatePreflight(params: {
   refreshedRemotes: readonly string[];
   targetRevision?: string;
   beforeSha?: string | null;
-  beforeBuiltCommit: string | null;
+  beforeRuntimeVerified: boolean;
   sourceRuntimePrepared?: boolean;
   beforeGitStaging?: UpdateRunnerOptions["beforeGitStaging"];
   validateCandidate: UpdateRunnerOptions["validateCandidate"];
@@ -593,11 +586,8 @@ export async function runGitCandidatePreflight(params: {
     localDevBranchExists = upstream.localDevBranchExists;
   }
 
-  // A matching source revision cannot prove an unrecorded runtime is current.
-  const canSkipActivation =
-    !params.prepareGitExposure &&
-    params.beforeBuiltCommit !== null &&
-    gitCommitPrefixesMatch(params.beforeBuiltCommit, params.beforeSha ?? "");
+  // Source identity alone cannot prove the installed build is complete.
+  const canSkipActivation = !params.prepareGitExposure && params.beforeRuntimeVerified;
   if (canSkipActivation && preflightBaseSha === params.beforeSha) {
     return { status: "skipped", reason: "already-current" };
   }
@@ -629,7 +619,7 @@ export async function runGitCandidatePreflight(params: {
         : "preflight-worktree-failed",
     };
   }
-  const worktreeDir = resolvePreflightWorktreeDir(preflightRoot);
+  const worktreeDir = path.join(preflightRoot, PREFLIGHT_WORKTREE_DIRNAME);
   let tested: PreflightCandidateResult | undefined;
   try {
     const worktreeStep = await runStep(
