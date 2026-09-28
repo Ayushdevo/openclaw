@@ -402,6 +402,17 @@ function createIsolatedRootHelpRenderContext(
     OPENCLAW_BUNDLED_PLUGINS_DIR: bundledPluginsDir,
     OPENCLAW_DISABLE_BUNDLED_PLUGINS: "",
     OPENCLAW_STATE_DIR: stateDir,
+    // Node on Windows requires the system root environment to initialize
+    // native crypto in isolated child processes.
+    ...(process.platform === "win32"
+      ? {
+          SystemRoot: process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "C:\\Windows",
+          windir: process.env.windir ?? process.env.WINDIR ?? process.env.SystemRoot ?? "C:\\Windows",
+          TEMP: process.env.TEMP ?? process.env.TMPDIR ?? "",
+          TMP: process.env.TMP ?? process.env.TMPDIR ?? "",
+          COMSPEC: process.env.COMSPEC ?? "",
+        }
+      : {}),
   };
   const config: OpenClawConfig = {
     agents: {
