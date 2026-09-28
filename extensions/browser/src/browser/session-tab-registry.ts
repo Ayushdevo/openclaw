@@ -124,9 +124,13 @@ async function performVolatileCleanup(
             ownership: tab.ownership,
           });
           if (outcome.status === "cancelled" || outcome.status === "unavailable") {
-            params.onWarn?.(
-              `deferred tracked browser tab ${tab.targetId}: ${outcome.status === "unavailable" ? outcome.reason : "cleanup cancelled"}`,
-            );
+            // A stopped managed browser is expected to make its tracked tabs
+            // temporarily unreachable; avoid repeating a warning every sweep.
+            if (outcome.status === "cancelled" || outcome.reason !== "browser-identity-lookup-failed") {
+              params.onWarn?.(
+                `deferred tracked browser tab ${tab.targetId}: ${outcome.status === "unavailable" ? outcome.reason : "cleanup cancelled"}`,
+              );
+            }
             return 0;
           }
           if (outcome.status === "ownership-mismatch") {
