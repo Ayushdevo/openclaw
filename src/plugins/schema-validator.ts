@@ -409,7 +409,25 @@ export function validateJsonSchemaValue(params: {
     !cached ||
     (cached.schema !== params.schema && cached.schemaFingerprint !== schemaFingerprint)
   ) {
-    const validate = compileSchema(params.schema);
+    let validate: TypeBoxValidator;
+    try {
+      validate = compileSchema(params.schema);
+    } catch (error) {
+      // TypeBox generates a checker function from external schemas. Extremely deep
+      // or wide schemas can overflow V8 while compiling; surface that as the same
+      // structured validation failure used for other unusable schemas.
+      if (error instanceof RangeError) {
+        return {
+          ok: false,
+          errors: [{
+            path: "<root>",
+            message: "schema is too deep or large to compile",
+            text: "<root>: schema is too deep or large to compile",
+          }],
+        };
+      }
+      throw error;
+    }
     cached = {
       hasDefaults: params.applyDefaults ? schemaHasDefaults(params.schema) : false,
       validate,
