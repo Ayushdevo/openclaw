@@ -137,6 +137,14 @@ export function auditGatewayInstallPreservation(
   for (const [key, value] of Object.entries(current.environment ?? {})) {
     const upper = key.toUpperCase();
     const replacement = next.get(normalize(key));
+    if (
+      upper === "PATH" &&
+      command.environmentValueSources?.[key] === "file"
+    ) {
+      // PATH loaded from the installer-managed environment file is generated
+      // state, not an operator edit. Preserve it while reconciling the service.
+      continue;
+    }
     if (platform === "win32" && upper === "PATH") {
       unknown(`Environment.${key}`);
       continue;
