@@ -2222,6 +2222,7 @@ describe("frozen admission workflow barriers", () => {
     "acquires selected upgrade metadata before expanded %s admission",
     (lane) => {
       const path = "src/gateway/node-command-policy.ts";
+      const membershipOwner = "src/cli/update-cli/update-command-terminal-publication.ts";
       const scenarioCatalog = "scripts/lib/upgrade-survivor-scenarios.json";
       const inputs = {
         docker_lanes: lane,
@@ -2239,12 +2240,14 @@ describe("frozen admission workflow barriers", () => {
         {
           "package.json": '{"type":"module","version":"2026.9.2"}',
           [path]: readFileSync(path, "utf8"),
+          [membershipOwner]: readFileSync(membershipOwner, "utf8"),
           ...currentSurvivorScenarioFiles(),
         },
         { ADMISSION_BASELINES_RESOLVED: "true" },
       );
       const planned = fixture.selection();
       expect(planned.sourcePaths).toContain(path);
+      expect(planned.sourcePaths).toContain(membershipOwner);
       expect(planned.sourcePaths).toContain(scenarioCatalog);
       const origin = join(fixture.root, "origin.git");
       fixture.git("clone", "--bare", "--no-hardlinks", fixture.target, origin);
@@ -2254,6 +2257,10 @@ describe("frozen admission workflow barriers", () => {
       fixture.git("config", "remote.origin.partialclonefilter", "blob:none");
       const oid = fixture.git("rev-parse", `${fixture.sha}:${path}`);
       const scenarioCatalogOid = fixture.git("rev-parse", `${fixture.sha}:${scenarioCatalog}`);
+      const membershipOid = fixture.git("rev-parse", `${fixture.sha}:${membershipOwner}`);
+      unlinkSync(
+        join(fixture.target, ".git", "objects", membershipOid.slice(0, 2), membershipOid.slice(2)),
+      );
       unlinkSync(join(fixture.target, ".git", "objects", oid.slice(0, 2), oid.slice(2)));
       unlinkSync(
         join(
@@ -2283,7 +2290,10 @@ describe("frozen admission workflow barriers", () => {
       });
       expect(acquired.status, acquired.stderr).toBe(0);
       expect(readFileSync(requested, "utf8").trim().split("\n")).toEqual(
-        expect.arrayContaining([oid, scenarioCatalogOid]),
+        expect.arrayContaining([oid, scenarioCatalogOid, membershipOid]),
+      );
+      expect(fixture.git("cat-file", "blob", membershipOid)).toBe(
+        readFileSync(membershipOwner, "utf8").trim(),
       );
       const admitted = fixture.admit();
       expect(admitted.status, admitted.stderr).toBe(0);
@@ -4970,6 +4980,19 @@ function runReleaseChecksSummary(params: {
 }
 
 describe("package acceptance workflow", () => {
+  it("keeps manual frozen-target adaptation explicit and forwards the reusable contract", () => {
+    const workflow = readWorkflow(PACKAGE_ACCEPTANCE_WORKFLOW);
+    const name = "allow_frozen_target_scenario_omissions";
+    const input = workflow.on?.workflow_dispatch?.inputs?.[name];
+    expect(input).toEqual(workflow.on?.workflow_call?.inputs?.[name]);
+    expect(input).toMatchObject({ required: false, default: false, type: "boolean" });
+    for (const job of ["docker_acceptance", "docker_acceptance_registry", "package_telegram"]) {
+      expect(workflowJob(PACKAGE_ACCEPTANCE_WORKFLOW, job).with?.[name]).toBe(
+        "${{ inputs.allow_frozen_target_scenario_omissions || false }}",
+      );
+    }
+  });
+
   it("forwards sealed publication inputs through the canonical publish dispatch", () => {
     const workflow = readWorkflow(RELEASE_PUBLISH_WORKFLOW);
     const input = workflow.on?.workflow_dispatch?.inputs?.plugin_sdk_api_acknowledgement;
@@ -8112,7 +8135,7 @@ test "$package_manager" = "pnpm@12.1.0"
     expect(dispatchInputs?.advisory).toBeUndefined();
     expect(callInputs?.advisory).toBeUndefined();
     expect(callInputs?.telegram_advisory).toBeUndefined();
-    expect(Object.keys(dispatchInputs ?? {})).toHaveLength(24);
+    expect(Object.keys(dispatchInputs ?? {})).toHaveLength(25);
     expect(parsedWorkflow.on?.workflow_dispatch?.inputs?.telegram_advisory).toBeUndefined();
     expect(parsedWorkflow.on?.workflow_call?.inputs?.suite_profile).toMatchObject({
       default: "package",
@@ -10317,8 +10340,29 @@ describe("package artifact reuse", () => {
     expect(workflow).toContain("suite_id: native-live-extensions-media-music-minimax");
     expect(workflow).toContain("suite_id: native-live-extensions-media-video");
     expect(workflow).toContain("suite_group: native-live-extensions-media-video");
-    expect(workflow).toContain("OPENCLAW_LIVE_VIDEO_GENERATION_PROVIDERS=google,minimax");
-    expect(workflow).toContain("OPENCLAW_LIVE_VIDEO_GENERATION_PROVIDERS=openai,openrouter,xai");
+    for (const suffix of ["a", "b", "c", "d"]) {
+      const shard = workflowMatrixEntry(
+        LIVE_E2E_WORKFLOW,
+        "validate_live_media_provider_suites",
+        `native-live-extensions-media-video-${suffix}`,
+      );
+      const providers = shard.command?.match(
+        /OPENCLAW_LIVE_VIDEO_GENERATION_PROVIDERS=(\S+)/u,
+      )?.[1];
+      if (!providers) {
+        throw new Error(`Missing video providers for shard ${suffix}`);
+      }
+      expect(providers.split(",")).toHaveLength(4);
+      expect(shard.command).toContain("OPENCLAW_LIVE_VIDEO_GENERATION_TIMEOUT_MS=600000");
+      // Four serial ten-minute operations plus test overhead leave eight minutes for setup.
+      expect(shard.timeout_minutes).toBeGreaterThanOrEqual(4 * 10.5 + 8);
+    }
+    expect(workflow).toContain(
+      "OPENCLAW_LIVE_VIDEO_GENERATION_PROVIDERS=google,kie,minimax,pixverse OPENCLAW_LIVE_VIDEO_GENERATION_TIMEOUT_MS=600000",
+    );
+    expect(workflow).toContain(
+      "OPENCLAW_LIVE_VIDEO_GENERATION_PROVIDERS=novita,openrouter,xai,zai",
+    );
     expect(workflow).toContain(
       "inputs.live_suite_filter == 'native-live-src-gateway-profiles-anthropic'",
     );
@@ -14900,7 +14944,7 @@ promote_windows_release_assets
     });
     expect(authorization.env).toMatchObject({
       APPROVAL_PATH: "${{ runner.temp }}/clawhub-bootstrap-approval/approval.json",
-      CHILD_WORKFLOW_SHA: "${{ github.sha }}",
+      CHILD_WORKFLOW_SHA: "${{ inputs.bootstrap_workflow_sha }}",
       EXPECTED_RUN_ATTEMPT: "${{ inputs.release_publish_run_attempt }}",
       EXPECTED_WORKFLOW_BRANCH: "${{ inputs.release_publish_branch }}",
       RELEASE_PUBLISH_RUN_ID: "${{ inputs.release_publish_run_id }}",
