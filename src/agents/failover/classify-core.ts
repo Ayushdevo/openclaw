@@ -25,6 +25,7 @@ import {
   failoverReasonFromClassification,
   inferSignalStatus,
   isClaudeCliAuthError,
+  isClaudeCliTransientRefreshError,
   isExactUnknownNoDetailsError,
   isGenericUnknownStreamErrorMessage,
   isReplayInvalidErrorMessage,
@@ -99,6 +100,9 @@ function classifyFailoverClassificationFromMessage(
   }
   if (isUnsupportedImageInputErrorMessage(raw)) {
     return toReasonClassification("format");
+  }
+  if (isClaudeCliTransientRefreshError(raw, provider)) {
+    return toReasonClassification("timeout");
   }
   if (isClaudeCliAuthError(raw, provider)) {
     return toReasonClassification("auth");
