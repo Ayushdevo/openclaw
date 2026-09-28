@@ -179,7 +179,7 @@ export function assertSkillPatchRunUsage(params: {
     })
   ) {
     throw new ToolInputError(
-      `skill "${params.skill.skillName}" was not used in this run and cannot be repaired autonomously. Workshop read and prepare_patch do not count as skill use. For a planned change, use action=update with complete proposal_content; apply the proposal only when explicitly authorized by the user.`,
+      `skill "${params.skill.skillName}" was not used in this run and cannot be repaired autonomously. Workshop read and prepare_patch do not count as skill use. For a planned change, use action=update with complete proposal_content only after a complete read; keep it pending unless the user explicitly requests apply. If the complete body was omitted, use operator or CLI access to inspect it rather than overwriting unseen content.`,
     );
   }
 }
