@@ -172,6 +172,7 @@ export function countRichTextChars(text: RichText): number {
 }
 
 type RichBlockMeasurement = { chars: number; blocks: number; media: number; nesting: number };
+const MAX_MEASURE_NESTING = 64;
 
 function measureRichBlockText(text: RichText, size: RichBlockMeasurement, depth: number): void {
   if (typeof text === "string") {
