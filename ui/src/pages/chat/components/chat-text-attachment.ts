@@ -10,6 +10,8 @@ import { toSanitizedMarkdownHtml } from "../../../components/markdown.ts";
 import { t } from "../../../i18n/index.ts";
 import { registerFilePreviewEnglish } from "../../../i18n/locales/en-file-preview.ts";
 import { formatBytes } from "../../../lib/agents/display.ts";
+import { fetchControlUiResource } from "../../../app/browser-http.ts";
+import { downloadBlobFile } from "../../../lib/download.ts";
 import type { EmbedSandboxMode } from "../../../lib/chat/tool-display.ts";
 import { detectTextDirection } from "../../../lib/text-direction.ts";
 import { OpenClawLightDomContentsElement } from "../../../lit/openclaw-element.ts";
@@ -54,6 +56,7 @@ class ChatTextAttachment extends OpenClawLightDomContentsElement {
   @state() private text: string | null = null;
   @state() private failed = false;
   @state() private source = false;
+  @state() private downloadPending = false;
 
   private readonly htmlPreviewLoader = new LazyCustomElementRequestController(this);
   private loadVersion = 0;
@@ -134,6 +137,18 @@ class ChatTextAttachment extends OpenClawLightDomContentsElement {
       if (this.abortController === controller) {
         this.abortController = undefined;
       }
+    }
+  }
+
+  private async downloadAttachment(): Promise<void> {
+    if (this.downloadPending || !this.src) return;
+    this.downloadPending = true;
+    try {
+      const response = await fetchControlUiResource(this.src);
+      if (!response.ok) throw new Error("Attachment download failed (HTTP " + response.status + ")");
+      downloadBlobFile(this.label, await response.blob());
+    } finally {
+      this.downloadPending = false;
     }
   }
 
