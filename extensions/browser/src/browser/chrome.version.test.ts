@@ -121,10 +121,13 @@ describe("readBrowserVersion", () => {
           "-NoProfile",
           "-NonInteractive",
           "-Command",
-          "[System.Diagnostics.FileVersionInfo]::GetVersionInfo($args[0]).ProductVersion",
-          exePath,
+          "[System.Diagnostics.FileVersionInfo]::GetVersionInfo($env:OPENCLAW_BROWSER_PROBE_PATH).ProductVersion",
         ],
-        expect.objectContaining({ timeout: 4000 }),
+        expect.objectContaining({
+          timeout: 4000,
+          env: expect.objectContaining({ OPENCLAW_BROWSER_PROBE_PATH: exePath }),
+          stdio: ["ignore", "pipe", "pipe"],
+        }),
       );
     });
 

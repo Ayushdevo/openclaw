@@ -13,12 +13,15 @@ export function execBrowserProbe(
   args: string[],
   timeoutMs = 1200,
   maxBuffer = 1024 * 1024,
+  env?: NodeJS.ProcessEnv,
 ): string | null {
   try {
     const output = execFileSync(command, args, {
       timeout: timeoutMs,
       encoding: "utf8",
       maxBuffer,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
     });
     return normalizeOptionalString(output) ?? null;
   } catch {
@@ -84,10 +87,11 @@ function readWindowsBrowserVersion(executablePath: string): string | null {
       "-NoProfile",
       "-NonInteractive",
       "-Command",
-      "[System.Diagnostics.FileVersionInfo]::GetVersionInfo($args[0]).ProductVersion",
-      executablePath,
+      "[System.Diagnostics.FileVersionInfo]::GetVersionInfo($env:OPENCLAW_BROWSER_PROBE_PATH).ProductVersion",
     ],
     WINDOWS_FILE_METADATA_TIMEOUT_MS,
+    undefined,
+    { ...process.env, OPENCLAW_BROWSER_PROBE_PATH: executablePath },
   );
   if (metadataVersion) {
     return metadataVersion.replace(/\s+/g, " ").trim();
