@@ -222,13 +222,13 @@ describe("media admission after requester lookup", () => {
             updatedAt: 1,
           },
         );
-        const readStarted = createDeferredCore();
-        const resumeRead = createDeferredCore();
+        const readStarted = createDeferredCore<undefined>();
+        const resumeRead = createDeferredCore<undefined>();
         const read = entryReader.withSessionEntryReadOnlyInWorker;
         vi.spyOn(entryReader, "withSessionEntryReadOnlyInWorker").mockImplementation(
           (scope, assertCurrent, consume) =>
             read(scope, assertCurrent, async (result, owner) => {
-              readStarted.resolve();
+              readStarted.resolve(undefined);
               await resumeRead.promise;
               return consume(result, owner);
             }),
@@ -290,7 +290,7 @@ describe("media admission after requester lookup", () => {
         } else if (revocation === "generation") {
           rotateAgentEventLifecycleGeneration();
         }
-        resumeRead.resolve();
+        resumeRead.resolve(undefined);
         expect(await pending).toBeInstanceOf(Error);
         expect(run).not.toHaveBeenCalled();
         expect(schedule).not.toHaveBeenCalled();
