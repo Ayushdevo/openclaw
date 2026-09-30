@@ -102,9 +102,11 @@ class ScriptedImapServer {
           idleTag = tag;
           socket.write("+ idling\r\n");
         } else if (upper === "UID" && subcommand?.toUpperCase() === "FETCH") {
-          const maximum = this.messages.at(-1)?.uid ?? 0;
+          const lastUid = this.messages.at(-1)?.uid ?? 0;
           const ranges = (line.split(" ")[3] ?? "").split(",").map((range) => {
-            const bounds = range.split(":").map((bound) => (bound === "*" ? maximum : Number(bound)));
+            const bounds = range
+              .split(":")
+              .map((bound) => (bound === "*" ? lastUid : Number(bound)));
             return [Math.min(...bounds), Math.max(...bounds)] as const;
           });
           // Snapshot the response at command time: a held response must not absorb
@@ -263,7 +265,9 @@ describe("IMAP watcher protocol boundary", () => {
       server.append(`From: ${sender}\r\nSubject: Retry ${uid}\r\n\r\nMessage ${uid}`);
     }
     await waitForCursor(61, 10_000);
-    const expected = Array.from({ length: 60 }, (_, index) => index + 2).filter((uid) => uid !== 30);
+    const expected = Array.from({ length: 60 }, (_, index) => index + 2).filter(
+      (uid) => uid !== 30,
+    );
     expect(admitted).toEqual(expected);
     const attempts = dispatchHookAgentTurn.mock.calls.map(([params]) =>
       Number(params.sessionKey.split(":").at(-1)),
