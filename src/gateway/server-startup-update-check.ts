@@ -1,3 +1,4 @@
+import { applyRemoteModelCatalogUpdate } from "../agents/prepared-model-runtime.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { GatewayActiveWorkInspectors } from "../infra/gateway-active-work.js";
 import type { GatewayScheduler } from "../infra/gateway-scheduler.js";
@@ -87,6 +88,7 @@ export function createDeferredGatewayUpdateCheck(params: {
     }
     started = true;
     runWatcher = startUpdateRunWatcher({
+      lifecycle,
       broadcast: (event, payload) =>
         params.broadcastToConnIds(event, payload, params.getClientConnIds()),
       log: params.log,
@@ -106,6 +108,8 @@ export function createDeferredGatewayUpdateCheck(params: {
           owner = await params.createUpdateCheck({
             lifecycle,
             getConfig: params.getConfig,
+            applyRemoteCatalogUpdate: (signal) =>
+              applyRemoteModelCatalogUpdate(params.getConfig, signal),
             onUpdateRunCreated: wakeUpdateRunWatcher,
             log: params.log,
             isNixMode: params.isNixMode,

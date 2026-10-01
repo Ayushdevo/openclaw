@@ -1,9 +1,4 @@
-/**
- * Embedded-mode Gateway method stub.
- *
- * Implements only the Gateway calls needed by session tools and rejects unsupported methods.
- */
-import { normalizeFastMode, type FastMode } from "@openclaw/normalization-core/string-coerce";
+import { normalizeFastMode } from "@openclaw/normalization-core/string-coerce";
 import type {
   SessionsListParams,
   SessionsResolveParams,
@@ -154,18 +149,7 @@ async function handleSessionsSearch(params: Record<string, unknown>) {
   };
 }
 
-async function handleChatHistory(params: Record<string, unknown>): Promise<{
-  sessionKey: string;
-  sessionId: string | undefined;
-  messages: unknown[];
-  offset?: number;
-  nextOffset?: number;
-  hasMore?: boolean;
-  totalMessages?: number;
-  thinkingLevel?: string;
-  fastMode?: FastMode;
-  verboseLevel?: string;
-}> {
+async function handleChatHistory(params: Record<string, unknown>) {
   const rt = await getRuntime();
 
   const sessionKey = typeof params.sessionKey === "string" ? params.sessionKey : "";
@@ -250,7 +234,8 @@ async function handleChatHistory(params: Record<string, unknown>): Promise<{
         messageCost: (message) => jsonUtf8Bytes(message) + 1,
       }) ?? rt.capArrayByJsonBytes(replaced.messages, maxHistoryBytes).items)
     : rt.capArrayByJsonBytes(replaced.messages, maxHistoryBytes).items;
-  const pagination = params.offset === undefined ? undefined : page.pagination;
+  const responseOffset = page.responseOffset ?? (params.offset === undefined ? undefined : offset);
+  const pagination = responseOffset === undefined ? undefined : page.pagination;
   const nextOffset =
     pagination !== undefined
       ? rt.resolveChatHistoryNextOffset({
@@ -270,8 +255,13 @@ async function handleChatHistory(params: Record<string, unknown>): Promise<{
     sessionKey,
     sessionId,
     messages: capped,
-    ...(params.offset !== undefined
-      ? { offset, hasMore, totalMessages: pagination?.totalMessages ?? page.messages.length }
+    ...(page.windowReset ? { windowReset: true } : {}),
+    ...(responseOffset !== undefined
+      ? {
+          offset: responseOffset,
+          hasMore,
+          totalMessages: pagination?.totalMessages ?? page.messages.length,
+        }
       : {}),
     ...(hasMore ? { nextOffset } : {}),
     thinkingLevel: entry?.thinkingLevel,

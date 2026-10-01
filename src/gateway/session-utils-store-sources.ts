@@ -1,6 +1,6 @@
 import { withAgentRosterFactsBatch } from "../agents/agent-scope-config.js";
 import { cloneEnvWithPlatformSemantics } from "../config/config-env-vars.js";
-import type { SessionEntryReadSource } from "../config/sessions/session-accessor.types.js";
+import type { SessionEntryReadSource } from "../config/sessions/session-entry-read-source.types.js";
 import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
 import {
   assertSessionStoreReadCandidate,
@@ -24,7 +24,7 @@ import {
   readOpenClawAgentDatabaseRegistryToken,
 } from "../state/openclaw-agent-db-registry-listing.js";
 import { createOpenClawAgentDatabasePathMatcher } from "../state/openclaw-agent-db.paths.js";
-import { resolveGatewaySessionStoreLookupCandidates } from "./session-utils-store-lookup.js";
+import { resolveGatewaySessionStoreLookupCandidates } from "./session-utils-store-candidates.js";
 import type {
   GatewaySessionStoreReadSources,
   GatewaySessionStoreSourceRequest,
@@ -278,8 +278,6 @@ export async function prepareGatewaySessionStoreReadSourcesAsync(params: {
     path: params.registryPath,
     includeIncompatibleSchemaVersions: true,
   });
-  let registry = await registryRead.read();
-  const original = registry.result;
   const assertSourceCurrent = () => {
     if (
       params.currentSource.agentId !== currentSource.agentId ||
@@ -289,6 +287,27 @@ export async function prepareGatewaySessionStoreReadSourcesAsync(params: {
       throw storeChanged();
     }
   };
+  const readRegistry = async (assertCallerCurrent?: () => void) => {
+    for (let attempt = 0; ; attempt++) {
+      assertCallerCurrent?.();
+      assertSourceCurrent();
+      try {
+        const current = await registryRead.read();
+        assertCallerCurrent?.();
+        assertSourceCurrent();
+        current.assertCurrent();
+        return current;
+      } catch (error) {
+        // One registration can invalidate at both admission and settlement.
+        // Refresh only metadata, retaining the original source and state custody.
+        if (!(error instanceof AgentDatabaseRegistryChangedError) || attempt >= 2) {
+          throw error;
+        }
+      }
+    }
+  };
+  let registry = await readRegistry();
+  const original = registry.result;
   const assertCurrent = () => {
     assertSourceCurrent();
     try {
@@ -338,7 +357,7 @@ export async function prepareGatewaySessionStoreReadSourcesAsync(params: {
           throw error;
         }
       }
-      const current = await registryRead.read();
+      const current = await readRegistry(assertCallerCurrent);
       assertCallerCurrent();
       assertSourceCurrent();
       current.assertCurrent();

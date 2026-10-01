@@ -4,6 +4,8 @@ import type {
   ChatInputReceipts,
   ChatPendingInputsPage,
   ChatHistoryActivity,
+  ChatHistoryDeltaResult as ProtocolChatHistoryDeltaResult,
+  ChatHistoryResetResult,
 } from "../../../../packages/gateway-protocol/src/schema/logs-chat.js";
 import type { GatewaySessionRow, GatewaySessionsDefaults } from "../../api/types.ts";
 import type { ChatMetadataResult } from "../../lib/chat/chat-metadata-cache.ts";
@@ -27,6 +29,7 @@ export type ChatHistoryResult = {
   pendingInputs?: ChatPendingInputsPage;
   inputReceipts?: ChatInputReceipts;
   deltaCursor?: string;
+  windowReset?: boolean;
   messages?: Array<unknown>;
   offset?: number;
   nextOffset?: number;
@@ -49,19 +52,16 @@ export type ChatHistoryResult = {
   };
 };
 
-export type ChatHistoryDeltaResult = {
-  activity?: ChatHistoryActivity[];
-  pendingInputs?: ChatPendingInputsPage;
-  inputReceipts?: ChatInputReceipts;
-  kind: "delta";
-  messages: unknown[];
-  deltaCursor: string;
+export type ChatHistoryDeltaResult = Omit<
+  ProtocolChatHistoryDeltaResult,
+  "sessionInfo" | "inFlightRun" | "metadata"
+> & {
   sessionInfo: GatewaySessionRow;
   inFlightRun?: ChatHistoryResult["inFlightRun"];
   metadata?: ChatMetadataResult;
 };
 
-export type ChatHistoryResetResult = { kind: "reset" };
+export type { ChatHistoryResetResult };
 
 export type ChatHistoryResponse =
   | ChatHistoryResult

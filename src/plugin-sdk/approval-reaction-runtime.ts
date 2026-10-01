@@ -77,7 +77,7 @@ export type ApprovalReactionDecisionResolution = {
 /** Stored target metadata needed to convert a reaction into an approval decision. */
 export type ApprovalReactionTargetRecord<TRoute = unknown> = {
   approvalId: string;
-  /** Explicit ownership; omission is supported only by the deprecated resolver. */
+  /** Optional for legacy record shapes; typed resolution requires explicit ownership. */
   approvalKind?: ChannelApprovalKind;
   allowedDecisions: readonly ExecApprovalReplyDecision[];
   route?: TRoute;
@@ -99,7 +99,9 @@ export function readApprovalReactionTargetRecord(
   if (
     !isRecord(target) ||
     typeof target.approvalId !== "string" ||
-    (target.approvalKind !== "exec" && target.approvalKind !== "plugin")
+    (target.approvalKind !== "exec" &&
+      target.approvalKind !== "plugin" &&
+      target.approvalKind !== "system-agent")
   ) {
     return null;
   }
@@ -185,13 +187,6 @@ export const APPROVAL_REACTION_BINDINGS = [
 const APPROVAL_REACTION_ORDER = APPROVAL_REACTION_BINDINGS.map((binding) => binding.decision);
 const VARIATION_SELECTOR_RE = /[\uFE0E\uFE0F]/gu;
 const FITZPATRICK_MODIFIER_RE = /[\u{1F3FB}-\u{1F3FF}]/gu;
-
-function normalizeDecisionList(
-  allowedDecisions: readonly ExecApprovalReplyDecision[],
-): ExecApprovalReplyDecision[] {
-  const allowed = new Set(allowedDecisions);
-  return APPROVAL_REACTION_ORDER.filter((decision) => allowed.has(decision));
-}
 
 /** List the canonical reaction bindings allowed for a specific approval request. */
 export function listApprovalReactionBindings(params: {
@@ -285,10 +280,13 @@ export function resolveApprovalReactionDecision(params: {
   return null;
 }
 
-function resolveApprovalReactionTargetInternal<TRoute>(params: {
-  target: ApprovalReactionTargetRecord<TRoute> | null | undefined;
+/** Resolve an explicitly typed target without deriving ownership from its id. */
+export function resolveTypedApprovalReactionTarget<TRoute = unknown>(params: {
+  target:
+    | (ApprovalReactionTargetRecord<TRoute> & { approvalKind: ChannelApprovalKind })
+    | null
+    | undefined;
   reactionKey: string;
-  allowLegacyKindInference: boolean;
 }): ApprovalReactionTargetResolution<TRoute> | null {
   const target = params.target;
   if (!target) {
@@ -301,45 +299,21 @@ function resolveApprovalReactionTargetInternal<TRoute>(params: {
   if (!decision) {
     return null;
   }
-  // Typed targets already carry canonical protocol identity. Preserve it byte-for-byte;
-  // only the shipped ownerless path retains its historical trimming behavior.
-  const approvalId = params.allowLegacyKindInference ? target.approvalId.trim() : target.approvalId;
+  const approvalId = target.approvalId;
   const approvalKind = target.approvalKind;
   if (!approvalId) {
     return null;
   }
-  const resolvedKind =
-    approvalKind === "exec" || approvalKind === "plugin"
-      ? approvalKind
-      : params.allowLegacyKindInference
-        ? approvalId.startsWith("plugin:")
-          ? "plugin"
-          : "exec"
-        : null;
-  if (!resolvedKind) {
+  if (approvalKind !== "exec" && approvalKind !== "plugin" && approvalKind !== "system-agent") {
     return null;
   }
   return {
     approvalId,
-    approvalKind: resolvedKind,
+    approvalKind,
     decision: decision.decision,
     normalizedEmoji: decision.normalizedEmoji,
     ...(target.route === undefined ? {} : { route: target.route }),
   };
-}
-
-/** Resolve an explicitly typed target without deriving ownership from its id. */
-export function resolveTypedApprovalReactionTarget<TRoute = unknown>(params: {
-  target:
-    | (ApprovalReactionTargetRecord<TRoute> & { approvalKind: ChannelApprovalKind })
-    | null
-    | undefined;
-  reactionKey: string;
-}): ApprovalReactionTargetResolution<TRoute> | null {
-  return resolveApprovalReactionTargetInternal({
-    ...params,
-    allowLegacyKindInference: false,
-  });
 }
 
 function formatSeverity(value: "info" | "warning" | "critical"): string {
@@ -365,16 +339,11 @@ function buildManualInstructionSection(params: {
   return lines;
 }
 
-function buildCommandActionInstructionSection(actions: PendingApprovalView["actions"]): string[] {
-  return actions.flatMap((action) =>
-    action.command.trim() ? [`${action.label}: ${action.command}`] : [],
-  );
-}
-
 function listDecisionActions(actions: PendingApprovalView["actions"]): ExecApprovalReplyDecision[] {
-  return normalizeDecisionList(
+  const allowed = new Set(
     actions.flatMap((action) => ("decision" in action && action.decision ? [action.decision] : [])),
   );
+  return APPROVAL_REACTION_ORDER.filter((decision) => allowed.has(decision));
 }
 function buildApprovalReactionPromptText(params: {
   view: PendingApprovalView;
@@ -471,7 +440,9 @@ function buildApprovalReactionPromptText(params: {
   if (params.reactionHint) {
     sections.push(params.reactionHint);
   }
-  const commandInstructions = buildCommandActionInstructionSection(view.actions);
+  const commandInstructions = view.actions.flatMap((action) =>
+    action.command.trim() ? [`${action.label}: ${action.command}`] : [],
+  );
   if (commandInstructions.length > 0) {
     sections.push(commandInstructions.join("\n"));
   }
@@ -491,26 +462,6 @@ function withoutPresentation(payload: ReplyPayload): ReplyPayload {
   return rest;
 }
 
-function buildMetadataPayload(params: {
-  request: ApprovalRequest;
-  view: PendingApprovalView;
-  text: string;
-  allowedDecisions: readonly ExecApprovalReplyDecision[];
-}): ReplyPayload {
-  const sessionKey = params.request.request.sessionKey ?? null;
-  return withoutPresentation(
-    buildApprovalPendingReplyPayload({
-      approvalKind: params.view.approvalKind,
-      approvalId: params.view.approvalId,
-      approvalSlug: params.view.approvalId.slice(0, 8),
-      text: params.text,
-      agentId: params.view.agentId ?? null,
-      allowedDecisions: params.allowedDecisions,
-      sessionKey,
-    }),
-  );
-}
-
 /** Build an approval prompt payload with reaction bindings for a prepared view. */
 export function buildApprovalPendingPromptPayload(params: {
   request: ApprovalRequest;
@@ -525,12 +476,17 @@ export function buildApprovalPendingPromptPayload(params: {
     reactionHint: buildApprovalReactionHint({ allowedDecisions }),
   });
   return {
-    ...buildMetadataPayload({
-      request: params.request,
-      view: params.view,
-      text,
-      allowedDecisions,
-    }),
+    ...withoutPresentation(
+      buildApprovalPendingReplyPayload({
+        approvalKind: params.view.approvalKind,
+        approvalId: params.view.approvalId,
+        approvalSlug: params.view.approvalId.slice(0, 8),
+        text,
+        agentId: params.view.agentId ?? null,
+        allowedDecisions,
+        sessionKey: params.request.request.sessionKey ?? null,
+      }),
+    ),
     allowedDecisions,
     reactionBindings,
   };

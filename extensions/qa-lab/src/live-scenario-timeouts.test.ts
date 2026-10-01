@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { nestedToolHistoryFixture } from "../test/nested-tool-activity-fixture.js";
 import { createQaBusState } from "./bus-state.js";
+import type { QaNativeSubagentRun } from "./execution-identity-storage-inspection.js";
 import { resolveQaLiveTurnTimeoutMs } from "./live-timeout.js";
 import { readQaScenarioById } from "./scenario-catalog.js";
 import { requireFlowScenario } from "./scenario-catalog.test-utils.js";
@@ -21,14 +23,8 @@ type CompletionSuccessfulToolEvent = {
   toolCallId: string;
 };
 
-type CompletionTaskFixture = {
+type CompletionRunFixture = Omit<QaNativeSubagentRun, "childSessionKey"> & {
   childSessionKey?: string;
-  createdAt: number;
-  deliveryStatus: "delivered" | "pending";
-  endedAt?: number;
-  label: string;
-  requesterSessionKey: string;
-  status: "running" | "succeeded";
 };
 
 type CompletionParentReplyFixture = {
@@ -46,15 +42,19 @@ type CompletionParentOutboundFixture = {
   text?: string;
 };
 
-const deliveredCompletionTask: CompletionTaskFixture = {
+const deliveredCompletionRun = {
+  runId: "completion-child-run",
   childSessionKey: completionChildSessionKey,
   createdAt: completionAttemptStartedAt + 1,
-  deliveryStatus: "delivered",
-  endedAt: completionChildEndedAt,
+  delivery: { status: "delivered" },
+  execution: {
+    status: "terminal",
+    endedAt: completionChildEndedAt,
+    outcome: { status: "ok" },
+  },
   label: "issue-109025-completion-child-00000000",
   requesterSessionKey: completionParentSessionKey,
-  status: "succeeded",
-};
+} satisfies QaNativeSubagentRun;
 
 function runCompletionPolicyFlow(
   params: {
@@ -62,6 +62,8 @@ function runCompletionPolicyFlow(
     delayedParentReplyHistoryReads?: number;
     parentExecCompletedAt?: number;
     parentExecCommand?: string;
+    parentExecMode?: "direct" | "code-mode";
+    parentExecCustomType?: string;
     parentExecToolCallId?: string;
     parentOutbound?: CompletionParentOutboundFixture | null;
     parentReply?: CompletionParentReplyFixture | null;
@@ -75,13 +77,13 @@ function runCompletionPolicyFlow(
     successfulChildReads?: number;
     successfulParentToolEvents?: CompletionSuccessfulToolEvent[];
     successfulParentToolCalls?: Record<string, number>;
-    taskLookupError?: Error;
-    tasks?: CompletionTaskFixture[];
+    runLookupError?: Error;
+    runs?: CompletionRunFixture[];
   } = {},
 ) {
   const state = createQaBusState();
   const gatewayCalls: Array<{ method: string; request: { sessionKey?: string } }> = [];
-  const taskCommands: unknown[] = [];
+  const runRequesterSessionKeys: string[] = [];
   const transcriptSessionKeys: string[] = [];
   const transcriptReadOptions: unknown[] = [];
   const workspaceWrites: Array<{ content: string; filePath: string }> = [];
@@ -171,12 +173,36 @@ function runCompletionPolicyFlow(
             };
             const parentReplyIsVisible =
               parentReply && gatewayCalls.length > (params.delayedParentReplyHistoryReads ?? 0);
+            const execMessages =
+              params.parentExecMode === "code-mode"
+                ? [
+                    {
+                      role: "assistant",
+                      content: [
+                        {
+                          type: "toolCall",
+                          id: "exec-qa",
+                          name: "exec",
+                          arguments: {
+                            code: `text(await tools.exec(${JSON.stringify(execToolCall.arguments)}));`,
+                          },
+                        },
+                      ],
+                    },
+                    {
+                      ...nestedToolHistoryFixture({
+                        toolName: "exec",
+                        toolCallId: execToolCall.id,
+                        input: execToolCall.arguments,
+                        text: completionProofMarker,
+                      }),
+                      customType: params.parentExecCustomType ?? "openclaw.nested-tool.v1",
+                    },
+                  ]
+                : [{ role: "assistant", content: [execToolCall] }];
             return {
               messages: [
-                {
-                  role: "assistant",
-                  content: [execToolCall],
-                },
+                ...execMessages,
                 ...(parentReplyIsVisible
                   ? [
                       {
@@ -307,12 +333,12 @@ function runCompletionPolicyFlow(
         }
         throw new Error(`unexpected completion transcript session: ${sessionKey}`);
       },
-      runQaCli: async (_env: unknown, command: unknown) => {
-        taskCommands.push(command);
-        if (params.taskLookupError) {
-          throw params.taskLookupError;
+      readNativeQaSubagentRuns: async (_env: unknown, requesterSessionKey: string) => {
+        runRequesterSessionKeys.push(requesterSessionKey);
+        if (params.runLookupError) {
+          throw params.runLookupError;
         }
-        return { tasks: params.tasks ?? [deliveredCompletionTask] };
+        return params.runs ?? [deliveredCompletionRun];
       },
     },
   });
@@ -321,7 +347,7 @@ function runCompletionPolicyFlow(
     gatewayCalls,
     result,
     state,
-    taskCommands,
+    runRequesterSessionKeys,
     transcriptReadOptions,
     transcriptSessionKeys,
     workspaceWrites,
@@ -416,37 +442,65 @@ describe("live subagent scenario timeouts", () => {
   });
 
   it.each([
-    { reason: "missing child task", tasks: [] },
+    { reason: "missing child run", runs: [] },
     {
-      reason: "stale child task",
-      tasks: [{ ...deliveredCompletionTask, createdAt: completionAttemptStartedAt - 1 }],
+      reason: "stale child run",
+      runs: [{ ...deliveredCompletionRun, createdAt: completionAttemptStartedAt - 1 }],
     },
     {
       reason: "different child label",
-      tasks: [{ ...deliveredCompletionTask, label: "another-child" }],
+      runs: [{ ...deliveredCompletionRun, label: "another-child" }],
     },
     {
       reason: "different requester session",
-      tasks: [{ ...deliveredCompletionTask, requesterSessionKey: "agent:qa:someone-else" }],
+      runs: [{ ...deliveredCompletionRun, requesterSessionKey: "agent:qa:someone-else" }],
     },
     {
-      reason: "unfinished child task",
-      tasks: [{ ...deliveredCompletionTask, status: "running" as const }],
+      reason: "unfinished child run",
+      runs: [
+        {
+          ...deliveredCompletionRun,
+          execution: { ...deliveredCompletionRun.execution, status: "running" },
+        },
+      ],
+    },
+    {
+      reason: "failed child run",
+      runs: [
+        {
+          ...deliveredCompletionRun,
+          execution: { ...deliveredCompletionRun.execution, outcome: { status: "error" } },
+        },
+      ],
+    },
+    {
+      reason: "missing child outcome",
+      runs: [
+        {
+          ...deliveredCompletionRun,
+          execution: { ...deliveredCompletionRun.execution, outcome: undefined },
+        },
+      ],
     },
     {
       reason: "undelivered child completion",
-      tasks: [{ ...deliveredCompletionTask, deliveryStatus: "pending" as const }],
+      runs: [{ ...deliveredCompletionRun, delivery: { status: "pending" } }],
     },
     {
       reason: "missing child session identity",
-      tasks: [{ ...deliveredCompletionTask, childSessionKey: undefined }],
+      runs: [{ ...deliveredCompletionRun, childSessionKey: undefined }],
     },
     {
       reason: "missing child completion timestamp",
-      tasks: [{ ...deliveredCompletionTask, endedAt: undefined }],
+      runs: [
+        {
+          ...deliveredCompletionRun,
+          execution: { ...deliveredCompletionRun.execution, endedAt: undefined },
+        },
+      ],
     },
-  ])("rejects a $reason despite matching Gateway completion text", async ({ tasks }) => {
-    await expect(runCompletionPolicyFlow({ tasks }).result).rejects.toThrow(
+  ])("rejects a $reason despite matching Gateway completion text", async ({ runs }) => {
+    await expect(runCompletionPolicyFlow({ runs }).result).rejects.toThrow(
       "test condition was not met",
     );
   });
@@ -644,11 +698,15 @@ describe("live subagent scenario timeouts", () => {
     ).rejects.toThrow("parent successful tool timeline was incomplete");
   });
 
-  it("rejects a visible exec tool call that does not match the successful result identity", async () => {
-    await expect(
-      runCompletionPolicyFlow({ parentExecToolCallId: "another-exec-call" }).result,
-    ).rejects.toThrow("parent exec did not use the exact delivered-completion command");
-  });
+  it.each(["direct", "code-mode"] as const)(
+    "rejects a %s exec tool call that does not match the successful result identity",
+    async (parentExecMode) => {
+      await expect(
+        runCompletionPolicyFlow({ parentExecMode, parentExecToolCallId: "another-exec-call" })
+          .result,
+      ).rejects.toThrow("parent exec did not use the exact delivered-completion command");
+    },
+  );
 
   it("rejects premature parent exec with a guessed completion token", async () => {
     await expect(
@@ -656,11 +714,33 @@ describe("live subagent scenario timeouts", () => {
     ).rejects.toThrow("completion proof did not contain the delivered child marker");
   });
 
-  it("rejects inline filesystem discovery even when the exec proof forges the child marker", async () => {
+  it.each(["direct", "code-mode"] as const)(
+    "rejects %s inline filesystem discovery even when the exec proof forges the child marker",
+    async (parentExecMode) => {
+      await expect(
+        runCompletionPolicyFlow({
+          parentExecMode,
+          parentExecCommand: `node -e 'require("node:fs").readFileSync("guessed-chain")'`,
+          proofCompletionText: "__DELIVERED_CHILD_TOKEN__",
+        }).result,
+      ).rejects.toThrow("parent exec did not use the exact delivered-completion command");
+    },
+  );
+
+  it("rejects a Code Mode nested exec with the wrong command despite matching output", async () => {
     await expect(
       runCompletionPolicyFlow({
-        parentExecCommand: `node -e 'require("node:fs").readFileSync("guessed-chain")'`,
-        proofCompletionText: "__DELIVERED_CHILD_TOKEN__",
+        parentExecMode: "code-mode",
+        parentExecCommand: "printf wrong-command",
+      }).result,
+    ).rejects.toThrow("parent exec did not use the exact delivered-completion command");
+  });
+
+  it("rejects an unrelated custom row with the exact exec ID and command", async () => {
+    await expect(
+      runCompletionPolicyFlow({
+        parentExecMode: "code-mode",
+        parentExecCustomType: "unrelated",
       }).result,
     ).rejects.toThrow("parent exec did not use the exact delivered-completion command");
   });
@@ -684,11 +764,11 @@ describe("live subagent scenario timeouts", () => {
     },
   );
 
-  it("surfaces task snapshot failures without converting them into retry timeouts", async () => {
+  it("surfaces native run snapshot failures without converting them into retry timeouts", async () => {
     await expect(
-      runCompletionPolicyFlow({ taskLookupError: new Error("durable task snapshot unavailable") })
+      runCompletionPolicyFlow({ runLookupError: new Error("native run snapshot unavailable") })
         .result,
-    ).rejects.toThrow("durable task snapshot unavailable");
+    ).rejects.toThrow("native run snapshot unavailable");
   });
 
   it.each([
@@ -702,46 +782,49 @@ describe("live subagent scenario timeouts", () => {
       successfulChildReads: 3,
       failure: "child did not successfully read the complete chain",
     },
-  ])("rejects a delivered task with the $reason", async (fixture) => {
+  ])("rejects a delivered child with the $reason", async (fixture) => {
     await expect(runCompletionPolicyFlow(fixture).result).rejects.toThrow(fixture.failure);
   });
 
-  it("accepts a current requester-owned delivered child with complete transcript proof", async () => {
-    const {
-      gatewayCalls,
-      result,
-      state,
-      taskCommands,
-      transcriptReadOptions,
-      transcriptSessionKeys,
-    } = runCompletionPolicyFlow();
+  it.each(["direct", "code-mode"] as const)(
+    "accepts a current requester-owned delivered child with complete %s transcript proof",
+    async (parentExecMode) => {
+      const {
+        gatewayCalls,
+        result,
+        state,
+        runRequesterSessionKeys,
+        transcriptReadOptions,
+        transcriptSessionKeys,
+      } = runCompletionPolicyFlow({ parentExecMode });
 
-    await expect(result).resolves.toMatchObject({ status: "pass" });
-    expect(gatewayCalls).toEqual([
-      {
-        method: "chat.history",
-        request: { sessionKey: completionParentSessionKey, limit: 100, maxChars: 131_072 },
-      },
-    ]);
-    expect(taskCommands).toEqual([["tasks", "list", "--json", "--runtime", "subagent"]]);
-    expect(transcriptSessionKeys).toEqual([
-      completionParentSessionKey,
-      completionParentSessionKey,
-      completionChildSessionKey,
-    ]);
-    expect(transcriptReadOptions).toEqual([
-      { allowEmpty: true },
-      { afterEventCursor: completionParentTranscriptCursor },
-      undefined,
-    ]);
-    expect(state.getSnapshot().messages[0]?.text).toContain("CHILD_DONE");
-    expect(state.getSnapshot().messages[1]).toMatchObject({
-      accountId: "qa-channel",
-      conversation: { id: "issue-109025-completion", kind: "direct" },
-      direction: "outbound",
-      text: completionProofMarker,
-    });
-  });
+      await expect(result).resolves.toMatchObject({ status: "pass" });
+      expect(gatewayCalls).toEqual([
+        {
+          method: "chat.history",
+          request: { sessionKey: completionParentSessionKey, limit: 100, maxChars: 131_072 },
+        },
+      ]);
+      expect(runRequesterSessionKeys).toEqual([completionParentSessionKey]);
+      expect(transcriptSessionKeys).toEqual([
+        completionParentSessionKey,
+        completionParentSessionKey,
+        completionChildSessionKey,
+      ]);
+      expect(transcriptReadOptions).toEqual([
+        { allowEmpty: true },
+        { afterEventCursor: completionParentTranscriptCursor },
+        undefined,
+      ]);
+      expect(state.getSnapshot().messages[0]?.text).toContain("CHILD_DONE");
+      expect(state.getSnapshot().messages[1]).toMatchObject({
+        accountId: "qa-channel",
+        conversation: { id: "issue-109025-completion", kind: "direct" },
+        direction: "outbound",
+        text: completionProofMarker,
+      });
+    },
+  );
 
   it("waits until the exact final requester reply is visible after the exec result", async () => {
     const { gatewayCalls, result } = runCompletionPolicyFlow({ delayedParentReplyHistoryReads: 2 });

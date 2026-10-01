@@ -75,7 +75,6 @@ describe("renderUsageInsights", () => {
           ],
         },
         {
-          durationSumMs: 0,
           durationCount: 0,
           avgDurationMs: 0,
           errorRate: 0,
@@ -134,7 +133,6 @@ describe("renderUsageInsights", () => {
         totals,
         aggregates,
         {
-          durationSumMs: 0,
           durationCount: 0,
           avgDurationMs: 0,
           errorRate: 0,
@@ -176,7 +174,6 @@ describe("renderUsageInsights", () => {
         costTotals,
         costAggregates,
         {
-          durationSumMs: 0,
           durationCount: 0,
           avgDurationMs: 0,
           errorRate: 0,
@@ -215,7 +212,6 @@ describe("renderUsageInsights", () => {
         costTotals,
         costAggregates,
         {
-          durationSumMs: 0,
           durationCount: 0,
           avgDurationMs: 0,
           errorRate: 0,
@@ -384,7 +380,6 @@ describe("renderSessionsCard", () => {
         noop,
         noop,
         noop,
-        [],
         options.totalSessions ?? sessions.length,
         noop,
       ),
@@ -393,7 +388,7 @@ describe("renderSessionsCard", () => {
     return container;
   };
 
-  it("identifies mixed-agent sessions even when optional metadata columns are hidden", async () => {
+  it("identifies mixed-agent sessions", async () => {
     const container = renderCard([
       { key: "agent:main:one", agentId: "main", usage: null },
       { key: "agent:research:two", agentId: "research", usage: null },
@@ -569,7 +564,6 @@ describe("renderSessionsCard", () => {
         noop,
         noop,
         noop,
-        [],
         sessions.length,
         noop,
       ),

@@ -172,11 +172,7 @@ vi.mock("./update-command-service-command.js", async (importOriginal) => {
     ...actual,
     runUpdatedInstallGatewayCommand: (
       ...[params, action]: Parameters<typeof actual.runUpdatedInstallGatewayCommand>
-    ) =>
-      actual.runUpdatedInstallGatewayCommand(
-        { ...params, opts: { json: params.opts.json } },
-        action,
-      ),
+    ) => actual.runUpdatedInstallGatewayCommand({ ...params, opts: {} }, action),
   };
 });
 vi.mock("../../process/exec.js", async (importOriginal) => {
@@ -842,7 +838,7 @@ describe("preserved update activation with real version guards", () => {
       const state = nativeRunning ? "running" : "stopped";
       return {
         code: 0,
-        stdout: args[0] === "print" ? `state = ${state}\n` : "",
+        stdout: args[0] === "print" ? `${args[1]} = {\n\tstate = ${state}\n}` : "",
         stderr: "",
         termination: "exit",
       };

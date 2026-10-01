@@ -46,6 +46,40 @@ function hasSite(
 }
 
 describe("native app i18n inventory", () => {
+  it("keeps live tool-display translations inventoried after UI call sites disappear", () => {
+    const entries = collectNativeI18nEntriesFromSources([
+      {
+        repoPath: "apps/shared/OpenClawKit/Sources/OpenClawKit/Resources/tool-display.json",
+        surface: "android",
+        source: JSON.stringify({
+          tools: { read: { title: "Read", actions: [{ label: "open", icon: "ignored" }] } },
+        }),
+      },
+    ]);
+    expect(entries.map(({ source, surface, sites }) => ({ source, surface, sites }))).toEqual([
+      {
+        source: "Read",
+        surface: "android",
+        sites: [
+          {
+            kind: "tool-display",
+            path: "apps/shared/OpenClawKit/Sources/OpenClawKit/Resources/tool-display.json",
+          },
+        ],
+      },
+      {
+        source: "open",
+        surface: "android",
+        sites: [
+          {
+            kind: "tool-display",
+            path: "apps/shared/OpenClawKit/Sources/OpenClawKit/Resources/tool-display.json",
+          },
+        ],
+      },
+    ]);
+  });
+
   it("serializes each complete entry on one line", () => {
     const entries = [
       {
@@ -506,6 +540,33 @@ describe("native app i18n inventory", () => {
     ]);
   });
 
+  it("extracts shared auth problem copy without translating commands or URLs", () => {
+    const entries = collectNativeI18nEntriesFromSources([
+      {
+        surface: "apple",
+        repoPath: "apps/shared/OpenClawKit/Sources/OpenClawKit/GatewayConnectionProblem.swift",
+        source: `
+          AuthProblemDefaults(
+            kind: .bootstrapTokenInvalid,
+            owner: .iphone,
+            title: "Setup code no longer valid",
+            message: "Get a fresh setup code from the Gateway owner.",
+            actionLabel: "Scan QR again",
+            actionCommand: "openclaw devices list",
+            docsURLString: "https://docs.openclaw.ai/platforms/ios",
+            retryable: false,
+            pauseReconnect: true)
+        `,
+      },
+    ]);
+
+    expect(entries.map((entry) => entry.source)).toEqual([
+      "Get a fresh setup code from the Gateway owner.",
+      "Scan QR again",
+      "Setup code no longer valid",
+    ]);
+  });
+
   it("collects stable Android and Apple UI entries", async () => {
     const entries = await collectNativeI18nEntries();
     const surfaces = new Set(entries.map((entry) => entry.surface));
@@ -539,7 +600,7 @@ describe("native app i18n inventory", () => {
         "Don't show this again",
         "Use Manual Gateway",
         "Session target",
-        'OpenClaw needs ${labels.joinToString(", ")} permissions to continue.',
+        'OpenClaw uses ${labels.joinToString(", ")} permissions for features that need this access.',
         "Some channel status checks did not complete.",
         "Use the credential for this destination. Leave both fields empty only if this route already has device pairing or does not require a shared credential. Changing the destination clears this form's saved credentials.",
         "Cron changes require operator.admin. Setup codes intentionally do not grant it. Reconnect with the gateway's shared token or password to request admin access. If this device still lacks it, approve the pending scope upgrade from an existing admin client.",
@@ -604,7 +665,9 @@ describe("native app i18n inventory", () => {
               site.path.startsWith("apps/android/app/src/main/") ||
               site.path.startsWith("apps/android/app/src/play/") ||
               site.path.startsWith("apps/android/app/src/thirdParty/") ||
-              site.path === "apps/android/wear/src/main/res/values/strings.xml",
+              site.path === "apps/android/wear/src/main/res/values/strings.xml" ||
+              site.path ===
+                "apps/shared/OpenClawKit/Sources/OpenClawKit/Resources/tool-display.json",
           ),
         ),
     ).toBe(true);
