@@ -165,7 +165,8 @@ export function countRichTextChars(text: RichText): number {
 }
 
 type RichBlockMeasurement = { chars: number; blocks: number; media: number; nesting: number };
-export const MAX_RICH_BLOCK_NESTING = 16;
+// Telegram accepts 15 nested containers plus the leaf, but rejects 16 containers.
+export const MAX_RICH_BLOCK_NESTING = 15;
 
 function measureRichBlockText(text: RichText, size: RichBlockMeasurement, depth: number): void {
   const pending = [{ text, depth }];

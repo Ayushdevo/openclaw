@@ -912,7 +912,7 @@ describe("rich message plan wiring", () => {
     );
     expect(pages[0]?.richMessage?.blocks[0]?.type).toBe("details");
     for (const page of pages) {
-      expect(measureInputRichBlocks(page.richMessage?.blocks ?? []).nesting).toBeLessThanOrEqual(16);
+      expect(measureInputRichBlocks(page.richMessage?.blocks ?? []).nesting).toBeLessThanOrEqual(15);
     }
   });
 
@@ -933,7 +933,7 @@ describe("rich message plan wiring", () => {
       "leaf" + "s".repeat(5000) + "body",
     );
     for (const page of pages) {
-      expect(measureInputRichBlocks(page.richMessage?.blocks ?? []).nesting).toBeLessThanOrEqual(16);
+      expect(measureInputRichBlocks(page.richMessage?.blocks ?? []).nesting).toBeLessThanOrEqual(15);
     }
   });
 
