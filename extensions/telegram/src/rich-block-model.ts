@@ -543,10 +543,7 @@ export function normalizeInputRichBlocks(
                 },
               }),
         };
-      case "pre":
-      case "mathematical_expression":
-      case "divider":
-      case "anchor":
+      default:
         return block;
     }
   });

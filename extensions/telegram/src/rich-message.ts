@@ -142,10 +142,10 @@ export function buildTelegramRichBlocksPlan(
   blocks: InputRichBlock[],
   options?: Pick<TelegramRichMessageOptions, "skipEntityDetection">,
 ): TelegramRichMessagePlan {
-  blocks = normalizeInputRichBlocks(blocks);
-  const plainText = inputRichBlocksToPlainText(blocks);
+  const normalized = normalizeInputRichBlocks(blocks);
+  const plainText = inputRichBlocksToPlainText(normalized);
   return {
-    richMessage: toRichMessage(blocks, plainText, options),
+    richMessage: toRichMessage(normalized, plainText, options),
     plainText,
     degradationReasons: [],
   };

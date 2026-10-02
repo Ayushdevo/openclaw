@@ -907,12 +907,17 @@ describe("rich message plan wiring", () => {
     const text =
       "<details><summary>s</summary>".repeat(depth) + "leaf" + "</details>".repeat(depth);
     const pages = planTelegramTextDeliveryPages({ text, maxChars: 32_768, richMessages: true });
-    expect(pages.map((page) => page.plainText).join("").replace(/\s/g, "")).toBe(
-      "s".repeat(depth) + "leaf",
-    );
+    expect(
+      pages
+        .map((page) => page.plainText)
+        .join("")
+        .replace(/\s/g, ""),
+    ).toBe("s".repeat(depth) + "leaf");
     expect(pages[0]?.richMessage?.blocks[0]?.type).toBe("details");
     for (const page of pages) {
-      expect(measureInputRichBlocks(page.richMessage?.blocks ?? []).nesting).toBeLessThanOrEqual(15);
+      expect(measureInputRichBlocks(page.richMessage?.blocks ?? []).nesting).toBeLessThanOrEqual(
+        15,
+      );
     }
   });
 
@@ -929,11 +934,16 @@ describe("rich message plan wiring", () => {
       richMessages: true,
       richMessage: { blocks: [{ type: "paragraph", text }, block] },
     });
-    expect(pages.map((page) => page.plainText).join("").replace(/\s/g, "")).toBe(
-      "leaf" + "s".repeat(5000) + "body",
-    );
+    expect(
+      pages
+        .map((page) => page.plainText)
+        .join("")
+        .replace(/\s/g, ""),
+    ).toBe("leaf" + "s".repeat(5000) + "body");
     for (const page of pages) {
-      expect(measureInputRichBlocks(page.richMessage?.blocks ?? []).nesting).toBeLessThanOrEqual(15);
+      expect(measureInputRichBlocks(page.richMessage?.blocks ?? []).nesting).toBeLessThanOrEqual(
+        15,
+      );
     }
   });
 

@@ -138,7 +138,7 @@ export function parseHtmlFragment(ir: MarkdownIR): HtmlNode[] {
 
 export function nodeText(nodes: readonly HtmlNode[]): string {
   const parts: string[] = [];
-  const pending = [...nodes].reverse();
+  const pending = nodes.toReversed();
   while (pending.length > 0) {
     const node = pending.pop()!;
     if (node.kind === "text") {

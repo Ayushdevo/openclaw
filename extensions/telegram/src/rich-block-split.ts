@@ -233,9 +233,10 @@ export function splitTelegramRichBlocks(
   if (blocks.length === 0) {
     return [];
   }
-  blocks = normalizeInputRichBlocks(blocks);
   const limits = { textLimit, blockLimit };
-  const expanded = blocks.flatMap((block) => splitOversizedRichBlock(block, limits));
+  const expanded = normalizeInputRichBlocks(blocks).flatMap((block) =>
+    splitOversizedRichBlock(block, limits),
+  );
   const chunks: InputRichBlock[][] = [];
   let current: InputRichBlock[] = [];
   let size: RichBlockBudget = { chars: 0, blocks: 0, media: 0 };
