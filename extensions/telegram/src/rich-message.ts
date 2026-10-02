@@ -3,6 +3,7 @@ import type { InputRichMessage, ReplyParameters } from "grammy/types";
 import type { MarkdownTableMode } from "openclaw/plugin-sdk/config-contracts";
 import {
   inputRichBlocksToPlainText,
+  normalizeInputRichBlocks,
   type InputRichBlock,
   type TelegramRichBlocksDegradationReason,
 } from "./rich-block-model.js";
@@ -141,6 +142,7 @@ export function buildTelegramRichBlocksPlan(
   blocks: InputRichBlock[],
   options?: Pick<TelegramRichMessageOptions, "skipEntityDetection">,
 ): TelegramRichMessagePlan {
+  blocks = normalizeInputRichBlocks(blocks);
   const plainText = inputRichBlocksToPlainText(blocks);
   return {
     richMessage: toRichMessage(blocks, plainText, options),

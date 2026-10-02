@@ -902,6 +902,41 @@ describe("splitTelegramRichBlocks", () => {
 });
 
 describe("rich message plan wiring", () => {
+  it("delivers deeply nested details with readable text beyond the rich depth budget", () => {
+    const depth = 5000;
+    const text =
+      "<details><summary>s</summary>".repeat(depth) + "leaf" + "</details>".repeat(depth);
+    const pages = planTelegramTextDeliveryPages({ text, maxChars: 32_768, richMessages: true });
+    expect(pages.map((page) => page.plainText).join("").replace(/\s/g, "")).toBe(
+      "s".repeat(depth) + "leaf",
+    );
+    expect(pages[0]?.richMessage?.blocks[0]?.type).toBe("details");
+    for (const page of pages) {
+      expect(measureInputRichBlocks(page.richMessage?.blocks ?? []).nesting).toBeLessThanOrEqual(16);
+    }
+  });
+
+  it("bounds caller-supplied blocks and inline arrays before planning delivery", () => {
+    let text: RichText = "leaf";
+    let block: InputRichBlock = { type: "paragraph", text: "body" };
+    for (let depth = 0; depth < 5000; depth += 1) {
+      text = [{ type: "bold", text }];
+      block = { type: "details", summary: "s", blocks: [block] };
+    }
+    const pages = planTelegramTextDeliveryPages({
+      text: "",
+      maxChars: 32_768,
+      richMessages: true,
+      richMessage: { blocks: [{ type: "paragraph", text }, block] },
+    });
+    expect(pages.map((page) => page.plainText).join("").replace(/\s/g, "")).toBe(
+      "leaf" + "s".repeat(5000) + "body",
+    );
+    for (const page of pages) {
+      expect(measureInputRichBlocks(page.richMessage?.blocks ?? []).nesting).toBeLessThanOrEqual(16);
+    }
+  });
+
   it("preserves ordinary ordered lists across recursive block chunks", () => {
     const text = Array.from({ length: 250 }, (_, index) => `${index + 1}. item ${index + 1}`).join(
       "\n",

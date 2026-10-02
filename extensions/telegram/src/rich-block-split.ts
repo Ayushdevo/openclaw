@@ -3,6 +3,7 @@
 import {
   countRichTextChars,
   measureInputRichBlocks,
+  normalizeInputRichBlocks,
   normalizeRichText,
   type InputRichBlock,
   type InputRichBlockListItem,
@@ -232,6 +233,7 @@ export function splitTelegramRichBlocks(
   if (blocks.length === 0) {
     return [];
   }
+  blocks = normalizeInputRichBlocks(blocks);
   const limits = { textLimit, blockLimit };
   const expanded = blocks.flatMap((block) => splitOversizedRichBlock(block, limits));
   const chunks: InputRichBlock[][] = [];
