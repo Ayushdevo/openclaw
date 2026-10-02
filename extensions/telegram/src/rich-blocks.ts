@@ -470,7 +470,7 @@ function emitSegments(
     return [
       {
         type: "paragraph",
-        text: htmlNodes.length ? nodeText(htmlNodes) : ir.text.slice(rangeStart, rangeEnd),
+        text: htmlNodes.length ? nodeText(htmlNodes, true) : ir.text.slice(rangeStart, rangeEnd),
       },
     ];
   }

@@ -126,7 +126,7 @@ export function parseHtmlFragment(ir: MarkdownIR): HtmlNode[] {
           kind: "text",
           start: node.start,
           end: node.end,
-          text: nodeText([node]),
+          text: nodeText([node], true),
         };
       } else {
         pending.push({ nodes: node.children, depth: frame.depth + 1 });
@@ -136,7 +136,7 @@ export function parseHtmlFragment(ir: MarkdownIR): HtmlNode[] {
   return root;
 }
 
-export function nodeText(nodes: readonly HtmlNode[]): string {
+export function nodeText(nodes: readonly HtmlNode[], preserveMediaSources = false): string {
   const parts: string[] = [];
   const pending = nodes.toReversed();
   while (pending.length > 0) {
@@ -146,6 +146,16 @@ export function nodeText(nodes: readonly HtmlNode[]): string {
     } else {
       if (!node.closed) {
         parts.push(decodeTelegramHtmlEntities(node.raw));
+      }
+      if (
+        preserveMediaSources &&
+        node.closed &&
+        (node.name === "img" || node.name === "video" || node.name === "audio")
+      ) {
+        const source = parseHtmlAttrs(node.raw).get("src");
+        if (source) {
+          parts.push(`\n${source}\n`);
+        }
       }
       for (let index = node.children.length - 1; index >= 0; index -= 1) {
         pending.push(node.children[index]!);

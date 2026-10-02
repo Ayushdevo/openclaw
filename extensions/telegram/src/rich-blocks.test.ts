@@ -902,6 +902,20 @@ describe("splitTelegramRichBlocks", () => {
 });
 
 describe("rich message plan wiring", () => {
+  it.each([31, 61])("preserves media sources beyond HTML depth %i", (depth) => {
+    const text =
+      "<details><summary>s</summary>".repeat(depth) +
+      '<img src="https://example.com/a.jpg"/>' +
+      '<video src="https://example.com/a.mp4"></video>' +
+      '<audio src="https://example.com/a.mp3"></audio>' +
+      "</details>".repeat(depth);
+    const pages = planTelegramTextDeliveryPages({ text, maxChars: 32_768, richMessages: true });
+    const delivered = pages.map((page) => page.plainText).join("");
+    expect(delivered).toContain("https://example.com/a.jpg");
+    expect(delivered).toContain("https://example.com/a.mp4");
+    expect(delivered).toContain("https://example.com/a.mp3");
+  });
+
   it("delivers deeply nested details with readable text beyond the rich depth budget", () => {
     const depth = 5000;
     const text =
