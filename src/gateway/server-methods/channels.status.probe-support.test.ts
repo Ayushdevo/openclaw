@@ -106,7 +106,7 @@ describe("channels.status probe support", () => {
     "reports probe support independently of execution ($supported/$probe/$enabled/$configured)",
     async ({ supported, probe, enabled, configured }) => {
       const probeAccount = vi.fn(async () => ({ ok: true }));
-      const plugin = createChannelPlugin({ ...(supported ? { probeAccount } : {}) });
+      const plugin = createChannelPlugin(supported ? { probeAccount } : {});
       plugin.config.isEnabled = () => enabled;
       plugin.config.isConfigured = () => configured;
       mocks.listChannelPlugins.mockReturnValue([plugin]);
