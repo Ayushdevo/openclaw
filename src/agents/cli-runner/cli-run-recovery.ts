@@ -1,3 +1,4 @@
+import { sleepWithAbort } from "../../infra/backoff.js";
 import { formatErrorMessageForDisplay } from "../../infra/error-diagnostics.js";
 import { isCliSessionInvalidatingFailoverReason } from "../cli-session.js";
 import type { EmbeddedAgentRunResult } from "../embedded-agent-runner.js";
@@ -106,6 +107,51 @@ export async function runCliRecovery<TAttempt>(params: {
     runParams.assertCurrent?.();
     let recoveryError = err;
     if (isFailoverError(recoveryError)) {
+      if (
+        runParams.provider === "claude-cli" &&
+        recoveryError.reason === "timeout" &&
+        recoveryError.code === "cli_oauth_refresh_lock"
+      ) {
+        try {
+          // Claude asks callers to retry in a minute while another process owns
+          // its refresh lock. Retain the pre-work native session and run authority.
+          if (
+            remainingCliRecoveryBudgetMs(runParams.timeoutMs, context.startedMonotonicMs) <= 60_000
+          ) {
+            throw recoveryError;
+          }
+          runParams.abortSignal?.throwIfAborted();
+          await sleepWithAbort(60_000, runParams.abortSignal);
+          runParams.assertCurrent?.();
+          runParams.abortSignal?.throwIfAborted();
+          const retryTimeoutMs = remainingCliRecoveryBudgetMs(
+            runParams.timeoutMs,
+            context.startedMonotonicMs,
+          );
+          if (retryTimeoutMs <= 0) {
+            throw recoveryError;
+          }
+          return await params.finishAttempt(
+            await params.executeAttempt(retryableSessionId, {
+              timeoutMs: retryTimeoutMs,
+              ...(runParams.forkCliSessionOnResume
+                ? {
+                    onForkSuccessorPersisted: (sessionId: string) => {
+                      retryableSessionId = sessionId;
+                    },
+                  }
+                : {}),
+            }),
+            retryableSessionId,
+          );
+        } catch (retryErr) {
+          const deliveredRetryFailure = await params.finishDeliveredFailure(retryErr);
+          if (deliveredRetryFailure) {
+            return deliveredRetryFailure;
+          }
+          return await failTerminal(retryErr);
+        }
+      }
       if (
         !runParams.forkCliSessionOnResume &&
         recoveryError.reason === "timeout" &&

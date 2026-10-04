@@ -1,6 +1,7 @@
 import { isAbortError } from "../../infra/abort-signal.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { extractCliErrorMessage } from "../cli-output.js";
+import { isClaudeCliTransientRefreshError } from "../failover/classification-rules.js";
 import {
   coerceToFailoverError,
   FailoverError,
@@ -77,10 +78,12 @@ export function createCliExitFailoverError(params: CliExitFailoverErrorParams): 
   const reason =
     classified?.reason ?? (candidates.length === 0 ? params.emptyReason : undefined) ?? "unknown";
   const code =
-    reason === "context_overflow"
-      ? "cli_context_overflow"
-      : candidates.length === 0 && params.retryEmptyFailure
-        ? "cli_unknown_empty_failure"
-        : undefined;
+    params.retryEmptyFailure && isClaudeCliTransientRefreshError(message, params.context.provider)
+      ? "cli_oauth_refresh_lock"
+      : reason === "context_overflow"
+        ? "cli_context_overflow"
+        : candidates.length === 0 && params.retryEmptyFailure
+          ? "cli_unknown_empty_failure"
+          : undefined;
   return createCliFailoverError(message, reason, params.context, { code });
 }

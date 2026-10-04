@@ -25,6 +25,7 @@ import {
   resolveMcpLoopbackYieldContext,
   updateMcpLoopbackToolCallCapture,
 } from "../gateway/mcp-http.loopback-runtime.js";
+import * as backoff from "../infra/backoff.js";
 import {
   onTrustedInternalDiagnosticEvent,
   resetDiagnosticEventsForTest,
@@ -441,6 +442,32 @@ function createCliUserTurnRecorder(params: {
 
 const CLI_RESEED_PROMPT =
   "Continue this conversation using the OpenClaw transcript below as prior session history.\n\n<conversation_history>\nUser: earlier context\n</conversation_history>\n\n<next_user_message>\nhi\n</next_user_message>";
+
+async function advanceRefreshLockWait<T>(
+  run: () => Promise<T>,
+  onWaiting?: () => void,
+): Promise<T> {
+  let markWaiting: (() => void) | undefined;
+  const waiting = new Promise<void>((resolve) => {
+    markWaiting = resolve;
+  });
+  const sleep = backoff.sleepWithAbort;
+  const sleepSpy = vi.spyOn(backoff, "sleepWithAbort").mockImplementationOnce((...args) => {
+    const result = sleep(...args);
+    markWaiting?.();
+    return result;
+  });
+  try {
+    const result = run();
+    await waiting;
+    expect(sleepSpy).toHaveBeenCalledWith(60_000, expect.anything());
+    onWaiting?.();
+    await vi.advanceTimersByTimeAsync(60_000);
+    return await result;
+  } finally {
+    sleepSpy.mockRestore();
+  }
+}
 
 describe("runCliAgent reliability", () => {
   beforeEach(() => {
@@ -1732,6 +1759,115 @@ describe("runCliAgent reliability", () => {
     expect(supervisorSpawnMock).toHaveBeenCalledTimes(1);
     expect(clearBeforeRetry).not.toHaveBeenCalled();
   });
+
+  it.each([undefined, "existing-cli-session"])(
+    "retries a pre-work Claude OAuth refresh lock with the same session %s",
+    async (cliSessionId) => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
+      supervisorSpawnMock
+        .mockResolvedValueOnce(
+          makeManagedRun({
+            exitCode: 1,
+            stderr:
+              "Failed to refresh OAuth token: another Claude Code process is refreshing the token",
+          }),
+        )
+        .mockResolvedValueOnce(makeManagedRun({ stdout: "recovered" }));
+      const context = makeClaudePreparedContext({ cliSessionId });
+      context.params.timeoutMs = 120_000;
+      context.params.abortSignal = new AbortController().signal;
+      context.preparedBackend.backend = {
+        ...context.preparedBackend.backend,
+        resumeArgs: ["--resume", "{sessionId}"],
+      };
+      const clearBeforeRetry = vi.fn(async () => true);
+      context.params.onBeforeFreshCliSessionRetry = clearBeforeRetry;
+
+      const result = await advanceRefreshLockWait(() => runPreparedCliAgent(context));
+
+      expect(result.payloads).toEqual([{ text: "recovered" }]);
+      expect(supervisorSpawnMock).toHaveBeenCalledTimes(2);
+      const first = requireRecord(callArg(supervisorSpawnMock, 0, 0, "first spawn"), "first spawn");
+      const second = requireRecord(callArg(supervisorSpawnMock, 1, 0, "retry spawn"), "retry spawn");
+      expect(second.argv).toEqual(first.argv);
+      if (cliSessionId) {
+        expect(second.argv).toContain(cliSessionId);
+      }
+      expect(second.timeoutMs).toBeGreaterThan(0);
+      expect(second.timeoutMs).toBeLessThanOrEqual(60_000);
+      expect(clearBeforeRetry).not.toHaveBeenCalled();
+    },
+  );
+
+  it("stops after the second Claude OAuth refresh lock failure", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
+    const message =
+      "Failed to refresh OAuth token: another Claude Code process is refreshing the token";
+    supervisorSpawnMock.mockImplementation(async () =>
+      makeManagedRun({ exitCode: 1, stderr: message }),
+    );
+    const context = makeClaudePreparedContext();
+    context.params.timeoutMs = 120_000;
+    context.params.abortSignal = new AbortController().signal;
+
+    await advanceRefreshLockWait(() =>
+      expect(runPreparedCliAgent(context)).rejects.toMatchObject({
+        reason: "timeout",
+        code: "cli_oauth_refresh_lock",
+      }),
+    );
+    expect(supervisorSpawnMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels the refresh-lock wait without starting another CLI attempt", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
+    supervisorSpawnMock.mockResolvedValueOnce(
+      makeManagedRun({
+        exitCode: 1,
+        stderr: "Failed to refresh OAuth token: another Claude Code process is refreshing the token",
+      }),
+    );
+    const context = makeClaudePreparedContext();
+    const abort = new AbortController();
+    context.params.timeoutMs = 120_000;
+    context.params.abortSignal = abort.signal;
+
+    await advanceRefreshLockWait(
+      () => expect(runPreparedCliAgent(context)).rejects.toThrow(),
+      () => abort.abort(),
+    );
+    expect(supervisorSpawnMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["expired-budget", "cancelled", "other-provider", "permanent-auth"])(
+    "does not retry a Claude OAuth failure for %s",
+    async (scenario) => {
+      const abort = new AbortController();
+      supervisorSpawnMock.mockImplementationOnce(async () => {
+        if (scenario === "cancelled") {
+          abort.abort();
+        }
+        return makeManagedRun({
+          exitCode: 1,
+          stderr:
+            scenario === "permanent-auth"
+              ? "Not logged in · Please run /login"
+              : "Failed to refresh OAuth token: another Claude Code process is refreshing the token",
+        });
+      });
+      const context = makeClaudePreparedContext({
+        provider: scenario === "other-provider" ? "codex-cli" : "claude-cli",
+      });
+      context.params.timeoutMs = 120_000;
+      context.params.abortSignal = abort.signal;
+      if (scenario === "expired-budget") {
+        context.startedMonotonicMs -= context.params.timeoutMs + 1;
+      }
+
+      await expect(runPreparedCliAgent(context)).rejects.toThrow();
+      expect(supervisorSpawnMock).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("does not fresh retry when the run timeout budget is exhausted", async () => {
     const clearBeforeRetry = vi.fn(async () => true);
