@@ -31,12 +31,11 @@ import {
   classifyHiddenGitHubStoreName,
   GITHUB_SETUP_HANDOFF_MAX_AGE_MS,
 } from "./secret-store-hidden-github.js";
-import { isMissingSecretStoreTableError } from "./secret-store-sqlite.js";
+import { withMissingSecretStoreFallback } from "./secret-store-sqlite.js";
 import { SecretStoreValidationError } from "./secret-store-validation-error.js";
 import {
   assertSecretStoreEnvName,
   assertSecretStoreValue,
-  normalizeScope,
   normalizeSecretAllowedHosts,
   parseSecretAllowedHosts,
   type SecretStoreKind,
@@ -162,7 +161,7 @@ export function consumeGitHubSetupHandoff(params: {
     return undefined;
   }
   const now = params.nowMs ?? Date.now();
-  try {
+  return withMissingSecretStoreFallback(() => {
     const value = runOpenClawStateWriteTransaction(
       ({ db: sqlite }) => {
         const db = getNodeSqliteKysely<SecretStoreDatabase>(sqlite);
@@ -200,12 +199,7 @@ export function consumeGitHubSetupHandoff(params: {
       registerSecretValueForRedaction(value);
     }
     return value;
-  } catch (error) {
-    if (isMissingSecretStoreTableError(error)) {
-      return undefined;
-    }
-    throw error;
-  }
+  }, undefined);
 }
 
 /** Captures one coherent team-store snapshot for an agent run's exec environment. */
@@ -361,7 +355,6 @@ export function updateSecretStoreAllowedHosts(params: {
 }): void {
   assertSecretStoreEnvName(params.name);
   const allowedHosts = normalizeSecretAllowedHosts(params.allowedHosts);
-  const { scopeKind, scopeId } = normalizeScope(params.scope);
   const now = Date.now();
   runOpenClawStateWriteTransaction(
     ({ db: sqlite }) => {
@@ -376,8 +369,8 @@ export function updateSecretStoreAllowedHosts(params: {
             updated_at_ms: now,
             updated_by: params.updatedBy,
           })
-          .where("scope_kind", "=", scopeKind)
-          .where("scope_id", "=", scopeId)
+          .where("scope_kind", "=", "team")
+          .where("scope_id", "=", "")
           .where("name", "=", params.name)
           .where("kind", "=", "secret")
           .where("deleted_at_ms", "is", null),

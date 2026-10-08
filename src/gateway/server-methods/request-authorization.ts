@@ -15,7 +15,7 @@ import { withPluginRuntimeRegistryScope } from "../../plugins/runtime/gateway-re
 import { getAsyncWorkSignal } from "../../shared/async-work-scope.js";
 import type { SessionOperatorScope } from "../../shared/session-method-scopes-base.js";
 import type { ExpectedProfileBinding } from "../expected-profile.js";
-import type { GatewayMethodRegistry } from "../methods/registry.js";
+import type { GatewayMethodRegistryView } from "../methods/descriptor.js";
 import {
   prepareGatewaySessionAccessAuthority,
   type GatewaySessionAccessAuthority,
@@ -24,7 +24,10 @@ import { sessionMutationTargetFields } from "../session-method-policy.js";
 import { resolveRequestedSessionAgentId } from "../session-request-agent.js";
 import type { SessionRowReadView } from "../session-row-prepared-read.js";
 import { getSessionRowProjection } from "../session-row-projection-access.js";
+import { resolveSessionMutationAuthorizationAsync } from "../session-sharing-authorization-async.js";
+import { captureSessionMutationRouting } from "../session-sharing-preparation.js";
 import {
+  resolveChatSendAuthorizationParams,
   resolveDirectIncognitoTargets,
   resolveDirectSessionTargets,
 } from "../session-sharing-target-input.js";
@@ -49,10 +52,11 @@ export async function authorizeGatewayRequestPreDispatch(params: {
   requestParams: unknown;
   client: GatewayRequestOptions["client"];
   context: GatewayRequestContext;
-  methodRegistry: GatewayMethodRegistry;
+  methodRegistry: GatewayMethodRegistryView;
   expectedProfileBinding?: ExpectedProfileBinding;
   hasCurrentClientAuthority?: () => boolean;
   assertInvocationCurrent?: () => void;
+  assertPreparationCurrent?: () => void;
   markSessionSubscribePhase?: (phase: SessionSubscribePhase) => void;
   consumeSessionTurn?: {
     target: { sessionKey: string; agentId?: string; sessionId: string };
@@ -64,6 +68,8 @@ export async function authorizeGatewayRequestPreDispatch(params: {
   sessionMutationAuthorization?: SessionMutationAuthorization;
   sessionAccessAuthority?: GatewaySessionAccessAuthority;
 }> {
+  const assertPreparationCurrent =
+    params.assertPreparationCurrent ?? params.assertInvocationCurrent;
   const signal = params.methodRegistry.isObservation(params.method)
     ? getAsyncWorkSignal()
     : undefined;
@@ -94,6 +100,7 @@ export async function authorizeGatewayRequestPreDispatch(params: {
           details: { ...gatewayStartupUnavailableDetails(), method: params.method },
         })
       : null;
+  let assertChatRoutingCurrent: (() => void) | undefined;
   while (true) {
     signal?.throwIfAborted();
     const scopeAuthorization = authorizeMethod();
@@ -122,6 +129,7 @@ export async function authorizeGatewayRequestPreDispatch(params: {
     }
     try {
       params.expectedProfileBinding?.assertCurrent();
+      assertPreparationCurrent?.();
     } catch (error) {
       if (error instanceof SessionMutationAuthorizationChangedError) {
         return { error: error.error };
@@ -149,44 +157,72 @@ export async function authorizeGatewayRequestPreDispatch(params: {
     if (params.consumeSessionTurn && (params.method !== "chat.send" || sessionPolicy)) {
       throw new Error("Session turn consumers require core chat.send admission");
     }
+    let requestParams = params.requestParams;
+    if (params.method === "chat.send" && !sessionPolicy) {
+      const cfg = params.context.getRuntimeConfig();
+      if (!assertChatRoutingCurrent) {
+        const routing = captureSessionMutationRouting(cfg);
+        assertChatRoutingCurrent = () => routing(params.context.getRuntimeConfig());
+      }
+      assertChatRoutingCurrent();
+      const normalized = resolveChatSendAuthorizationParams(cfg, requestParams);
+      if (!normalized.ok) {
+        return { error: normalized.error };
+      }
+      requestParams = normalized.value;
+    }
     const projection =
       !sessionPolicy &&
-      resolveDirectSessionTargets(params.method, params.requestParams).length > 0 &&
+      resolveDirectSessionTargets(params.method, requestParams).length > 0 &&
       (params.consumeSessionTurn || !isGatewayAdmin(params.client))
         ? getSessionRowProjection(params.context)
         : undefined;
-    const authorizeSession = (sessionRowRead?: SessionRowReadView) =>
-      sessionPolicy
+    const sessionAuthorizationParams = {
+      client: params.client ?? null,
+      method: params.method,
+      requestParams,
+      context: params.context,
+      sessionScope: scopeAuthorization.sessionScope,
+    };
+    const assertSessionInvocationCurrent = () => {
+      assertPreparationCurrent?.();
+      assertChatRoutingCurrent?.();
+    };
+    const authorizeCurrent = (assertCurrent?: () => void, release?: () => void) => {
+      const current = authorizeMethod();
+      const authorizationError = current.error ?? startupError();
+      if (authorizationError) {
+        release?.();
+        return authorizationError;
+      }
+      try {
+        params.expectedProfileBinding?.assertCurrent();
+        assertCurrent?.();
+      } catch (error) {
+        release?.();
+        if (error instanceof SessionMutationAuthorizationChangedError) {
+          return error.error;
+        }
+        throw error;
+      }
+      if (current.sessionScope !== scopeAuthorization.sessionScope) {
+        release?.();
+        return errorShape(ErrorCodes.FORBIDDEN, "Gateway requester authority changed");
+      }
+      return null;
+    };
+    const authorizeSession = (sessionRowRead?: SessionRowReadView) => {
+      assertSessionInvocationCurrent();
+      return sessionPolicy
         ? { error: null }
-        : resolveSessionMutationAuthorization({
-            client: params.client ?? null,
-            method: params.method,
-            requestParams: params.requestParams,
-            context: params.context,
-            sessionRowRead,
-            sessionScope: scopeAuthorization.sessionScope,
-          });
+        : resolveSessionMutationAuthorization({ ...sessionAuthorizationParams, sessionRowRead });
+    };
     const authorizeSessionAndConsume = params.consumeSessionTurn
       ? (sessionRowRead?: SessionRowReadView) => {
           // Consume transient incognito rows before their prepared view closes.
-          const currentAuthorization = authorizeMethod();
-          const currentError = currentAuthorization.error ?? startupError();
-          if (currentError) {
-            return { error: currentError };
-          }
-          try {
-            params.expectedProfileBinding?.assertCurrent();
-            params.assertInvocationCurrent?.();
-          } catch (error) {
-            if (error instanceof SessionMutationAuthorizationChangedError) {
-              return { error: error.error };
-            }
-            throw error;
-          }
-          if (currentAuthorization.sessionScope !== scopeAuthorization.sessionScope) {
-            return {
-              error: errorShape(ErrorCodes.FORBIDDEN, "Gateway requester authority changed"),
-            };
+          const error = authorizeCurrent(() => params.assertInvocationCurrent?.());
+          if (error) {
+            return { error };
           }
           if (!sessionRowRead) {
             return { error: errorShape(ErrorCodes.UNAVAILABLE, "Session facts are unavailable") };
@@ -238,18 +274,21 @@ export async function authorizeGatewayRequestPreDispatch(params: {
       projection && !subscriptionAccessOnly
         ? await projection.withPreparedExactRows((cfg) => {
             signal?.throwIfAborted();
-            return resolveDirectSessionTargets(params.method, params.requestParams).flatMap(
-              (target) => {
-                const agent = resolveRequestedSessionAgentId(
-                  cfg,
-                  target.sessionKey,
-                  target.agentId,
-                );
-                return agent.ok ? [{ key: target.sessionKey, agentId: agent.agentId }] : [];
-              },
-            );
+            assertChatRoutingCurrent?.();
+            return resolveDirectSessionTargets(params.method, requestParams).flatMap((target) => {
+              const agent = resolveRequestedSessionAgentId(cfg, target.sessionKey, target.agentId);
+              return agent.ok ? [{ key: target.sessionKey, agentId: agent.agentId }] : [];
+            });
           }, authorizeSessionAndConsume)
-        : withCanonicalSessionValidationDeferral(() => authorizeSessionAndConsume());
+        : params.method === "chat.send" && !sessionPolicy && !params.consumeSessionTurn
+          ? {
+              kind: "complete" as const,
+              value: await resolveSessionMutationAuthorizationAsync({
+                ...sessionAuthorizationParams,
+                assertInvocationCurrent: assertSessionInvocationCurrent,
+              }),
+            }
+          : withCanonicalSessionValidationDeferral(() => authorizeSessionAndConsume());
     params.markSessionSubscribePhase?.("accessFacts");
     signal?.throwIfAborted();
     if (preparedSessionMutation.kind === "pending") {
@@ -271,7 +310,7 @@ export async function authorizeGatewayRequestPreDispatch(params: {
     let sessionAccessAuthority: GatewaySessionAccessAuthority | undefined;
     if (sessionPolicy) {
       try {
-        sessionAccessAuthority = await prepareGatewaySessionAccessAuthority({
+        const preparedAccess = await prepareGatewaySessionAccessAuthority({
           policy: sessionPolicy,
           requestParams: params.requestParams,
           client: params.client ?? null,
@@ -279,9 +318,11 @@ export async function authorizeGatewayRequestPreDispatch(params: {
           ownSessionOnly: scopeAuthorization.sessionScope === "operator.sessions.write",
           hasCurrentClientAuthority: params.hasCurrentClientAuthority,
           assertInvocationCurrent: params.assertInvocationCurrent,
+          assertPreparationCurrent,
         });
+        sessionAccessAuthority = preparedAccess.authority;
         params.expectedProfileBinding?.assertCurrent();
-        sessionAccessAuthority.assertCurrent();
+        preparedAccess.assertPreparationCurrent();
       } catch (error) {
         sessionAccessAuthority?.release();
         if (error instanceof SessionMutationAuthorizationChangedError) {
@@ -302,24 +343,11 @@ export async function authorizeGatewayRequestPreDispatch(params: {
         }),
       };
     }
-    const currentAuthorization = authorizeMethod();
-    const currentError = currentAuthorization.error ?? startupError();
-    if (currentError) {
-      sessionAccessAuthority?.release();
-      return { error: currentError };
-    }
-    try {
-      params.expectedProfileBinding?.assertCurrent();
-    } catch (error) {
-      sessionAccessAuthority?.release();
-      if (error instanceof SessionMutationAuthorizationChangedError) {
-        return { error: error.error };
-      }
-      throw error;
-    }
-    if (currentAuthorization.sessionScope !== scopeAuthorization.sessionScope) {
-      sessionAccessAuthority?.release();
-      return { error: errorShape(ErrorCodes.FORBIDDEN, "Gateway requester authority changed") };
+    const error = authorizeCurrent(assertSessionInvocationCurrent, () =>
+      sessionAccessAuthority?.release(),
+    );
+    if (error) {
+      return { error };
     }
     return {
       error: null,

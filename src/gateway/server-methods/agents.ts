@@ -690,7 +690,7 @@ export const agentsHandlers: GatewayRequestHandlers = {
             );
           }
           if (configured && lockedJournal?.cleanupCompleted) {
-            const claimed = claimCompletedAgentDeletion(agentId, lockedJournal.operationId);
+            const claimed = await claimCompletedAgentDeletion(agentId, lockedJournal.operationId);
             const remainingJournal = readAgentDeletionJournal(agentId);
             if (!claimed && remainingJournal) {
               throw new Error(
@@ -700,7 +700,7 @@ export const agentsHandlers: GatewayRequestHandlers = {
             lockedJournal = undefined;
           }
           const deleteFiles = lockedJournal?.deleteFiles ?? requestedDeleteFiles;
-          const deletion = begin(
+          const deletion = await begin(
             lockedJournal ?? {
               agentId,
               agentDir: resolveAgentDir(lockedConfig, agentId),
@@ -777,7 +777,7 @@ export const agentsHandlers: GatewayRequestHandlers = {
               }
             }
             await context.cron.removeAgentJobsTransactional(agentId, () =>
-              withAgentExecApprovalsRemoved(agentId, async () => {
+              withAgentExecApprovalsRemoved(deletion.entry, async () => {
                 deletion.assertCurrent();
                 if (!rosterCommitted) {
                   try {
@@ -831,7 +831,7 @@ export const agentsHandlers: GatewayRequestHandlers = {
               }
             }
             if (canReleaseFence) {
-              deletion.rollback();
+              await deletion.rollback();
             }
             throw error;
           }

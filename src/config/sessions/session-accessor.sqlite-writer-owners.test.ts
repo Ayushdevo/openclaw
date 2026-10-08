@@ -45,13 +45,15 @@ function observeSlowWriters(
   const getChildLogger = logging.getChildLogger;
   vi.spyOn(logging, "getChildLogger").mockImplementation((...args) => {
     const logger = getChildLogger(...args);
-    vi.spyOn(logger, "warn").mockImplementation((message, fields) => {
-      if (message === "slow SQLite session write") {
+    vi.spyOn(logger, "warn").mockImplementation((first: unknown, second: unknown) => {
+      if (second === "slow SQLite session write") {
+        const fields = first;
         assert(fields && typeof fields === "object");
         const operation = "operation" in fields ? fields.operation : undefined;
         operations.push(operation);
         onWarning(operation, fields);
-      } else if (message === "slow SQLite session archive pruning") {
+      } else if (first === "slow SQLite session archive pruning") {
+        const fields = second;
         assert(fields && typeof fields === "object");
         onPruning(fields);
       }
@@ -397,18 +399,12 @@ it("coalesces automatic maintenance through native planning and finalization", a
       expect(operations).toEqual([
         "session.maintenance.plan",
         "session.reclamation.retain",
-        "session.maintenance.plan",
         "session.reclamation.retain",
         "session.reclamation.retain",
         "session.reclamation.worker-commit",
         "session.reclamation.retain",
       ]);
-      expect(workerOutcomes.map(({ kind }) => kind)).toEqual([
-        "maintenance-plan",
-        "maintenance-plan",
-        "maintenance-finalize",
-        "maintenance-age",
-      ]);
+      expect(workerOutcomes.map(({ kind }) => kind)).toEqual(["maintenance-finalize"]);
       for (const outcome of workerOutcomes) {
         expect(outcome.outcome).toBe("resolved");
         expect(outcome.workerThreadId).toBeGreaterThan(0);

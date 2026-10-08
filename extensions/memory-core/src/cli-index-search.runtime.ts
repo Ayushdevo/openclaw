@@ -16,9 +16,9 @@ import {
   resolveMemoryDeepDreamingConfig,
 } from "openclaw/plugin-sdk/memory-core-host-status";
 import { resolveNonNegativeIntegerOption } from "openclaw/plugin-sdk/number-runtime";
+import { buildAgentSessionKey } from "openclaw/plugin-sdk/routing";
 import { resolveForeignMemorySlotOwner } from "./cli-memory-slot.js";
 import {
-  buildCliMemorySearchSessionKey,
   emitMemoryCoreSidecarNotice,
   formatAuditCounts,
   formatExtraPaths,
@@ -67,7 +67,7 @@ export async function runMemoryIndex(
   setVerbose(Boolean(opts.verbose));
   await withMemoryCommand({
     commandName: "memory index",
-    agent: opts.agent,
+    options: { agent: opts.agent },
     allAgents: true,
     purpose: "cli",
     inspectSources: true,
@@ -206,9 +206,7 @@ export async function runMemorySearch(
 ) {
   await withMemoryCommand({
     commandName: "memory search",
-    agent: opts.agent,
-    diagnosticsToStderr: Boolean(opts.json),
-    onUnavailable: opts.json ? defaultRuntime.writeJson : undefined,
+    options: opts,
     requiresMemorySlot: true,
     purpose: "cli",
     inspectSources: true,
@@ -223,7 +221,12 @@ export async function runMemorySearch(
         pluginConfig: memoryPluginConfig,
         cfg,
       });
-      const sessionKey = buildCliMemorySearchSessionKey(agentId);
+      const sessionKey = buildAgentSessionKey({
+        agentId,
+        channel: "cli",
+        peer: { kind: "direct", id: "memory-search" },
+        dmScope: "per-channel-peer",
+      });
       let readRebuildWarning: () => string | undefined = () => undefined;
       let results: Awaited<ReturnType<typeof manager.search>>;
       try {
@@ -376,9 +379,7 @@ export async function runMemoryPromote(
 ) {
   await withMemoryCommand({
     commandName: "memory promote",
-    agent: opts.agent,
-    diagnosticsToStderr: Boolean(opts.json),
-    onUnavailable: opts.json ? defaultRuntime.writeJson : undefined,
+    options: opts,
     purpose: "status",
     ...hostOptions,
     run: async ({ manager, cfg, agentId }) => {
@@ -550,9 +551,7 @@ export async function runMemoryPromoteExplain(
 ) {
   await withMemoryCommand({
     commandName: "memory promote-explain",
-    agent: opts.agent,
-    diagnosticsToStderr: Boolean(opts.json),
-    onUnavailable: opts.json ? defaultRuntime.writeJson : undefined,
+    options: opts,
     purpose: "status",
     ...hostOptions,
     run: async ({ manager, cfg, agentId }) => {

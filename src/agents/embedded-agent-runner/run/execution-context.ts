@@ -22,7 +22,7 @@ export type PreparedEmbeddedRunInput = {
   onInitialWriterPrepared: (resource: AsyncDisposable) => void;
   preReplyGeneration?: Awaited<ReturnType<typeof prepareCronRootSessionGeneration>>;
   runParams: RunEmbeddedAgentParamsWithSessionFile;
-  sessionAdmission?: ReturnType<typeof assertAgentHarnessRunAdmission>;
+  sessionAdmission?: Awaited<ReturnType<typeof assertAgentHarnessRunAdmission>>;
   contextEngineAgentId?: string;
   provider: string;
   modelId: string;
@@ -55,8 +55,6 @@ export type PreparedEmbeddedAttemptDispatchInput = {
   sessionPromptState: Awaited<ReturnType<typeof createEmbeddedRunSessionPromptState>>;
   terminalRetryState: ReturnType<typeof createEmbeddedRunTerminalRetryState>;
   replayState: EmbeddedRunReplayState;
-  provider: string;
-  modelId: string;
   startupStagesEmitted: boolean;
   bootstrapPromptWarningSignaturesSeen: string[];
   resolveRuntimeFallbackReason: () => string | null;

@@ -30,6 +30,7 @@ import {
   prepareGatewayLocalUserIngress,
 } from "../local-user-ingress.js";
 import { getSessionRowProjection } from "../session-row-projection-access.js";
+import { SessionMutationFactsUnavailableError } from "../session-sharing-preparation.js";
 import {
   authorizeResolvedSessionMutation,
   resolveSessionMutationAuthorization,
@@ -378,12 +379,14 @@ describe("session sharing handlers", () => {
           createdActor: { type: "human", source: "profile", id: "owner@example.com" },
         },
       );
+      const previewContext = context(vi.fn());
+      await initializeSessionReadContext(previewContext);
       const previewFor = async (client: GatewayClient) => {
         const responses: Parameters<RespondFn>[] = [];
         await createControlUiHandlers()["controlUi.sessionPreview"]?.({
           params: { sessionKey },
           client,
-          context: context(vi.fn()),
+          context: previewContext,
           respond: (...response: Parameters<RespondFn>) => responses.push(response),
         } as never);
         return responses[0]?.[1];
@@ -413,6 +416,8 @@ describe("session sharing handlers", () => {
           visibility: "shared",
         },
       );
+      const broadcast = vi.fn();
+      const requestContext = context(broadcast);
       const run = sharingLifecycle.runExclusiveSessionLifecycleMutation;
       vi.spyOn(sharingLifecycle, "runExclusiveSessionLifecycleMutation").mockImplementationOnce(
         async (operation, params) => {
@@ -427,14 +432,14 @@ describe("session sharing handlers", () => {
           expect(loadSessionEntry({ agentId: "main", sessionKey })?.sessionId).toBe(
             "session-replaced",
           );
+          await getSessionRowProjection(requestContext)!.prepareMembership();
           return run(operation, params);
         },
       );
-      const broadcast = vi.fn();
 
       await expect(
-        call("session.visibility.set", { sessionKey, visibility: "draft" }, context(broadcast)),
-      ).rejects.toThrow("session changed before sharing mutation");
+        call("session.visibility.set", { sessionKey, visibility: "draft" }, requestContext),
+      ).rejects.toThrow(SessionMutationFactsUnavailableError);
 
       const replacement = loadSessionEntry({ agentId: "main", sessionKey });
       expect(replacement?.sessionId).toBe("session-replaced");

@@ -1,4 +1,3 @@
-/** LaunchAgent plist, environment-file, and atomic publication ownership. */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -221,10 +220,16 @@ export async function readExistingLaunchAgentPlist(
 }
 
 type LaunchAgentFileState = NonNullable<Awaited<ReturnType<typeof readServiceFileState>>>;
-type LaunchAgentFilePublication = Awaited<ReturnType<typeof captureLaunchAgentFiles>>;
+type LaunchAgentFilePublication = Awaited<ReturnType<typeof captureLaunchAgentInstallFiles>>;
 
 /** Captured file identities bound rollback to this install's actual publications. */
-async function captureLaunchAgentFiles(paths: string[]) {
+export async function captureLaunchAgentInstallFiles(env: GatewayServiceEnv) {
+  const label = resolveLaunchAgentLabel(env);
+  const paths = [
+    resolveLaunchAgentPlistPath(env),
+    resolveLaunchAgentEnvFilePath(env, label),
+    resolveLaunchAgentEnvWrapperPath(env, label),
+  ];
   const originals = new Map<
     string,
     { snapshot: LaunchAgentFileSnapshot | null; state: LaunchAgentFileState | null }
@@ -351,15 +356,6 @@ async function captureLaunchAgentFiles(paths: string[]) {
   };
 }
 
-export function captureLaunchAgentInstallFiles(env: GatewayServiceEnv) {
-  const label = resolveLaunchAgentLabel(env);
-  return captureLaunchAgentFiles([
-    resolveLaunchAgentPlistPath(env),
-    resolveLaunchAgentEnvFilePath(env, label),
-    resolveLaunchAgentEnvWrapperPath(env, label),
-  ]);
-}
-
 async function publishLaunchAgentPlist(params: {
   label: string;
   plistPath: string;
@@ -413,7 +409,7 @@ export async function writeLaunchAgentPlist(
   const label = resolveLaunchAgentLabel(env);
   await assertNoSystemLaunchDaemonOwnership(label);
 
-  const { logDir, stdoutPath } = resolveGatewaySupervisorLogPaths(env, { platform: "darwin" });
+  const { logDir, stdoutPath } = resolveGatewaySupervisorLogPaths(env);
   await ensureSecureDirectory(logDir);
 
   const plistPath = resolveLaunchAgentPlistPathForLabel(env, label);
@@ -482,7 +478,7 @@ export async function rewriteLaunchAgentPlistForRestart({
   const publication = await captureLaunchAgentInstallFiles(env);
   const definitionTransaction = publication.hooks;
   return withGatewayServiceInstallationRecovery(async () => {
-    const { logDir, stdoutPath } = resolveGatewaySupervisorLogPaths(env, { platform: "darwin" });
+    const { logDir, stdoutPath } = resolveGatewaySupervisorLogPaths(env);
     await ensureSecureDirectory(logDir);
 
     const serviceDescription = resolveGatewayServiceDescription({

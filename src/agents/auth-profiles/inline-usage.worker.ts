@@ -13,6 +13,12 @@ import {
   type InlineAuthFailureReceipt,
 } from "./inline-usage-kernel.js";
 import { inspectAuthProfileJsonCell } from "./sqlite-json.js";
+import {
+  authProfilePeerGenerationMayMatch,
+  updateAuthProfileStoreInDatabase,
+} from "./store-update-kernel.js";
+import type { AuthProfileUsageReceipt } from "./store.worker-contract.js";
+import { recordAuthProfileUsageInDatabase } from "./usage-kernel.js";
 
 /** The canonical agent executor lends its connection and transaction/commit admission. */
 export function bindSqliteWorkerBackend(
@@ -21,6 +27,15 @@ export function bindSqliteWorkerBackend(
 ): SqliteWorkerBackend<InlineAuthFailureOperations> {
   return {
     execute(command) {
+      if (command.type === "authProfiles.update") {
+        if (!authProfilePeerGenerationMayMatch(context.database, command.input)) {
+          return false;
+        }
+        runSqliteWorkerTransactionSync(context, () =>
+          updateAuthProfileStoreInDatabase(context.database, "agent", command.input),
+        );
+        return true;
+      }
       if (command.type === "authProfiles.inlineSnapshot") {
         return runSqliteDeferredTransactionSync(context.database, () => ({
           store: inspectAuthProfileJsonCell(context.database, "store", "agent"),
@@ -29,16 +44,26 @@ export function bindSqliteWorkerBackend(
         }));
       }
       let receipt: InlineAuthFailureReceipt | undefined;
+      let usageReceipt: AuthProfileUsageReceipt | undefined;
       let committed = false;
       try {
         runSqliteWorkerTransactionSync(
           context,
           () => {
-            receipt = recordInlineAuthFailureInDatabase(
-              context.database,
-              context.databasePath,
-              command.input,
-            );
+            if (command.type === "authProfiles.usage") {
+              usageReceipt = recordAuthProfileUsageInDatabase(
+                context.database,
+                context.databasePath,
+                "agent",
+                command.input,
+              );
+            } else {
+              receipt = recordInlineAuthFailureInDatabase(
+                context.database,
+                context.databasePath,
+                command.input,
+              );
+            }
           },
           {
             withCommit(commit) {
@@ -48,7 +73,7 @@ export function bindSqliteWorkerBackend(
           },
         );
       } catch (error) {
-        if (!committed || !receipt) {
+        if (!committed || (!receipt && !usageReceipt)) {
           // A confirmed rollback is a domain refusal, not an unsettled executor.
           assertTransactionUsable(context.database);
           if (!context.database.isOpen || context.database.isTransaction) {
@@ -64,6 +89,9 @@ export function bindSqliteWorkerBackend(
           "Auth usage committed before transaction cleanup failed",
           error,
         );
+      }
+      if (usageReceipt) {
+        return { ok: true, receipt: usageReceipt };
       }
       if (!receipt) {
         throw new Error("Auth usage transaction produced no durable result");

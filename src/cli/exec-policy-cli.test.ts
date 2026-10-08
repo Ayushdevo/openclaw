@@ -94,14 +94,13 @@ const mocks = vi.hoisted(() => {
       async ({
         baseHash,
         update,
-      }: {
-        baseHash?: string;
-        update: (file: ExecApprovalsFile) => ExecApprovalsFile | null;
-      }) => {
+      }: Parameters<typeof import("../infra/exec-approvals.js").updateExecApprovals>[0]) => {
         if (baseHash !== undefined && baseHash !== approvalsHash) {
           return null;
         }
-        const next = update(structuredClone(approvalsState));
+        const { applyExecApprovalsUpdate } =
+          await import("../infra/exec-approvals-mutation.kernel.js");
+        const next = applyExecApprovalsUpdate(structuredClone(approvalsState), update);
         if (next !== null) {
           approvalsState = next;
           approvalsHash = "written-approvals-hash";
@@ -137,11 +136,20 @@ vi.mock("../infra/exec-approvals.js", async () => {
   );
   return {
     ...actual,
-    readExecApprovalsSnapshot: mocks.readExecApprovalsSnapshot,
+    readExecApprovalsSnapshotAsync: async () => mocks.readExecApprovalsSnapshot(),
     restoreExecApprovalsSnapshotLocked: mocks.restoreExecApprovalsSnapshot,
     updateExecApprovals: mocks.updateExecApprovals,
   };
 });
+
+// mock-isolation: In-memory policy cases omit filesystem ownership; the real CLI boundary is covered by local-state-owner.process.test.ts.
+vi.mock("./local-state-owner.js", () => ({
+  runWithLocalStateOwner: ({
+    runLocal,
+  }: {
+    runLocal: (scope: { assertCurrent: () => void }) => unknown;
+  }) => runLocal({ assertCurrent() {} }),
+}));
 
 vi.mock("./gateway-rpc.js", async () => {
   const actual = await vi.importActual<typeof import("./gateway-rpc.js")>("./gateway-rpc.js");
@@ -830,6 +838,8 @@ describe("exec-policy CLI", () => {
       expect(mocks.restoreExecApprovalsSnapshot).toHaveBeenCalledWith(
         originalSnapshot,
         "written-approvals-hash",
+        expect.anything(),
+        expect.any(Function),
       );
       expect(mocks.updateExecApprovals).toHaveBeenCalledTimes(concurrent ? 2 : 1);
       if (!rollbackError) {
