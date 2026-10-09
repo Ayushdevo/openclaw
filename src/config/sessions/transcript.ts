@@ -22,6 +22,7 @@ import {
   OPENCLAW_TRANSCRIPT_ARTIFACT_PROVIDER,
   isTranscriptOnlyOpenClawAssistantMessage,
 } from "../../shared/transcript-only-openclaw-assistant.js";
+import { rethrowIncognitoSessionError } from "../../state/incognito-session-error.js";
 import type { OpenClawConfig } from "../types.openclaw.js";
 import {
   parseSqliteSessionFileMarker,
@@ -32,7 +33,6 @@ import {
   loadSessionEntryReadOnly,
   isSessionTranscriptProjectionUnavailableError,
   persistSessionTranscriptTurn,
-  readActiveTranscriptEntryAnchor,
   readLatestTranscriptAssistantText,
   readSessionTranscriptMessageEventPage,
   resolveSessionEntrySelection,
@@ -44,7 +44,10 @@ import {
   type TranscriptEntryAnchor,
   type TranscriptEvent,
 } from "./session-accessor.js";
+import { resolveSqliteSessionKey } from "./session-accessor.sqlite-scope.js";
 import type { LatestTranscriptAssistantText } from "./session-accessor.types.js";
+import { captureIncognitoSessionOperation } from "./session-incognito-binding.js";
+import { readActiveTranscriptEntryAnchorAsync } from "./session-transcript-anchor-read.js";
 import { prepareSessionTranscriptHydration } from "./session-transcript-hydration.js";
 import type {
   SessionLifecycleRevisionExpectation,
@@ -69,6 +72,7 @@ import {
   readPreferredUpstreamUserText,
 } from "./transcript-recent-window.js";
 import { streamSessionTranscriptLinesReverse } from "./transcript-stream.js";
+import { captureOwnedTranscriptWriteAssertion } from "./transcript-write-context.js";
 import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
 type SessionTranscriptAppendTarget = {
@@ -218,13 +222,12 @@ function extractRecentConversationText(
     message.provenance && typeof message.provenance === "object"
       ? (message.provenance as { sourceChannel?: unknown })
       : undefined;
+  const timestamp = normalizeTranscriptTimestamp(message.timestamp);
   return {
     ...(typeof parsed.id === "string" && parsed.id ? { id: parsed.id } : {}),
     role: message.role,
     text,
-    ...(normalizeTranscriptTimestamp(message.timestamp) !== undefined
-      ? { timestamp: normalizeTranscriptTimestamp(message.timestamp) }
-      : {}),
+    ...(timestamp !== undefined ? { timestamp } : {}),
     ...(typeof provenance?.sourceChannel === "string" && provenance.sourceChannel.trim()
       ? { sourceChannel: provenance.sourceChannel.trim() }
       : {}),
@@ -424,6 +427,18 @@ export async function appendExactAssistantMessageToSessionTranscript(
     message: SessionTranscriptAssistantMessage;
   },
 ): Promise<SessionTranscriptAppendResult> {
+  const incognito = captureIncognitoSessionOperation(params);
+  return incognito
+    ? incognito.actor.sessions.withSharedState(() =>
+        appendExactAssistantMessageWithSource(params, incognito),
+      )
+    : appendExactAssistantMessageWithSource(params);
+}
+
+async function appendExactAssistantMessageWithSource(
+  params: Parameters<typeof appendExactAssistantMessageToSessionTranscript>[0],
+  incognito?: ReturnType<typeof captureIncognitoSessionOperation>,
+): Promise<SessionTranscriptAppendResult> {
   const sessionKey = params.sessionKey.trim();
   if (!sessionKey) {
     return { ok: false, reason: "missing sessionKey" };
@@ -440,13 +455,31 @@ export async function appendExactAssistantMessageToSessionTranscript(
   const storeAgentId =
     transcriptAgentId ?? resolveAgentIdFromSessionKey(sessionKey, configuredDefaultAgentId);
   const storePath =
+    incognito?.actor.path ??
     params.storePath ??
     resolveSessionStorePathCore(params.config?.session?.store, { agentId: storeAgentId });
-  const resolved = resolveSessionEntrySelection({
-    ...(transcriptAgentId ? { agentId: transcriptAgentId } : {}),
-    sessionKey,
-    storePath,
-  });
+  const actorKey = incognito
+    ? resolveSqliteSessionKey(sessionKey, incognito.actor.agentId)
+    : undefined;
+  const resolved =
+    incognito && actorKey
+      ? {
+          existing: (
+            await incognito.actor.sessions.read(
+              incognito.authority,
+              { sessionKey: actorKey },
+              incognito.admissionSignal,
+            )
+          ).entry,
+          normalizedKey: actorKey,
+        }
+      : resolveSessionEntrySelection({
+          ...(transcriptAgentId ? { agentId: transcriptAgentId } : {}),
+          sessionKey,
+          storePath,
+        });
+  incognito?.authority.assertCurrent();
+  params.assertCurrent?.();
   const entry = resolved.existing;
   if (
     (params.expectedSessionId && entry?.sessionId !== params.expectedSessionId) ||
@@ -499,7 +532,7 @@ export async function appendExactAssistantMessageToSessionTranscript(
     // read the current projected tail again inside the guarded append.
     await waitForSessionTranscriptProjection(target);
   }
-  let latestEquivalentAssistantId: string | undefined;
+  let equivalentAssistant: { messageId: string; assertCurrent: () => void } | undefined;
   // Keyed mirrors use strict replay identity; text-only suppression must not
   // hide conflicting media or collapse distinct source messages.
   const turn = await persistSessionTranscriptTurn(target, {
@@ -541,7 +574,7 @@ export async function appendExactAssistantMessageToSessionTranscript(
             }
           : {}),
         shouldAppend: async (appendTarget) => {
-          latestEquivalentAssistantId =
+          const messageId =
             isRedundantDeliveryMirror(params.message) && !explicitIdempotencyKey
               ? await findLatestEquivalentAssistantMessageId(
                   appendTarget,
@@ -549,7 +582,10 @@ export async function appendExactAssistantMessageToSessionTranscript(
                   params.config,
                 )
               : undefined;
-          return !latestEquivalentAssistantId;
+          equivalentAssistant = messageId
+            ? { messageId, assertCurrent: captureOwnedTranscriptWriteAssertion(appendTarget) }
+            : undefined;
+          return !equivalentAssistant;
         },
       },
     ],
@@ -561,15 +597,17 @@ export async function appendExactAssistantMessageToSessionTranscript(
       reason: `session rebound for sessionKey: ${sessionKey}`,
     };
   }
-  if (latestEquivalentAssistantId) {
-    const anchor = readActiveTranscriptEntryAnchor({
+  if (equivalentAssistant) {
+    const anchor = await readActiveTranscriptEntryAnchorAsync({
       ...target,
-      entryId: latestEquivalentAssistantId,
+      entryId: equivalentAssistant.messageId,
     });
+    equivalentAssistant.assertCurrent();
+    params.assertCurrent?.();
     return {
       ok: true,
       target,
-      messageId: latestEquivalentAssistantId,
+      messageId: equivalentAssistant.messageId,
       ...(anchor ? { anchor } : {}),
     };
   }
@@ -584,13 +622,19 @@ export async function appendExactAssistantMessageToSessionTranscript(
   const { anchor, messageId } = appendedResult;
   if (!params.expectedSessionId) {
     try {
-      await touchSqliteAssistantAppendSessionEntry({
-        agentId: transcriptAgentId,
-        currentEntry: entry,
-        sessionKey: resolved.normalizedKey,
-        storePath,
-      });
+      const now = Date.now();
+      await updateSessionEntry(
+        { agentId: transcriptAgentId, sessionKey: resolved.normalizedKey, storePath },
+        (current) =>
+          current.sessionId !== entry.sessionId
+            ? null
+            : {
+                updatedAt: Math.max(current.updatedAt ?? 0, now),
+                sessionStartedAt: current.sessionStartedAt ?? entry.sessionStartedAt ?? now,
+              },
+      );
     } catch (err) {
+      rethrowIncognitoSessionError(err);
       return {
         ok: false,
         reason: formatErrorMessage(err),
@@ -598,31 +642,6 @@ export async function appendExactAssistantMessageToSessionTranscript(
     }
   }
   return { ok: true, target, messageId, ...(anchor ? { anchor } : {}) };
-}
-
-async function touchSqliteAssistantAppendSessionEntry(params: {
-  agentId?: string;
-  currentEntry: SessionEntry;
-  sessionKey: string;
-  storePath: string;
-}): Promise<void> {
-  const now = Date.now();
-  await updateSessionEntry(
-    {
-      agentId: params.agentId,
-      sessionKey: params.sessionKey,
-      storePath: params.storePath,
-    },
-    (entry) => {
-      if (entry.sessionId !== params.currentEntry.sessionId) {
-        return null;
-      }
-      return {
-        updatedAt: Math.max(entry.updatedAt ?? 0, now),
-        sessionStartedAt: entry.sessionStartedAt ?? params.currentEntry.sessionStartedAt ?? now,
-      };
-    },
-  );
 }
 
 function isRedundantDeliveryMirror(message: SessionTranscriptAssistantMessage): boolean {
@@ -651,7 +670,8 @@ async function readLatestVisibleTranscriptMessage(scope: {
       ...(typeof record.id === "string" ? { id: record.id } : {}),
       message: record.message,
     };
-  } catch {
+  } catch (error) {
+    rethrowIncognitoSessionError(error);
     // Mirror deduplication remains best-effort when transcript reads are unavailable.
     return undefined;
   }
