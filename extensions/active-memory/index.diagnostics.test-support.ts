@@ -1,5 +1,5 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
-import { expect, it, vi, type Mock } from "vitest";
+import { expect, it, type Mock } from "vitest";
 
 type DiagnosticTestParams = {
   logger: OpenClawPluginApi["logger"];
@@ -9,8 +9,7 @@ type DiagnosticTestParams = {
     context?: Record<string, unknown>,
   ) => Promise<unknown>;
   runActiveMemoryCommand: (params: Record<string, unknown>) => Promise<{ text?: string }>;
-  configure: (logging: boolean) => void;
-  expectPrependContextContains: (result: unknown, text: string) => void;
+  configure: (logging: boolean, remember?: boolean) => void;
 };
 
 /** Registers trigger-recall diagnostics against the shared plugin hook fixture. */
@@ -33,51 +32,19 @@ export function registerActiveMemoryDiagnosticTests(params: DiagnosticTestParams
         sessionKey: "agent:main:main",
         args: "status",
       });
-      expect(status.text).toContain("Trigger recall: off for agent main.");
-      expect(status.text).toContain("Remember across conversations: on.");
+      expect(status.text).toContain("Active Memory: on for this session.");
+      expect(status.text).toContain("Trigger recall configuration: off for agent main.");
+      expect(status.text).toContain("Remember across conversations setting: on.");
+      await params.runActiveMemoryCommand({ sessionKey: "agent:main:main", args: "off" });
+      const paused = await params.runActiveMemoryCommand({ sessionKey: "agent:main:main" });
+      expect(paused.text).toContain("Active Memory: off for this session.");
+      expect(paused.text).toContain("Remember across conversations setting: on.");
     },
   );
 
-  it("logs deterministic trigger injections when invocation logging is enabled", async () => {
-    params.getActiveMemorySearchManager.mockResolvedValueOnce({
-      manager: {
-        search: vi.fn(async () => []),
-        listTriggerCandidates: vi.fn(async () => [
-          {
-            path: "MEMORY.md",
-            startLine: 1,
-            endLine: 1,
-            score: 1,
-            snippet: "Prefer aisle seats.",
-            source: "memory" as const,
-            provenance: {
-              originClass: "agent" as const,
-              sessionKind: "interactive" as const,
-              observedAt: 1,
-            },
-            triggers: "booking a flight",
-          },
-        ]),
-      },
-    } as never);
-
-    const result = await params.runPromptBuild(
-      { prompt: "Help when booking a flight" },
-      {
-        sessionKey: "agent:main:telegram:direct:owner",
-        messageProvider: "telegram",
-        channelId: "owner",
-      },
-    );
-
-    params.expectPrependContextContains(result, "Prefer aisle seats.");
-    expect(
-      vi
-        .mocked(params.logger.info)
-        .mock.calls.some(
-          (call: unknown[]) =>
-            String(call[0]) === "active-memory: lane-1 injected 1 trigger-matched entries",
-        ),
-    ).toBe(true);
+  it("reports session status off when the current agent is outside the active-memory allowlist (#78986)", async () => {
+    params.configure(true, false);
+    const status = await params.runActiveMemoryCommand({ sessionKey: "agent:main:main" });
+    expect(status.text).toBe("Active Memory: off for this session.");
   });
 }

@@ -172,11 +172,10 @@ export default definePluginEntry({
         }
         const commandAgentId = resolveStatusUpdateAgentId({ sessionKey });
         const liveConfig = readCurrentConfig();
-        const triggerRecallEnabled = isEnabledForAgent(config, commandAgentId);
+        const triggerRecallConfigured = isEnabledForAgent(config, commandAgentId);
         const rememberEnabled =
           config.enabled && resolveRememberAcrossConversations(liveConfig, commandAgentId);
-        const commandRecallEnabled = triggerRecallEnabled || rememberEnabled;
-        if (!commandRecallEnabled) {
+        if (!triggerRecallConfigured && !rememberEnabled) {
           return { text: "Active Memory: off for this session." };
         }
         if (action === "status") {
@@ -184,8 +183,8 @@ export default definePluginEntry({
           return {
             text: [
               `Active Memory: ${disabled ? "off" : "on"} for this session.`,
-              `Trigger recall: ${!disabled && triggerRecallEnabled ? "on" : "off"} for agent ${commandAgentId}.`,
-              `Remember across conversations: ${!disabled && rememberEnabled ? "on" : "off"}.`,
+              `Trigger recall configuration: ${triggerRecallConfigured ? "on" : "off"} for agent ${commandAgentId}.`,
+              `Remember across conversations setting: ${rememberEnabled ? "on" : "off"}.`,
             ].join("\n"),
           };
         }
@@ -460,23 +459,8 @@ export default definePluginEntry({
                   "active-memory: lane-1 trigger recall skipped: preflight budget exhausted",
                 );
               }
-            } else {
-              const reason = !effectiveAgentId
-                ? "no-agent"
-                : !activeMemoryConfigured
-                  ? "agent-not-configured"
-                  : !laneOneSource
-                    ? nativeRecallToolNames && !resolvedSessionKey
-                      ? "no-session"
-                      : nativeRecallToolNames?.length === 0
-                        ? "no-recall-tools"
-                        : !nativeRecallToolNames && !deterministicRecallToolName
-                          ? "no-deterministic-recall-tool"
-                          : "recall-tool-not-allowed"
-                    : !privateDestination
-                      ? "not-private-destination"
-                      : "chat-id-not-allowed";
-              const line = `active-memory: lane-1 skipped reason=${reason} agent=${effectiveAgentId ?? "unknown"}`;
+            } else if (invocationConfig.enabled && effectiveAgentId && !activeMemoryConfigured) {
+              const line = `active-memory: lane-1 skipped reason=agent-not-configured agent=${effectiveAgentId}`;
               api.logger.debug?.(line);
               if (invocationConfig.logging) {
                 api.logger.info?.(line);
