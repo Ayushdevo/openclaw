@@ -19,6 +19,7 @@ import type { SessionRowReadView } from "./session-row-prepared-read.js";
 import { prepareSessionRowPublication } from "./session-row-presentation.js";
 import type { SessionRowProjection } from "./session-row-projection.js";
 import { serializeSessionRow } from "./session-row-serialization.js";
+import type { GatewaySessionRow } from "./session-utils.types.js";
 
 type ProjectedPayload = Record<string, unknown> & {
   session: SessionRow;
@@ -105,9 +106,7 @@ export function prepareSessionEventProjection(
     const audiences = new Map<
       string,
       {
-        row: NonNullable<
-          ReturnType<ReturnType<typeof presentRecipient>["presentation"]["present"]>
-        >;
+        row: GatewaySessionRow;
         ancestors: ReturnType<typeof prepareSessionAncestor>[] | undefined;
         hiddenAncestors: string[];
         payloads: Map<string | undefined, ProjectedPayload>;
@@ -150,10 +149,10 @@ export function prepareSessionEventProjection(
       }
       // Resolve each recipient's live authority before reusing this synchronous publication.
       const recipient = presentRecipient(client, runProjector);
-      const audienceKey = recipient.audienceKey;
+      const audienceKey = recipient.getAudienceKey();
       let audience = audiences.get(audienceKey);
       if (!audience) {
-        const { presentation } = recipient;
+        const presentation = recipient.getPresentation();
         const row = presentation.present(record, enrichment);
         if (!row) {
           return undefined;
@@ -173,12 +172,16 @@ export function prepareSessionEventProjection(
         audiences.set(audienceKey, audience);
       }
       const { row } = audience;
+      const rowDeltas = hasGatewayClientCap(
+        client.connect.caps,
+        GATEWAY_CLIENT_CAPS.SESSION_ROW_DELTAS,
+      );
       const references = connection.references(client);
       for (const key of audience.hiddenAncestors) {
         references.forget(key);
       }
       const ancestorDelivery =
-        audience.ancestors && references.prepare(audience.ancestors, ancestorRevision);
+        audience.ancestors && references.prepare(audience.ancestors, ancestorRevision, rowDeltas);
       if (!ancestorDelivery) {
         connection.forgetConnectionAncestors(client);
       }
@@ -208,10 +211,7 @@ export function prepareSessionEventProjection(
         }
         audience.payloads.set(deliveryKey, projected);
       }
-      const rowDelivery = hasGatewayClientCap(
-        client.connect.caps,
-        GATEWAY_CLIENT_CAPS.SESSION_ROW_DELTAS,
-      )
+      const rowDelivery = rowDeltas
         ? references.prepareRows([row, ...(projected.ancestorSessions ?? [])], diff)
         : undefined;
       let wirePayload: Record<string, unknown> = projected;
@@ -227,7 +227,8 @@ export function prepareSessionEventProjection(
             const fields = Object.entries(row)
               .filter(([, value]) => value !== undefined)
               .toSorted(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-            for (const [index, [field, value]] of fields.entries()) {
+            for (let index = 0; index < fields.length; index++) {
+              const [field, value] = fields[index]!;
               if (
                 field !== "key" &&
                 field !== "agentId" &&

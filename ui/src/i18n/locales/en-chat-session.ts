@@ -1,4 +1,5 @@
 import type { TranslationMap } from "../lib/types.ts";
+import { registerSessionNavigationEnglish } from "./en-session-navigation.ts";
 import { en } from "./en.ts";
 
 // This copy follows its lazy rendering consumers; shared labels stay in en.ts.
@@ -149,6 +150,7 @@ const enChatSession = {
       createdBy: "Created by",
       owner: "Owner",
       participants: "{count} participants",
+      peopleCount: "People: {count}.",
       moreParticipants: "{count} more participants",
       workspaceUnavailable: "Workspace unavailable",
       allChanges: "All changes",
@@ -223,6 +225,17 @@ const enChatSession = {
       installingBody: "Installing the new worker runtime on this device.",
     },
     subagentsPanel: {
+      nativeTitle: "Live native agents",
+      nativeCoverage: "Current native agent activity. Saved agent history is not included.",
+      nativeEmpty: "No native agents are currently observed.",
+      nativeTruncated: "Only part of the live native roster is shown.",
+      nativeRetry: "Updates retry automatically while this panel is visible.",
+      nativeStatus: {
+        running: "Running",
+        completed: "Completed",
+        failed: "Failed",
+        interrupted: "Interrupted",
+      },
       title: "Subagents",
       desktopFilter: { all: "All", active: "Active", waiting: "Waiting", done: "Done" },
       desktopFilterLabel: "Filter subagents",
@@ -265,11 +278,10 @@ const enChatSession = {
       publicLinkDescription: "Anyone can read without signing in.",
       publicDraftDescription: "The public link stays readable in Draft.",
       linkUnavailable: "Link unavailable",
-      messagePermissions: "Message permissions",
+      sessionMembers: "Session members",
       creator: "Creator",
-      permissionUnavailable: "Unavailable",
-      permissionUnavailableDescription:
-        "Effective permission is not provided by the Gateway. The check only indicates membership.",
+      member: "Member",
+      visitor: "Visitor",
       searchPeople: "Search people…",
       closeSearch: "Close search",
       noPeopleFound: "No people found",
@@ -507,8 +519,6 @@ const enChatSession = {
       askImageQuestion: "What does this image show?",
       selectionTooLong:
         "These comments are too long for Side chat. Use a shorter selection or comment.",
-      selectionQuoteOnly:
-        "The selection is too long to attach. A short quote is ready in Side chat.",
       askSubmit: "Ask",
       askBusy: "Side chat is already answering a question.",
       askHistoryUnavailable: "Couldn't load this session's history.",
@@ -519,7 +529,6 @@ const enChatSession = {
       askRateLimited: "Side chat reached its question limit. Try again shortly.",
       askUnavailable: "Side chat cannot answer right now.",
       askRetry: "Retry",
-      asOf: "as of {time}",
       health: {
         "on-track": "On track",
         grinding: "Working",
@@ -696,11 +705,45 @@ const enChatSession = {
       preview: "Preview",
       copyPath: en.chat.workspaceFiles.copyPath,
     },
+    pendingInputs: {
+      agentUpdate: {
+        cancelled: "This agent update was cancelled before delivery.",
+        interrupted: "Delivery interrupted. This saved agent update is not scheduled to retry.",
+      },
+      waitingForWorkspaceSync: "Received · waiting for workspace sync",
+      waitingForWorkerSetup: "Received · waiting for worker setup",
+      cancelled:
+        "Cancelled before the agent started it. It will not run automatically; copy it and send again.",
+      interrupted:
+        "Interrupted before the agent started it. If it does not resume, copy it and send again.",
+      earlier: "Show earlier messages",
+      latest: "Show latest messages",
+    },
+    sessionSuggestions: {
+      attachmentsUnsupported: "Remove attachments before submitting a text suggestion.",
+      sendNow: "Send {author}'s suggestion now",
+      queue: "Queue {author}'s suggestion",
+      edit: "Edit {author}'s suggestion",
+      dismiss: "Dismiss {author}'s suggestion",
+      typing: "{name} is typing…",
+      typingMany: "{names} are typing…",
+      typingSeveral: "Several people are typing…",
+      typingOthers: "{count} others",
+      otherCollaborators: "Other collaborators",
+      typingDraftState: "is typing...",
+      pausedDraftState: "Draft",
+      state: {
+        pending: "Pending",
+        accepted: "Accepted",
+        dismissed: "Dismissed",
+      },
+    },
   },
 } satisfies TranslationMap;
 
 export const registerChatSessionEnglish = Object.assign(
   () => {
+    registerSessionNavigationEnglish();
     Object.assign(en.chat.sessionAutomation, enChatSession.chat.sessionAutomation);
     Object.assign(en.chat.activityPills, enChatSession.chat.activityPills);
     Object.assign(en.chat.sessionDetails, enChatSession.chat.sessionDetails);
@@ -724,6 +767,12 @@ export const registerChatSessionEnglish = Object.assign(
     Object.assign(en.chat.sessionDiff, enChatSession.chat.sessionDiff);
     Object.assign(en.chat.sessionDiscussion, enChatSession.chat.sessionDiscussion);
     Object.assign(en.chat.workspaceFiles, enChatSession.chat.workspaceFiles);
+    const { agentUpdate, ...pendingInputs } = enChatSession.chat.pendingInputs;
+    Object.assign(en.chat.pendingInputs, pendingInputs);
+    Object.assign(en.chat.pendingInputs.agentUpdate, agentUpdate);
+    const { state, ...sessionSuggestions } = enChatSession.chat.sessionSuggestions;
+    Object.assign(en.chat.sessionSuggestions, sessionSuggestions);
+    Object.assign(en.chat.sessionSuggestions.state, state);
   },
   { catalog: enChatSession },
 );
