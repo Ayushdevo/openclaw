@@ -1,0 +1,49 @@
+name: Verify Discord callback context
+on:
+  push:
+    branches: [verify/discord-callback-context-20261023]
+permissions:
+  contents: read
+jobs:
+  focused-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 4c4a62241aa04514abfccaa07f656cf1d4add2ab
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.19.0
+      - name: Install pinned dependencies without repository lifecycle scripts
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Verify repaired public action and real callback registry
+        run: |
+          mkdir -p "$RUNNER_TEMP/discord-proof-home"
+          env -i HOME="$RUNNER_TEMP/discord-proof-home" PATH="$PATH" CI=1 NO_COLOR=1 pnpm test extensions/discord/src/actions/handle-action.test.ts extensions/discord/src/actions/runtime.test.ts --maxWorkers=1
+      - name: Demonstrate original callback-identity defect
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("extensions/discord/src/actions/handle-action.ts")
+          text = path.read_text()
+          for old, new in [
+              ("__sessionKey: ctx.sessionKey,", '__sessionKey: readStringParam(params, "__sessionKey"),'),
+              ("__agentId: ctx.agentId,", '__agentId: readStringParam(params, "__agentId"),'),
+          ]:
+              assert text.count(old) == 1, old
+              text = text.replace(old, new)
+          path.write_text(text)
+          PY
+          set +e
+          env -i HOME="$RUNNER_TEMP/discord-proof-home" PATH="$PATH" CI=1 NO_COLOR=1 pnpm test extensions/discord/src/actions/runtime.test.ts --maxWorkers=1 -t "edits Components V2 through the public action" > "$RUNNER_TEMP/discord-negative-control.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/discord-negative-control.log"
+          test "$status" -ne 0
+          grep -q 'agent:research:discord:channel:123:thread:789' "$RUNNER_TEMP/discord-negative-control.log"
+          echo "Original source fails the same public-action callback registry assertion."
