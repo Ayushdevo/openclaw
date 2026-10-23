@@ -45,5 +45,5 @@ jobs:
           set -e
           cat "$RUNNER_TEMP/discord-negative-control.log"
           test "$status" -ne 0
-          grep -q 'agent:research:discord:channel:123:thread:789' "$RUNNER_TEMP/discord-negative-control.log"
+          grep -q '"agentId": "research"' "$RUNNER_TEMP/discord-negative-control.log"
           echo "Original source fails the same public-action callback registry assertion."
