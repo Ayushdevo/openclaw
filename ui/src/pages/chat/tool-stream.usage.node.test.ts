@@ -67,6 +67,36 @@ describe("app-tool-stream run usage", () => {
     ]);
   });
 
+  it.each(["client-run", null])(
+    "projects bounded-context events as system warnings for the visible run %s",
+    (chatRunId) => {
+      const { host, send } = usageHarness({ chatRunId });
+      const message = "Older history is omitted for this turn; resend any earlier details needed.";
+
+      expect(send(1, "compaction", { phase: "context_bounded", message })).toBe(true);
+      expect(host.guardianNotices).toMatchObject([
+        { runId: "client-run", kind: "warning", source: "system", message },
+      ]);
+      expect(host.compactionStatus).toBeNull();
+    },
+  );
+
+  it.each([
+    ["foreign-run", "main"],
+    ["client-run", "agent:other:main"],
+    ["foreign-run", null],
+  ] as const)("rejects bounded-context warnings from %s/%s", (runId, sessionKey) => {
+    const { host, send } = usageHarness({ chatRunId: "client-run" });
+    send(
+      1,
+      "compaction",
+      { phase: "context_bounded", message: "Foreign warning" },
+      runId,
+      sessionKey,
+    );
+    expect(host.guardianNotices).toEqual([]);
+  });
+
   it.each([false, true])(
     "replaces pending Guardian reviews with decisions (strict=%s)",
     (strict) => {

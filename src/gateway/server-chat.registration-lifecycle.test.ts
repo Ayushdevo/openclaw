@@ -80,6 +80,7 @@ describe("chat run registration lifecycle", () => {
         ["compaction", { phase: "start", itemId: "recovery-compaction" }],
         ["compaction", { phase: "notice", messages: ["Synthetic private hook notice"] }],
         ["compaction", { phase: "end", itemId: "recovery-compaction", completed }],
+        ["compaction", { phase: "context_bounded", message: "Older history was omitted." }],
       ]);
 
       const deliveries = h.targetedAgent();
@@ -95,6 +96,12 @@ describe("chat run registration lifecycle", () => {
           sessionKey,
           stream: "compaction",
           data: { phase: "end", itemId: "recovery-compaction", completed },
+        }),
+        expect.objectContaining({
+          runId: "client-compaction",
+          sessionKey,
+          stream: "compaction",
+          data: { phase: "context_bounded", message: "Older history was omitted." },
         }),
       ]);
       for (const delivery of deliveries) {
@@ -131,6 +138,7 @@ describe("chat run registration lifecycle", () => {
       await h.emitMany(runId, [
         ["compaction", { phase: "start", itemId: "recovery-compaction" }],
         ["compaction", { phase: "end", itemId: "recovery-compaction", completed: true }],
+        ["compaction", { phase: "context_bounded", message: "Older history was omitted." }],
       ]);
       expect(h.targetedAgent()).toHaveLength(0);
       expect(h.broadcast).not.toHaveBeenCalled();

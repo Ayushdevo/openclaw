@@ -14,6 +14,7 @@ import {
   loadTranscriptEventsSync,
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
+import { BOUNDED_CONTEXT_NOTICE } from "../../context-engine/transcript-byte-limit.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import type { PersistedUserTurnMessage } from "../../sessions/user-turn-transcript.types.js";
 import {
@@ -374,5 +375,9 @@ it.each(["throws", "rejects"] as const)(
       expect(JSON.stringify(seed)).toContain("Older history outside that window is omitted");
       expect(seed).toContainEqual(makeUserMessage("recent request", 2));
       expect(onAgentEvent).toHaveBeenCalledOnce();
+      expect(onAgentEvent).toHaveBeenCalledWith({
+        stream: "compaction",
+        data: { phase: "context_bounded", message: BOUNDED_CONTEXT_NOTICE },
+      });
     }),
 );

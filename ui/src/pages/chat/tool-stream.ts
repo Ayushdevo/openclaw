@@ -294,7 +294,9 @@ function handleUsageEvent(host: ToolStreamHost, payload: AgentEventPayload): boo
 }
 
 function handleNoticeEvent(host: ToolStreamHost, payload: AgentEventPayload): boolean {
-  const systemNotice = payload.stream === "notice";
+  const boundedContext =
+    payload.stream === "compaction" && payload.data?.phase === "context_bounded";
+  const systemNotice = payload.stream === "notice" || boundedContext;
   if (!systemNotice && payload.stream !== "codex_app_server.guardian") {
     return false;
   }
@@ -302,7 +304,7 @@ function handleNoticeEvent(host: ToolStreamHost, payload: AgentEventPayload): bo
     return true;
   }
   const data = payload.data ?? {};
-  const phase = toTrimmedString(data.phase);
+  const phase = boundedContext ? "warning" : toTrimmedString(data.phase);
   if (systemNotice && phase === "provider_policy") {
     if (data.category !== "cyber" || data.provider !== "openai") {
       return true;

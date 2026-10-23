@@ -532,6 +532,19 @@ describe("grouped chat rendering", () => {
     expect(notice?.querySelector("img[onerror]")).toBeNull();
   });
 
+  it("renders bounded-context warnings as host status without claiming a compaction", () => {
+    const host = createHost({ chatRunId: "run-bounded" });
+    const message =
+      "Continuing with bounded recent context. Older history is omitted for this turn.";
+    applyNotice(host, 1, { phase: "context_bounded", message }, "run-bounded", "compaction");
+    renderNotices(host, "run-bounded", "bounded-context-render-test");
+
+    const notice = requireElement(".chat-notice", HTMLDivElement);
+    expect(notice.querySelector(".chat-divider__title")?.textContent).toBe("System");
+    expect(notice.textContent).toContain(message);
+    expectAbsent(".chat-compaction", ".chat-group.assistant");
+  });
+
   it("renders Codex guardian decisions and warnings in the transcript", () => {
     const host = createHost();
     applyNotice(host, 1, {
