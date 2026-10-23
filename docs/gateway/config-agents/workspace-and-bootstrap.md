@@ -21,6 +21,11 @@ Default: `OPENCLAW_WORKSPACE_DIR` when set, otherwise `<state-dir>/workspace`. T
 
 An explicit `agents.defaults.workspace` value takes precedence over `OPENCLAW_WORKSPACE_DIR`. A sole agent uses this path directly. In a multi-agent fleet, agents without their own `workspace` use an agent-id subdirectory so no implicit owner claims the shared root.
 
+Per-agent override: `agents.entries.<agentId>.workspace`. Bootstrap files such as
+`AGENTS.md` and `SOUL.md` are read from that resolved workspace. `agentDir` is
+separate runtime state; bootstrap files placed there do not override or merge
+with workspace files. Use separate workspaces for per-agent instructions.
+
 ## `agents.defaults.cwd`
 
 Optional working directory for agent reply runs. Use it to run coding tools in an

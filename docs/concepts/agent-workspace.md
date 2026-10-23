@@ -69,6 +69,13 @@ Use **Settings → Agents → Files** in the Control UI to edit these files. **P
 
 Standard files OpenClaw expects inside the workspace:
 
+Bootstrap files belong in the agent's resolved `workspace`, not its `agentDir`
+(normally `~/.openclaw/agents/<agentId>/agent/`). Placing `AGENTS.md`, `SOUL.md`,
+or another bootstrap file in `agentDir` does not load it or override the workspace
+copy. For different instructions or personas per agent, set
+`agents.entries.<agentId>.workspace` to a separate directory and keep that agent's
+bootstrap files there. See [Multi-agent configuration](/gateway/config-agents/entries-and-multi-agent).
+
 <AccordionGroup>
   <Accordion title="AGENTS.md - operating instructions">
     Operating instructions for the agent and how it should use memory. Loaded at the start of every session. Good place for rules, priorities, and "how to behave" details. Template: [AGENTS.md](/reference/templates/AGENTS).
