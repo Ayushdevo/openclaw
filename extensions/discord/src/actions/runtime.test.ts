@@ -8,6 +8,9 @@ import {
 } from "discord-api-types/v10";
 import type { OpenClawConfig, DiscordActionConfig } from "openclaw/plugin-sdk/config-contracts";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { resolveDiscordComponentEntryWithPersistence } from "../components-registry.js";
+import { clearDiscordComponentEntriesForTest } from "../components-registry.test-support.js";
+import { parseDiscordComponentCustomId } from "../components.js";
 import type { GatewayPlugin } from "../internal/gateway.js";
 import { createInternalTestClient } from "../internal/test-builders.test-support.js";
 import { registerGateway, unregisterGateway } from "../monitor/gateway-registry.js";
@@ -1238,25 +1241,35 @@ describe("handleDiscordMessagingAction", () => {
   });
 
   it("edits Components V2 through the public action without PATCH content", async () => {
+    clearDiscordComponentEntriesForTest();
     const { editDiscordComponentMessage: realEditDiscordComponentMessage } =
       await vi.importActual<typeof import("../send.components.js")>("../send.components.js");
-    const loopback = await createDiscordLoopbackRest();
-    discordSendMocks.editDiscordComponentMessage.mockImplementation((to, messageId, spec, options) =>
-      realEditDiscordComponentMessage(to, messageId, spec, { ...options, rest: loopback.rest }),
+    const loopback = await createDiscordLoopbackRest({
+      respond: (request) =>
+        request.method === "GET"
+          ? { id: "123", type: ChannelType.GuildText }
+          : { id: "456", channel_id: "123" },
+    });
+    discordSendMocks.editDiscordComponentMessage.mockImplementation(
+      (to, messageId, spec, options) =>
+        realEditDiscordComponentMessage(to, messageId, spec, { ...options, rest: loopback.rest }),
     );
     try {
       for (const message of [undefined, "Approved"]) {
         await handleDiscordMessageAction({
           action: "edit",
+          sessionKey: "agent:research:discord:channel:123:thread:789",
+          agentId: "research",
           params: {
             channelId: "channel:123",
             messageId: "456",
             message,
             components: JSON.stringify({
-              blocks: [{ type: "text", text: "Resolved decision" }],
+              blocks: [
+                { type: "text", text: "Resolved decision" },
+                { type: "actions", buttons: [{ label: "Review", callbackData: "review" }] },
+              ],
             }),
-            __sessionKey: "agent:main:discord:channel:123",
-            __agentId: "main",
           },
           cfg: DISCORD_TEST_CFG,
         });
@@ -1275,18 +1288,36 @@ describe("handleDiscordMessagingAction", () => {
             components: [
               ...(index === 1 ? [{ type: ComponentType.TextDisplay, content: "Approved" }] : []),
               { type: ComponentType.TextDisplay, content: "Resolved decision" },
+              {
+                type: ComponentType.ActionRow,
+                components: [
+                  expect.objectContaining({ type: ComponentType.Button, label: "Review" }),
+                ],
+              },
             ],
           }),
         ]);
+        const containers = body.components as Array<{
+          components: Array<{ components?: Array<{ custom_id?: string }> }>;
+        }>;
+        const customId = containers[0]?.components.at(-1)?.components?.[0]?.custom_id;
+        const componentId = parseDiscordComponentCustomId(
+          expectDefined(customId, "replacement button custom id"),
+        )?.componentId;
+        const callback = await resolveDiscordComponentEntryWithPersistence({
+          id: expectDefined(componentId, "replacement button component id"),
+        });
+        expect(callback).toMatchObject({
+          messageId: "456",
+          callbackData: "review",
+          sessionKey: "agent:research:discord:channel:123:thread:789",
+          agentId: "research",
+        });
       }
       expect(discordSendMocks.editMessageDiscord).not.toHaveBeenCalled();
-      expect(discordSendMocks.editDiscordComponentMessage.mock.calls[0]?.[3]).toMatchObject({
-        cfg: DISCORD_TEST_CFG,
-        sessionKey: "agent:main:discord:channel:123",
-        agentId: "main",
-      });
     } finally {
       await loopback.close();
+      clearDiscordComponentEntriesForTest();
     }
   });
 

@@ -74,6 +74,7 @@ type DiscordMessageActionContext = Pick<
   | "mediaLocalRoots"
   | "mediaReadFile"
   | "sessionKey"
+  | "agentId"
   | "inboundEventKind"
   | "conversationReadOrigin"
   | "reply"
@@ -344,8 +345,8 @@ async function dispatchDiscordMessageAction(
         ? {
             content: params.message,
             components: coerceDiscordComponentParam(params.components),
-            __sessionKey: readStringParam(params, "__sessionKey"),
-            __agentId: readStringParam(params, "__agentId"),
+            __sessionKey: ctx.sessionKey,
+            __agentId: ctx.agentId,
           }
         : {}),
     });
