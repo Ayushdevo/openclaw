@@ -10,6 +10,12 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { whatsappApprovalCapability } from "./approval-native.js";
 import { cacheInboundMessageMeta } from "./quoted-message.js";
 
+const reactionStores = await vi.hoisted(async () =>
+  (await import("./approval-reactions.test-support.js")).createWhatsAppReactionStores(),
+);
+// mock-isolation: Preserve real exports while collecting only this suite's reaction stores.
+vi.mock("openclaw/plugin-sdk/approval-reaction-runtime", reactionStores.mockRuntime);
+
 const hoisted = vi.hoisted(() => ({
   sendMessageWhatsApp: vi.fn(async () => ({ messageId: "wa-1", toJid: "jid" })),
   sendPollWhatsApp: vi.fn(async () => ({ messageId: "poll-1", toJid: "jid" })),
@@ -31,7 +37,6 @@ vi.mock("./runtime.js", () => ({
 
 let whatsappChannelOutbound: typeof import("./channel-outbound.js").whatsappChannelOutbound;
 let whatsappMessageAdapter: typeof import("./channel-outbound.js").whatsappMessageAdapter;
-let clearWhatsAppApprovalReactionTargetsForTest: typeof import("./approval-reactions.js").clearWhatsAppApprovalReactionTargetsForTest;
 let resolveWhatsAppApprovalReactionTargetWithPersistence: typeof import("./approval-reactions.js").resolveWhatsAppApprovalReactionTargetWithPersistence;
 
 type ApprovalAction = Extract<MessagePresentationAction, { type: "approval" }>;
@@ -39,15 +44,13 @@ type ApprovalAction = Extract<MessagePresentationAction, { type: "approval" }>;
 describe("whatsappChannelOutbound", () => {
   beforeAll(async () => {
     ({ whatsappChannelOutbound, whatsappMessageAdapter } = await import("./channel-outbound.js"));
-    ({
-      clearWhatsAppApprovalReactionTargetsForTest,
-      resolveWhatsAppApprovalReactionTargetWithPersistence,
-    } = await import("./approval-reactions.js"));
+    ({ resolveWhatsAppApprovalReactionTargetWithPersistence } =
+      await import("./approval-reactions.js"));
   });
 
   beforeEach(() => {
     vi.clearAllMocks();
-    clearWhatsAppApprovalReactionTargetsForTest();
+    reactionStores.forEach((store) => store.clearForTest());
   });
 
   it.each([

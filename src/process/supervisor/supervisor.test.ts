@@ -1,14 +1,11 @@
+import * as fs from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { mockProcessPlatform } from "../../test-utils/vitest-spies.js";
 import { createProcessSupervisor } from "./supervisor.js";
-import {
-  createStubChildAdapter,
-  createWriteStdoutArgv,
-  type StubChildAdapter,
-} from "./supervisor.test-support.js";
+import { createStubChildAdapter, type StubChildAdapter } from "./supervisor.test-support.js";
 import type { SpawnInput } from "./types.js";
 
 const { child, pty } = vi.hoisted(() => ({ child: vi.fn(), pty: vi.fn() }));
@@ -21,6 +18,11 @@ vi.mock("./adapters/child.js", () => ({
   }),
 }));
 vi.mock("./adapters/pty.js", () => ({ createPtyAdapter: pty }));
+vi.mock("node:fs/promises", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs/promises")>()),
+  readFile: vi.fn(),
+  readdir: vi.fn(),
+}));
 
 let supervisor: ReturnType<typeof createProcessSupervisor>;
 const spawn = (input: Partial<Extract<SpawnInput, { mode: "child" }>> = {}) =>
@@ -33,6 +35,15 @@ function prepare(adapter = createStubChildAdapter()) {
   child.mockResolvedValueOnce(adapter);
   return adapter;
 }
+function deferStartup() {
+  const startup = createDeferred<StubChildAdapter>();
+  child.mockReturnValueOnce(startup.promise);
+  return startup;
+}
+async function start(input: Parameters<typeof spawn>[0] = {}, adapter = createStubChildAdapter()) {
+  prepare(adapter);
+  return { adapter, run: await spawn(input) };
+}
 function owned() {
   const extinction = createDeferred();
   const adapter = prepare(
@@ -42,10 +53,29 @@ function owned() {
   );
   return { adapter, extinction };
 }
+async function expectRejectedReplacement(input: SpawnInput, error: string, cancelRunId?: string) {
+  const { adapter, run } = await start({ scopeKey: "scope" });
+  try {
+    const pending = supervisor.spawn({ ...input, scopeKey: "scope", replaceExistingScope: true });
+    if (cancelRunId) {
+      supervisor.cancel(cancelRunId);
+    }
+    await expect(pending).rejects.toThrow(error);
+    expect(adapter.killMock).not.toHaveBeenCalled();
+    expect(child).toHaveBeenCalledOnce();
+    expect(pty).not.toHaveBeenCalled();
+  } finally {
+    adapter.settle(0);
+    await run.wait();
+    await supervisor.shutdown();
+  }
+}
 
 beforeEach(() => {
   child.mockReset();
   pty.mockReset();
+  vi.mocked(fs.readFile).mockReset();
+  vi.mocked(fs.readdir).mockReset();
   supervisor = createProcessSupervisor();
 });
 afterEach(() => {
@@ -55,10 +85,51 @@ afterEach(() => {
 });
 
 describe("process supervisor", () => {
+  it.each(["child", "pty", "external"] as const)(
+    "enforces host memory ownership for %s",
+    async (mode) => {
+      vi.useFakeTimers();
+      mockProcessPlatform("linux");
+      const read = vi.mocked(fs.readFile).mockResolvedValue("VmRSS:\t256 kB\n");
+      vi.mocked(fs.readdir).mockResolvedValue([]);
+      const adapter = terminating();
+      adapter.memoryRootPid = 4321;
+      if (mode === "pty") {
+        pty.mockResolvedValueOnce(adapter);
+      } else {
+        prepare(adapter);
+      }
+      const run = await supervisor.spawn({
+        mode: mode === "pty" ? "pty" : "child",
+        argv: ["fixture"],
+        memoryLimitBytes: 128 * 1024,
+        ...(mode === "external" ? { cleanupOwnership: "external" } : {}),
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+      if (mode === "external") {
+        expect(read).not.toHaveBeenCalled();
+        adapter.settle(0);
+      } else {
+        expect(adapter.killMock).toHaveBeenCalledExactlyOnceWith("SIGKILL");
+        expect(read).toHaveBeenCalledWith("/proc/4321/status", "utf8");
+        await expect(run.wait()).resolves.toMatchObject({
+          reason: "memory-limit",
+          timedOut: false,
+          stderr: expect.stringContaining("Command killed for exceeding its host memory bound"),
+        });
+      }
+      await run.wait();
+      await supervisor.shutdown();
+      const reads = read.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(read).toHaveBeenCalledTimes(reads);
+    },
+  );
+
   it("passes private secret input and exact environment to the child adapter", async () => {
     const adapter = prepare();
     const secretInput = { fd: 3, createData: () => Buffer.from("secret") };
-    const run = await spawn({ argv: createWriteStdoutArgv("ok"), exactEnv: true, secretInput });
+    const run = await spawn({ exactEnv: true, secretInput });
     expect(child).toHaveBeenCalledWith(expect.objectContaining({ exactEnv: true, secretInput }));
     adapter.settle(0);
     await run.wait();
@@ -67,8 +138,7 @@ describe("process supervisor", () => {
   it("coalesces overlapping Windows deadlines while hard kill is pending", async () => {
     vi.useFakeTimers();
     mockProcessPlatform("win32");
-    const adapter = prepare();
-    const run = await spawn({ timeoutMs: 20, noOutputTimeoutMs: 5 });
+    const { adapter, run } = await start({ timeoutMs: 20, noOutputTimeoutMs: 5 });
     await vi.advanceTimersByTimeAsync(5);
     await vi.advanceTimersToNextTimerAsync();
     expect(adapter.killMock).toHaveBeenCalledExactlyOnceWith("SIGKILL");
@@ -106,28 +176,12 @@ describe("process supervisor", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("cancels a PTY while its adapter is starting", async () => {
-    const startup = createDeferred<StubChildAdapter>();
-    pty.mockReturnValueOnce(startup.promise);
-    const pending = supervisor.spawn({ mode: "pty", argv: ["fixture"], runId: "starting" });
-    supervisor.cancel("starting");
-    const adapter = terminating();
-    startup.resolve(adapter);
-    const run = await pending;
-    await run.waitForExtinction?.();
-    expect(adapter.killMock).toHaveBeenCalledWith("SIGKILL");
-    expect(adapter.disposeMock).toHaveBeenCalledOnce();
-    await expect(run.wait()).resolves.toMatchObject({ reason: "manual-cancel" });
-    expect(run.activity.resultSettled).toBe(true);
-  });
-
   it.each(["no-output-timeout", "manual-cancel"] as const)(
     "keeps late construction cleanup joinable after %s",
     async (reason) => {
       vi.useFakeTimers();
-      const startup = createDeferred<StubChildAdapter>();
+      const startup = deferStartup();
       const extinction = createDeferred();
-      child.mockReturnValueOnce(startup.promise);
       const pending = spawn({
         runId: "starting",
         timeoutMs: 25,
@@ -164,8 +218,7 @@ describe("process supervisor", () => {
   );
 
   it("fences new runs and drains an unscoped startup during shutdown", async () => {
-    const startup = createDeferred<StubChildAdapter>();
-    child.mockReturnValueOnce(startup.promise);
+    const startup = deferStartup();
     const pending = spawn();
     const shutdown = supervisor.shutdown();
     await expect(spawn()).rejects.toThrow("process supervisor is shut down");
@@ -217,11 +270,11 @@ describe("process supervisor", () => {
     expect(later.killMock).not.toHaveBeenCalled();
     replacementAdapter.settle(0);
     later.settle(0);
-    await expect(Promise.all(runs.map((run) => run.wait()))).resolves.toEqual([
-      expect.objectContaining({ reason: "manual-cancel" }),
-      expect.objectContaining({ reason: "manual-cancel" }),
-      expect.objectContaining({ reason: "exit" }),
-      expect.objectContaining({ reason: "exit" }),
+    expect((await Promise.all(runs.map((run) => run.wait()))).map((exit) => exit.reason)).toEqual([
+      "manual-cancel",
+      "manual-cancel",
+      "exit",
+      "exit",
     ]);
   });
 
@@ -246,8 +299,7 @@ describe("process supervisor", () => {
   });
 
   it("never launches cancelled queued replacements or resolves their arguments", async () => {
-    const startup = createDeferred<StubChildAdapter>();
-    child.mockReturnValueOnce(startup.promise);
+    const startup = deferStartup();
     const first = createStubChildAdapter();
     const later = prepare();
     const firstRun = spawn({ scopeKey: "scope" });
@@ -289,15 +341,14 @@ describe("process supervisor", () => {
     }
     first.settle(0);
     later.settle(0);
-    await expect(Promise.all(runs.map((run) => run.wait()))).resolves.toEqual([
-      expect.objectContaining({ reason: "exit" }),
-      expect.objectContaining({ reason: "exit" }),
+    expect((await Promise.all(runs.map((run) => run.wait()))).map((exit) => exit.reason)).toEqual([
+      "exit",
+      "exit",
     ]);
   });
 
   it("resolves invocation arguments only after queued scope admission", async () => {
-    const startup = createDeferred<StubChildAdapter>();
-    child.mockReturnValueOnce(startup.promise);
+    const startup = deferStartup();
     const first = terminating();
     const replacement = prepare();
     const firstRun = spawn({ scopeKey: "scope" });
@@ -315,28 +366,75 @@ describe("process supervisor", () => {
   });
 
   it("leaves the active scope intact when replacement arguments fail", async () => {
-    const adapter = prepare();
-    const run = await spawn({ scopeKey: "scope" });
-    const pending = spawn({
-      runId: "failed",
-      scopeKey: "scope",
-      replaceExistingScope: true,
-      resolveArgs: () => {
-        throw new Error("arguments failed");
+    await expectRejectedReplacement(
+      {
+        mode: "child",
+        argv: ["fixture"],
+        runId: "failed",
+        resolveArgs: () => {
+          throw new Error("arguments failed");
+        },
       },
-    });
-    supervisor.cancel("failed");
-    await expect(pending).rejects.toThrow("arguments failed");
-    expect(adapter.killMock).not.toHaveBeenCalled();
-    expect(child).toHaveBeenCalledOnce();
-    adapter.settle(0);
-    await run.wait();
-    await supervisor.shutdown();
+      "arguments failed",
+      "failed",
+    );
   });
 
+  it.each(["ready", "revoked", "cancelled"] as const)(
+    "waits for async launch authority before replacing the active scope (%s)",
+    async (outcome) => {
+      const first = prepare(terminating());
+      const firstRun = await spawn({ scopeKey: "scope" });
+      const replacement = prepare();
+      const gate = createDeferred();
+      const pending = spawn({
+        runId: "replacement",
+        scopeKey: "scope",
+        replaceExistingScope: true,
+        prepareSpawn: () => gate.promise,
+      });
+      expect(child).toHaveBeenCalledOnce();
+      expect(first.killMock).not.toHaveBeenCalled();
+      if (outcome === "revoked") {
+        gate.reject(new Error("history owner changed"));
+        await expect(pending).rejects.toThrow("history owner changed");
+      } else {
+        if (outcome === "cancelled") {
+          supervisor.cancel("replacement");
+        }
+        gate.resolve();
+        const run = await pending;
+        if (outcome === "ready") {
+          expect(child).toHaveBeenCalledTimes(2);
+          expect(first.killMock).toHaveBeenCalledWith("SIGTERM");
+          replacement.settle(0);
+        } else {
+          await expect(run.wait()).resolves.toMatchObject({ reason: "manual-cancel" });
+        }
+        await run.wait();
+      }
+      if (outcome !== "ready") {
+        expect(child).toHaveBeenCalledOnce();
+        expect(first.killMock).not.toHaveBeenCalled();
+        first.settle(0);
+      }
+      await firstRun.wait();
+    },
+  );
+
+  it.each([
+    { mode: "child", argv: ["fixture"], resolveArgs: () => ["bad\0resolved"] },
+    { mode: "child", argv: ["fixture"], argv0: "bad\0name" },
+    { mode: "anchored-shell", command: "printf bad\0command" },
+  ] satisfies SpawnInput[])(
+    "rejects NUL-containing $mode input before construction or scope replacement (%#)",
+    async (input) => {
+      await expectRejectedReplacement(input, "must not contain NUL bytes");
+    },
+  );
+
   it("rejects retired authority behind a scope fence without cancelling its survivor", async () => {
-    const startup = createDeferred<StubChildAdapter>();
-    child.mockReturnValueOnce(startup.promise);
+    const startup = deferStartup();
     const first = createStubChildAdapter();
     let current = true;
     const firstRun = spawn({ scopeKey: "scope" });
@@ -391,82 +489,66 @@ describe("process supervisor", () => {
     expect(pty).not.toHaveBeenCalled();
   });
 
-  it.each(["timeoutMs", "noOutputTimeoutMs"] as const)(
-    "bounds oversized %s across a late intermediate timer",
-    async (field) => {
-      vi.useFakeTimers();
-      const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
-      const timer = vi.spyOn(globalThis, "setTimeout");
-      const adapter = prepare(terminating());
-      const run = await spawn({ [field]: MAX_TIMER_TIMEOUT_MS + 600_000 });
-      expect(timer.mock.calls.map(([, delay]) => delay)).toEqual([MAX_TIMER_TIMEOUT_MS]);
-      await vi.advanceTimersByTimeAsync(1);
-      expect(adapter.killMock).not.toHaveBeenCalled();
-      if (field === "noOutputTimeoutMs") {
-        adapter.emitStdout("progress");
-      }
-      now.mockReturnValue(1_000 + MAX_TIMER_TIMEOUT_MS + 540_000);
-      await vi.advanceTimersByTimeAsync(
-        field === "noOutputTimeoutMs" ? MAX_TIMER_TIMEOUT_MS : MAX_TIMER_TIMEOUT_MS - 1,
-      );
-      await vi.advanceTimersToNextTimerAsync();
-      expect(adapter.killMock).not.toHaveBeenCalled();
-      expect(timer.mock.calls.at(-1)?.[1]).toBe(60_000);
-      now.mockReturnValue(1_000 + MAX_TIMER_TIMEOUT_MS + 600_000);
-      await vi.advanceTimersByTimeAsync(60_000);
-      await vi.advanceTimersToNextTimerAsync();
-      await expect(run.wait()).resolves.toMatchObject({
-        reason: field === "timeoutMs" ? "overall-timeout" : "no-output-timeout",
-        timedOut: true,
-        noOutputTimedOut: field === "noOutputTimeoutMs",
-      });
-      expect(adapter.killMock).toHaveBeenCalledOnce();
-      expect(adapter.disposeMock).toHaveBeenCalledOnce();
-      expect(vi.getTimerCount()).toBe(0);
-    },
-  );
-
-  it("preserves a queued successful exit when the deadline timer runs first", async () => {
-    vi.useFakeTimers();
-    const adapter = prepare();
-    const run = await spawn({ timeoutMs: 10 });
-    vi.advanceTimersByTime(10);
-    adapter.settle(0);
-    await expect(run.wait()).resolves.toMatchObject({
-      reason: "exit",
-      exitCode: 0,
-      timedOut: false,
-    });
-    await vi.runOnlyPendingTimersAsync();
-    expect(adapter.killMock).not.toHaveBeenCalled();
-  });
-
-  it("refreshes an expired no-output timer before its deferred decision", async () => {
-    vi.useFakeTimers();
-    const adapter = prepare();
-    const run = await spawn({ noOutputTimeoutMs: 10 });
-    vi.advanceTimersByTime(10);
-    adapter.emitStdout("progress");
-    await vi.advanceTimersByTimeAsync(1);
-    expect(adapter.killMock).not.toHaveBeenCalled();
-    adapter.settle(0);
-    await expect(run.wait()).resolves.toMatchObject({
-      reason: "exit",
-      stdout: "progress",
-      timedOut: false,
-    });
-  });
-
-  it("preserves a natural close observed after a missed overall deadline", async () => {
+  it("bounds an oversized output timeout across a late intermediate timer", async () => {
     vi.useFakeTimers();
     const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
-    const adapter = prepare();
-    const run = await spawn({ timeoutMs: 10 });
-    now.mockReturnValue(1_011);
-    adapter.settle(0);
-    await expect(run.wait()).resolves.toMatchObject({ reason: "exit", timedOut: false });
+    const timer = vi.spyOn(globalThis, "setTimeout");
+    const adapter = prepare(terminating());
+    const run = await spawn({ noOutputTimeoutMs: MAX_TIMER_TIMEOUT_MS + 600_000 });
+    expect(timer.mock.calls.map(([, delay]) => delay)).toEqual([MAX_TIMER_TIMEOUT_MS]);
+    await vi.advanceTimersByTimeAsync(1);
     expect(adapter.killMock).not.toHaveBeenCalled();
+    adapter.emitStdout("progress");
+    now.mockReturnValue(1_000 + MAX_TIMER_TIMEOUT_MS + 540_000);
+    await vi.advanceTimersByTimeAsync(MAX_TIMER_TIMEOUT_MS);
+    await vi.advanceTimersToNextTimerAsync();
+    expect(adapter.killMock).not.toHaveBeenCalled();
+    expect(timer.mock.calls.at(-1)?.[1]).toBe(60_000);
+    now.mockReturnValue(1_000 + MAX_TIMER_TIMEOUT_MS + 600_000);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersToNextTimerAsync();
+    await expect(run.wait()).resolves.toMatchObject({
+      reason: "no-output-timeout",
+      timedOut: true,
+      noOutputTimedOut: true,
+    });
+    expect(adapter.killMock).toHaveBeenCalledOnce();
+    expect(adapter.disposeMock).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
   });
+
+  it.each(["queued exit", "new output", "missed deadline"] as const)(
+    "preserves natural completion across a deferred timeout decision: %s",
+    async (event) => {
+      vi.useFakeTimers();
+      const now =
+        event === "missed deadline"
+          ? vi.spyOn(performance, "now").mockReturnValue(1_000)
+          : undefined;
+      const { adapter, run } = await start(
+        event === "new output" ? { noOutputTimeoutMs: 10 } : { timeoutMs: 10 },
+      );
+      if (now) {
+        now.mockReturnValue(1_011);
+      } else {
+        vi.advanceTimersByTime(10);
+      }
+      if (event === "new output") {
+        adapter.emitStdout("progress");
+        await vi.advanceTimersByTimeAsync(1);
+        expect(adapter.killMock).not.toHaveBeenCalled();
+      }
+      adapter.settle(0);
+      await expect(run.wait()).resolves.toMatchObject({
+        reason: "exit",
+        exitCode: 0,
+        timedOut: false,
+        ...(event === "new output" ? { stdout: "progress" } : {}),
+      });
+      await vi.runOnlyPendingTimersAsync();
+      expect(adapter.killMock).not.toHaveBeenCalled();
+    },
+  );
 
   it("bounds captured output on UTF-16 boundaries while streaming full chunks", async () => {
     const adapter = prepare();
@@ -484,8 +566,10 @@ describe("process supervisor", () => {
     const result = await run.wait();
     expect(stdout).toHaveBeenCalledExactlyOnceWith(stdoutChunk);
     expect(stderr).toHaveBeenCalledExactlyOnceWith(stderrChunk);
-    expect(result.stdout).toBe(`${marker("stdout")}${"s".repeat(retained)}`);
-    expect(result.stderr).toBe(`${marker("stderr")}${"e".repeat(retained)}`);
+    expect(result).toMatchObject({
+      stdout: `${marker("stdout")}${"s".repeat(retained)}`,
+      stderr: `${marker("stderr")}${"e".repeat(retained)}`,
+    });
   });
 
   it("refreshes raw-only activity before notifying its observer", async () => {
@@ -638,8 +722,7 @@ describe("process supervisor", () => {
   });
 
   it("drains cancelled startups and same-ID siblings before reporting ownership failure", async () => {
-    const startup = createDeferred<StubChildAdapter>();
-    child.mockReturnValueOnce(startup.promise);
+    const startup = deferStartup();
     const first = createStubChildAdapter();
     const { adapter: sibling, extinction } = owned();
     const cleanup = supervisor.acquireScopeCleanup("scope", { processTree: "transport-only" });
@@ -669,8 +752,7 @@ describe("process supervisor", () => {
   });
 
   it("does not finalize a newer admission when an older same-ID startup fails", async () => {
-    const startup = createDeferred<StubChildAdapter>();
-    child.mockReturnValueOnce(startup.promise);
+    const startup = deferStartup();
     const sibling = prepare();
     const pending = spawn({ runId: "shared" });
     const replacement = await spawn({ runId: "shared" });

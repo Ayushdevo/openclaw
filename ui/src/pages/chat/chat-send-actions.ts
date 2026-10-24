@@ -8,7 +8,9 @@ import {
   reorderChatQueueItems,
 } from "../../lib/chat/chat-queue-order.ts";
 import type { ChatQueueItem } from "../../lib/chat/chat-types.ts";
+import { storedChatOutboxScopeKey } from "../../lib/chat/outbox-store-scope.ts";
 import { captureChatOutboxAdmission } from "../../lib/chat/outbox-store.ts";
+import { visibleSessionMatches } from "../../lib/sessions/navigation.ts";
 import { generateUUID } from "../../lib/uuid.ts";
 import {
   isExpiredIncognitoSession,
@@ -22,16 +24,11 @@ import {
 } from "./chat-outbox-drain.ts";
 import { chatOutboxOwner } from "./chat-outbox-owner.ts";
 import { chatProviderReviewRow } from "./chat-provider-review.ts";
-import {
-  admitQueuedMessageForSession,
-  readQueuedMessageById,
-  updateQueuedMessage,
-} from "./chat-queue.ts";
+import { readQueuedMessageById, updateQueuedMessage } from "./chat-queue.ts";
 import type { ChatHost } from "./chat-send-contract.ts";
 import { chatOutboxDrainDependencies, deliverChatQueueItem } from "./chat-send-delivery.ts";
 import { canSendVolatileQueueItem, reconnectSafeQueuedSendState } from "./chat-send-queue-state.ts";
 import { OFFLINE_QUEUE_STORAGE_ERROR } from "./chat-send-support.ts";
-import { storedChatOutboxScopeKey } from "./composer-persistence.ts";
 import {
   isQueuedMessageBeingEdited,
   QUEUED_MESSAGE_RETRY_CONFLICT_ERROR,
@@ -41,36 +38,39 @@ import {
 
 registerChatGoalsEnglish();
 
-function hasUncertainChatDelivery(entry: ChatQueueItem): boolean {
+function hasAttemptedChatDelivery(entry: ChatQueueItem): boolean {
   return Boolean(
     entry.sendRunId &&
     !entry.localCommandName &&
-    (entry.sendState === "unconfirmed" ||
-      (entry.sendState === "held" &&
-        ((entry.sendAttempts ?? 0) > 0 || entry.sendRequestStartedAtMs !== undefined))),
+    ((entry.sendAttempts ?? 0) > 0 || entry.sendRequestStartedAtMs !== undefined),
   );
 }
 
 const resetRetryState = (
   entry: ChatQueueItem,
   sendState: ChatQueueItem["sendState"],
+  reviewedSessionId?: string,
 ): ChatQueueItem => {
+  const renewAdmission =
+    !reviewedSessionId &&
+    entry.sendState === "failed" &&
+    !entry.attachmentStorageError &&
+    entry.queueMode !== "steer" &&
+    !entry.intent;
   // An ID-less post-clear review barrier has no transport attempt to preserve.
-  const uncertain = hasUncertainChatDelivery(entry);
+  const attempted = !renewAdmission && hasAttemptedChatDelivery(entry);
   return {
     ...entry,
     // Local payload failure cannot erase an uncertain transport attempt. Keep its
     // identity until the explicitly admitted retry actually reaches transport.
-    sendAttempts: uncertain ? entry.sendAttempts : 0,
+    sendAttempts: attempted ? entry.sendAttempts : 0,
     // A failed delivery keeps its diagnostic while an explicit retry waits for
     // run admission; the transcript uses it to retain the same optimistic row.
     sendError: entry.sendState === "failed" ? entry.sendError : undefined,
-    sendRequestStartedAtMs: uncertain ? entry.sendRequestStartedAtMs : undefined,
-    sendRunId:
-      entry.sendState === "failed" && entry.queueMode !== "steer" && !entry.intent
-        ? generateUUID()
-        : entry.sendRunId,
-    sendState: uncertain ? "unconfirmed" : sendState,
+    sendRequestStartedAtMs: attempted ? entry.sendRequestStartedAtMs : undefined,
+    sendRunId: renewAdmission ? generateUUID() : entry.sendRunId,
+    sessionId: renewAdmission ? undefined : (entry.sessionId ?? reviewedSessionId),
+    sendState,
   };
 };
 
@@ -195,7 +195,7 @@ export async function retryQueuedChatMessage(
     return;
   }
   const retriesFailedDelivery = item?.sendState === "failed" && !item.localCommandName;
-  const retriesUnconfirmed = item !== undefined && hasUncertainChatDelivery(item);
+  const retriesAttempted = item !== undefined && hasAttemptedChatDelivery(item);
   if (isQueuedMessageBeingEdited(host, id)) {
     setChatError(host, QUEUED_MESSAGE_RETRY_CONFLICT_ERROR);
     return;
@@ -215,24 +215,35 @@ export async function retryQueuedChatMessage(
   if (!located) {
     return;
   }
+  const needsReviewedBinding =
+    retriesAttempted &&
+    !item.sessionId &&
+    !item.intent &&
+    (item.sendState === "held" || Boolean(item.attachmentStorageError));
+  const reviewedSessionId =
+    needsReviewedBinding &&
+    visibleSessionMatches(host, located.scope.sessionKey, located.scope.agentId)
+      ? host.currentSessionId?.trim()
+      : undefined;
+  if (needsReviewedBinding && !reviewedSessionId) {
+    return;
+  }
   if (!located.durable) {
     const wasVolatile = chatOutboxOwner(host).hasVolatile(host, item.id);
     const admission = {
       ...captureChatOutboxAdmission(host, located.scope.sessionKey, located.scope.agentId),
       scope: located.scope,
     };
-    if (!admitQueuedMessageForSession(host, admission, item)) {
+    if (chatOutboxOwner(host).admit(host, admission, item) !== "admitted") {
       if (
         wasVolatile &&
         !item.localCommandName &&
         item.sendRunId &&
-        (item.sendState === "failed" ||
-          item.sendState === "unconfirmed" ||
-          item.sendState === "held") &&
+        (item.sendState === "failed" || item.sendState === "held") &&
         canSendVolatileQueueItem(host, item)
       ) {
         const retry = chatOutboxOwner(host).change(host, id, (entry) =>
-          resetRetryState(entry, undefined),
+          resetRetryState(entry, undefined, reviewedSessionId),
         );
         if (!retry) {
           setChatError(host, OFFLINE_QUEUE_STORAGE_ERROR);
@@ -250,7 +261,7 @@ export async function retryQueuedChatMessage(
     }
   }
   const retry = updateQueuedMessage(host, id, (entry) =>
-    resetRetryState(entry, reconnectSafeQueuedSendState(host)),
+    resetRetryState(entry, reconnectSafeQueuedSendState(host), reviewedSessionId),
   );
   if (!retry) {
     setChatError(host, OFFLINE_QUEUE_STORAGE_ERROR);
@@ -262,7 +273,7 @@ export async function retryQueuedChatMessage(
     return;
   }
   const outbox = retried.scope;
-  const explicitAdmission = retry.queueMode || retriesFailedDelivery || retriesUnconfirmed;
+  const explicitAdmission = retry.queueMode || retriesFailedDelivery || retriesAttempted;
   const drain = scheduleStoredChatOutboxDrain(
     host,
     outbox,

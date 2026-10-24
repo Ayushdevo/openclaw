@@ -1,8 +1,4 @@
-import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { parseQaTarget } from "./qa-bus-protocol.js";
 import type {
-  QaBusAttachment,
-  QaBusConversation,
   QaBusEvent,
   QaBusMessage,
   QaBusPollInput,
@@ -12,8 +8,8 @@ import type {
   QaBusSnapshotConversation,
   QaBusStateSnapshot,
   QaBusThread,
-  QaBusToolCall,
-} from "./runtime-api.js";
+} from "openclaw/plugin-sdk/qa-channel-protocol";
+import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coerce-runtime";
 
 const DEFAULT_ACCOUNT_ID = "default";
 
@@ -22,51 +18,18 @@ export function normalizeAccountId(raw?: string): string {
   return trimmed || DEFAULT_ACCOUNT_ID;
 }
 
-export function normalizeConversationFromTarget(target: string): {
-  conversation: QaBusConversation;
-  threadId?: string;
-} {
-  const parsed = parseQaTarget(target);
-  return {
-    conversation: { id: parsed.conversationId, kind: parsed.chatType },
-    ...(parsed.threadId !== undefined ? { threadId: parsed.threadId } : {}),
-  };
-}
-
 export function cloneMessage(message: QaBusMessage): QaBusMessage {
-  return {
+  return structuredClone({
     ...message,
-    conversation: { ...message.conversation },
-    attachments: (message.attachments ?? []).map(cloneAttachment),
-    ...(message.nativeCommand ? { nativeCommand: { ...message.nativeCommand } } : {}),
-    toolCalls: message.toolCalls?.map(cloneToolCall),
-    reactions: message.reactions.map((reaction) => ({ ...reaction })),
-  };
-}
-
-function cloneAttachment(attachment: QaBusAttachment): QaBusAttachment {
-  return { ...attachment };
-}
-
-function cloneToolCall(toolCall: QaBusToolCall): QaBusToolCall {
-  return {
-    name: toolCall.name,
-    ...(toolCall.arguments ? { arguments: structuredClone(toolCall.arguments) } : {}),
-  };
+    attachments: message.attachments ?? [],
+    toolCalls: message.toolCalls,
+  });
 }
 
 function cloneEvent(event: QaBusEvent): QaBusEvent {
-  switch (event.kind) {
-    case "inbound-message":
-    case "outbound-message":
-    case "message-edited":
-    case "message-deleted":
-    case "reaction-added":
-      return { ...event, message: cloneMessage(event.message) };
-    case "thread-created":
-      return { ...event, thread: { ...event.thread } };
-  }
-  throw new Error("Unsupported QA bus event kind");
+  return event.kind === "thread-created"
+    ? { ...event, thread: { ...event.thread } }
+    : { ...event, message: cloneMessage(event.message) };
 }
 
 export function buildQaBusSnapshot(params: {

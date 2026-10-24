@@ -1,4 +1,7 @@
-import { stableStringify } from "@openclaw/normalization-core";
+import { isDeepStrictEqual } from "node:util";
+import { isProxy } from "node:util/types";
+import type { ModelRequestHeaders } from "@openclaw/llm-core";
+import { sha256StableValue } from "@openclaw/normalization-core/node-crypto";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { ResponseInput, ResponseOutputItem } from "openai/resources/responses/responses.js";
 import { getAiTransportHost, resolveAiTransportHeaderSentinels } from "../host.js";
@@ -8,6 +11,7 @@ import {
   type SessionResourceOwner,
 } from "../session-resources.js";
 import { parseJsonObjectPreservingUnsafeIntegers } from "./json-unsafe-integers.js";
+import type { OpenAIResponsesRequestParams } from "./openai-responses-contracts.js";
 import {
   canReferenceResponsesReasoningHistory,
   replayResponsesReasoningUpdates,
@@ -28,10 +32,11 @@ const MAX_HTTP_CONTINUATION_READY_ENTRIES = 1000;
 const MAX_HTTP_CONTINUATION_RETAINED_BYTES = 64 * 1024 * 1024;
 const TURN_HEADERS = new Set(["traceparent", "x-openclaw-turn-id", "x-openclaw-turn-attempt"]);
 
-export type ResponsesContinuationRequest = Record<string, unknown> & {
-  input?: Array<ResponseInput[number] | ResponsesConfigurationUpdate>;
-  previous_response_id?: string;
-};
+export type ResponsesContinuationRequest = Record<string, unknown> &
+  Pick<OpenAIResponsesRequestParams, "service_tier" | "max_output_tokens"> & {
+    input?: Array<ResponseInput[number] | ResponsesConfigurationUpdate>;
+    previous_response_id?: string;
+  };
 export type ResponsesSteeringContinuationMode = "automatic" | "required-input";
 export type ResponsesContinuationState = {
   lastRequest: ResponsesContinuationRequest;
@@ -48,12 +53,62 @@ export type ResponsesContinuationStatus =
   | "no_previous_response"
   | "request_changed";
 
+// Keep text by reference instead of encoding/parsing it solely for comparison.
+// Hook-provided opaque values still use native JSON, including the property's key.
+function projectJsonValue(value: unknown, key: string, ancestors: Set<object>): unknown {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value + 0 : null;
+  }
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return value;
+  }
+  if (value === undefined || typeof value === "symbol") {
+    return undefined;
+  }
+  if (
+    typeof value !== "object" ||
+    isProxy(value) ||
+    Object.getPrototypeOf(value) !== (Array.isArray(value) ? Array.prototype : Object.prototype) ||
+    "toJSON" in value ||
+    ancestors.has(value)
+  ) {
+    // oxlint-disable-next-line unicorn/prefer-structured-clone -- Preserve JSON/toJSON semantics, not object identity.
+    const projected: Record<string, unknown> = JSON.parse(
+      JSON.stringify({ __proto__: null, [key]: value }),
+    );
+    return Object.hasOwn(projected, key) ? projected[key] : undefined;
+  }
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const result: unknown[] = [];
+      const length = value.length;
+      for (let index = 0; index < length; index++) {
+        result.push(projectJsonValue(value[index], String(index), ancestors) ?? null);
+      }
+      return result;
+    }
+    const fields: [string, unknown][] = [];
+    for (const name of Object.keys(value)) {
+      const member = projectJsonValue(Reflect.get(value, name), name, ancestors);
+      if (member !== undefined) {
+        fields.push([name, member]);
+      }
+    }
+    return Object.fromEntries(fields);
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
 function jsonValuesEqual(left: object, right: object): boolean {
-  // Normalize the left side first to preserve serialization errors and toJSON ordering.
-  const leftJson = JSON.stringify(left) as string;
-  const normalizedLeft = stableStringify(JSON.parse(leftJson));
-  const rightJson = JSON.stringify(right) as string;
-  return leftJson === rightJson || normalizedLeft === stableStringify(JSON.parse(rightJson));
+  const normalize = (value: object) => {
+    const projected = projectJsonValue(value, "", new Set());
+    // A root toJSON returning undefined was not a valid JSON comparison either.
+    return projected === undefined ? JSON.parse("undefined") : projected;
+  };
+  // Finish the left side before evaluating any right-side hook values.
+  return isDeepStrictEqual(normalize(left), normalize(right));
 }
 
 function requestWithoutInput(request: ResponsesContinuationRequest): ResponsesContinuationRequest {
@@ -140,16 +195,15 @@ function pendingResponsesToolCalls(
     const owner = ownerByReplayShape.get(item.call_id);
     if (item.type === "function_call") {
       replayedCallIds.add(item.call_id);
-      if (owner !== undefined && owner !== null) {
-        lastCallPosition.set(owner, inputIndex);
-      }
-      continue;
     }
-    if (item.type !== "function_call_output") {
-      continue;
-    }
-    if (owner !== undefined && owner !== null) {
-      lastOutputPosition.set(owner, inputIndex);
+    const positions =
+      item.type === "function_call"
+        ? lastCallPosition
+        : item.type === "function_call_output"
+          ? lastOutputPosition
+          : undefined;
+    if (positions && owner !== undefined && owner !== null) {
+      positions.set(owner, inputIndex);
     }
   }
   return calls.filter((_call, index) => {
@@ -184,7 +238,9 @@ export function recordResponsesContinuationState(
   return {
     lastRequest,
     lastResponseId: response.id,
-    lastResponseItems: response.output,
+    // Hosted search runs on the server and has no transcript block, so replay never
+    // sends it back. The server keeps it under previous_response_id.
+    lastResponseItems: response.output.filter((item) => item.type !== "web_search_call"),
     pendingToolCalls,
   };
 }
@@ -314,21 +370,6 @@ function continuationHistoryMatches(
       return false;
     }
   }
-  const previousCalls = responseToolCalls(previousInput);
-  const currentCalls = responseToolCalls(currentInput);
-  if (previousCalls.length !== currentCalls.length) {
-    return false;
-  }
-  for (const [index, previousCall] of previousCalls.entries()) {
-    const currentCall = currentCalls[index];
-    if (!currentCall) {
-      return false;
-    }
-    const previousShapes = toolCallReplayShapes(previousCall);
-    if (![...toolCallReplayShapes(currentCall)].some((shape) => previousShapes.has(shape))) {
-      return false;
-    }
-  }
   const normalizedPrevious = normalizeContinuationHistory(previousInput);
   const normalizedCurrent = normalizeContinuationHistory(currentInput);
   return (
@@ -342,7 +383,7 @@ export function responsesContinuationRequestFingerprint(
   request: ResponsesContinuationRequest,
 ): string {
   const serialized = JSON.stringify(requestWithoutInput(request));
-  return sha256Hex(stableStringify(JSON.parse(serialized)));
+  return sha256StableValue(JSON.parse(serialized)).digest;
 }
 
 export function responsesContinuationPrefixFingerprint(
@@ -353,7 +394,7 @@ export function responsesContinuationPrefixFingerprint(
     ...normalizeAssistantReplayInput(input),
     ...normalizeAssistantReplayInput(output, true),
   ]);
-  return sha256Hex(stableStringify(JSON.parse(serialized)));
+  return sha256StableValue(JSON.parse(serialized)).digest;
 }
 
 // Restore accepted replay IDs in the delta to match the provider's cached call.
@@ -453,15 +494,12 @@ export function resolveResponsesContinuationRequest(
   const replayedToolRoundInput = currentInput.slice(previousInput.length, baselineLength);
   const replayedToolRound = normalizeAssistantReplayInput(replayedToolRoundInput);
   // Replay may keep or omit function_call.id, so compare both cached forms.
-  const historyToolRoundUnchanged =
+  const historyToolRoundUnchanged = [false, true].some((ignoreCachedItemIds) =>
     jsonValuesEqual(
       replayedToolRound,
-      normalizeAssistantReplayInput(continuation.lastResponseItems, true),
-    ) ||
-    jsonValuesEqual(
-      replayedToolRound,
-      normalizeAssistantReplayInput(continuation.lastResponseItems, true, true),
-    );
+      normalizeAssistantReplayInput(continuation.lastResponseItems, true, ignoreCachedItemIds),
+    ),
+  );
   if (
     !continuationHistoryMatches(previousInput, currentInput.slice(0, previousInput.length)) ||
     !historyToolRoundUnchanged
@@ -513,31 +551,28 @@ const readyHttpContinuationEntries = new Map<
 // Updated with ready-entry insertion/removal; no full-cache scan on commit.
 let httpContinuationRetainedBytes = 0;
 
+// Keep timer closures outside the attempt scope, which retains prior baselines and callers.
+function createHttpContinuationTimer(key: string): ReturnType<typeof setTimeout> {
+  const timer = setTimeout(() => {
+    const entry = httpContinuationEntries.get(key);
+    if (entry?.kind === "ready" && entry.idleTimer === timer) {
+      deleteHttpContinuationIfOwned(key, entry);
+    }
+  }, HTTP_CONTINUATION_IDLE_TTL_MS);
+  timer.unref?.();
+  return timer;
+}
+
 // Timers and released handles must not remove a replacement claim.
 function deleteHttpContinuationIfOwned(key: string, entry: HttpContinuationEntry): void {
   if (httpContinuationEntries.get(key) !== entry) {
     return;
   }
   if (entry.kind === "ready") {
+    clearTimeout(entry.idleTimer);
     httpContinuationRetainedBytes -= entry.retainedBytes;
     readyHttpContinuationEntries.delete(key);
   }
-  httpContinuationEntries.delete(key);
-}
-
-// A serialized-content budget, not a measurement of JavaScript heap overhead.
-function estimateRetainedBytes(state: ResponsesContinuationState): number {
-  return Buffer.byteLength(JSON.stringify(state), "utf8");
-}
-
-// The caller synchronously verified this ready entry still owns its key.
-function removeReadyEntry(
-  key: string,
-  entry: Extract<HttpContinuationEntry, { kind: "ready" }>,
-): void {
-  clearTimeout(entry.idleTimer);
-  httpContinuationRetainedBytes -= entry.retainedBytes;
-  readyHttpContinuationEntries.delete(key);
   httpContinuationEntries.delete(key);
 }
 
@@ -555,14 +590,14 @@ function evictReadyEntriesForCapacity(pendingBytes: number): void {
       return;
     }
     const [oldestKey, oldestEntry] = oldest.value;
-    removeReadyEntry(oldestKey, oldestEntry);
+    deleteHttpContinuationIfOwned(oldestKey, oldestEntry);
   }
 }
 
 type HttpContinuationIdentity = {
   apiKey: string;
   baseUrl: string;
-  headers: Record<string, string>;
+  headers: ModelRequestHeaders;
 };
 
 function connectionIdentity(params: HttpContinuationIdentity): string {
@@ -592,83 +627,61 @@ export function claimOpenAIResponsesHttpContinuation(
   if (previous?.kind === "claimed") {
     return undefined;
   }
-  if (previous?.kind === "ready") {
-    removeReadyEntry(key, previous);
+  if (previous) {
+    deleteHttpContinuationIfOwned(key, previous);
   }
+  const request = previous ? params.request : (params.restoreRequest?.() ?? params.request);
+  const resolved = resolveResponsesContinuationRequest(previous?.state, request);
+  const fullRequest = resolved.fullRequest ?? request;
+  const continuationRequest = params.request.store === false ? fullRequest : resolved.request;
   const claimed = { kind: "claimed", sessionId: params.sessionId, owner } as const;
   httpContinuationEntries.set(key, claimed);
-  try {
-    const request =
-      previous?.kind === "ready" ? params.request : (params.restoreRequest?.() ?? params.request);
-    const resolved = resolveResponsesContinuationRequest(
-      previous?.kind === "ready" ? previous.state : undefined,
-      request,
-    );
-    const fullRequest = resolved.fullRequest ?? request;
-    return {
-      // Unstored HTTP responses cannot be referenced, but their prompt prefix can still be cached.
-      request: params.request.store === false ? fullRequest : resolved.request,
-      fullRequest,
-      commit: (
-        effectiveRequest: ResponsesContinuationRequest,
-        response: ContinuationResponse,
-        dispatchedPreviousResponseId?: string,
-      ) => {
-        if (httpContinuationEntries.get(key) !== claimed) {
-          return;
-        }
-        const state = recordResponsesContinuationState(
-          previous?.kind === "ready" ? previous.state : undefined,
-          effectiveRequest,
-          response,
-          previous?.kind === "ready" &&
-            dispatchedPreviousResponseId === previous.state.lastResponseId,
-        );
-        const retainedBytes = estimateRetainedBytes(state);
-        // Serialization can invoke caller-owned toJSON/getters that clean up or
-        // reclaim this session. Fence stale commits before eviction or mutation.
-        if (httpContinuationEntries.get(key) !== claimed) {
-          return;
-        }
-        if (retainedBytes > MAX_HTTP_CONTINUATION_RETAINED_BYTES) {
-          // Keep other sessions when this baseline cannot fit alone. Its next
-          // request sends full history; the completed response remains valid.
-          deleteHttpContinuationIfOwned(key, claimed);
-          return;
-        }
-        evictReadyEntriesForCapacity(retainedBytes);
-        const ready = {
-          ...claimed,
-          kind: "ready",
-          state,
-          idleTimer: setTimeout(
-            () => deleteHttpContinuationIfOwned(key, ready),
-            HTTP_CONTINUATION_IDLE_TTL_MS,
-          ),
-          retainedBytes,
-        } satisfies Extract<HttpContinuationEntry, { kind: "ready" }>;
-        ready.idleTimer.unref?.();
-        httpContinuationRetainedBytes += retainedBytes;
-        httpContinuationEntries.set(key, ready);
-        readyHttpContinuationEntries.set(key, ready);
-      },
-      release: () => deleteHttpContinuationIfOwned(key, claimed),
-    };
-  } catch (error) {
-    // Preparation failed before the caller received a handle that could release this claim.
-    deleteHttpContinuationIfOwned(key, claimed);
-    throw error;
-  }
+  return {
+    // Unstored HTTP responses cannot be referenced, but their prompt prefix can still be cached.
+    request: continuationRequest,
+    fullRequest,
+    commit: (
+      effectiveRequest: ResponsesContinuationRequest,
+      response: ContinuationResponse,
+      dispatchedPreviousResponseId?: string,
+    ) => {
+      if (httpContinuationEntries.get(key) !== claimed) {
+        return;
+      }
+      const state = recordResponsesContinuationState(
+        previous?.state,
+        effectiveRequest,
+        response,
+        previous !== undefined && dispatchedPreviousResponseId === previous.state.lastResponseId,
+      );
+      // Serialized-content budget, not JavaScript heap overhead.
+      const retainedBytes = Buffer.byteLength(JSON.stringify(state), "utf8");
+      if (retainedBytes > MAX_HTTP_CONTINUATION_RETAINED_BYTES) {
+        // Keep other sessions when this baseline cannot fit alone. Its next
+        // request sends full history; the completed response remains valid.
+        deleteHttpContinuationIfOwned(key, claimed);
+        return;
+      }
+      evictReadyEntriesForCapacity(retainedBytes);
+      const ready = {
+        ...claimed,
+        kind: "ready",
+        state,
+        idleTimer: owner.runInDetachedAsyncContext(() => createHttpContinuationTimer(key)),
+        retainedBytes,
+      } satisfies Extract<HttpContinuationEntry, { kind: "ready" }>;
+      httpContinuationRetainedBytes += retainedBytes;
+      httpContinuationEntries.set(key, ready);
+      readyHttpContinuationEntries.set(key, ready);
+    },
+    release: () => deleteHttpContinuationIfOwned(key, claimed),
+  };
 }
 
 registerSessionResourceCleanup((sessionId, owner) => {
   for (const [key, entry] of httpContinuationEntries) {
     if ((!owner || entry.owner === owner) && (!sessionId || entry.sessionId === sessionId)) {
-      if (entry.kind === "ready") {
-        removeReadyEntry(key, entry);
-      } else {
-        httpContinuationEntries.delete(key);
-      }
+      deleteHttpContinuationIfOwned(key, entry);
     }
   }
 });

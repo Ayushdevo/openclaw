@@ -4,8 +4,7 @@ import type { SessionsListParams } from "../../packages/gateway-protocol/src/ind
 import { isPinnableSessionEntry } from "../config/sessions/session-pin-policy.js";
 import type { InternalSessionEntry as SessionEntry } from "../config/sessions/types.js";
 import { sessionActivityTimestamp } from "../shared/session-activity-timestamp.js";
-import { sortAndLimitByWork } from "../shared/sort-and-limit.js";
-import type { SynchronousWork } from "../shared/synchronous-work.js";
+import { sortAndLimitBy } from "../shared/sort-and-limit.js";
 
 export type SessionEntryPair = [string, SessionEntry];
 
@@ -23,8 +22,8 @@ export function compareSessionEntryPairs(
       return bPinnedAt - aPinnedAt;
     }
   }
-  const aTimestamp = sortBy === "activity" ? sessionActivityTimestamp(a[1]) : a[1]?.[sortBy];
-  const bTimestamp = sortBy === "activity" ? sessionActivityTimestamp(b[1]) : b[1]?.[sortBy];
+  const aTimestamp = sortBy === "activity" ? sessionActivityTimestamp(a[1]) : a[1][sortBy];
+  const bTimestamp = sortBy === "activity" ? sessionActivityTimestamp(b[1]) : b[1][sortBy];
   const byTimestamp = (bTimestamp ?? 0) - (aTimestamp ?? 0);
   if (byTimestamp !== 0) {
     return byTimestamp;
@@ -33,16 +32,10 @@ export function compareSessionEntryPairs(
   return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
 }
 
-export function* sortAndLimitSessionEntries(
+export function sortAndLimitSessionEntries(
   entries: SessionEntryPair[],
   limit: number | undefined,
   sortBy: SessionsListParams["sortBy"],
-  shouldYield?: () => boolean,
-): SynchronousWork<SessionEntryPair[]> {
-  return yield* sortAndLimitByWork(
-    entries,
-    limit,
-    (a, b) => compareSessionEntryPairs(a, b, sortBy),
-    shouldYield,
-  );
+): SessionEntryPair[] {
+  return sortAndLimitBy(entries, limit, (a, b) => compareSessionEntryPairs(a, b, sortBy));
 }

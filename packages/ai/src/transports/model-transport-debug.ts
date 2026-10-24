@@ -7,11 +7,6 @@ type SubsystemLogger = {
 
 type ModelTransportDebugEnv = NodeJS.ProcessEnv;
 
-/** Payload debug detail levels accepted by `OPENCLAW_DEBUG_MODEL_PAYLOAD`. */
-type ModelPayloadDebugMode = "off" | "summary" | "tools" | "full-redacted";
-/** SSE debug detail levels accepted by `OPENCLAW_DEBUG_SSE`. */
-type ModelSseDebugMode = "off" | "events" | "peek";
-
 function isTruthyEnv(value: unknown): boolean {
   const normalized = normalizeLowercaseStringOrEmpty(value);
   return (
@@ -26,7 +21,7 @@ function isTruthyEnv(value: unknown): boolean {
 /** Resolves model payload debug verbosity from `OPENCLAW_DEBUG_MODEL_PAYLOAD`. */
 export function resolveModelPayloadDebugMode(
   env: ModelTransportDebugEnv = process.env,
-): ModelPayloadDebugMode {
+): "off" | "summary" | "tools" | "full-redacted" {
   const normalized = normalizeLowercaseStringOrEmpty(env.OPENCLAW_DEBUG_MODEL_PAYLOAD);
   if (normalized === "tools" || normalized === "full-redacted" || normalized === "summary") {
     return normalized;
@@ -37,7 +32,7 @@ export function resolveModelPayloadDebugMode(
 /** Resolves SSE stream debug verbosity from `OPENCLAW_DEBUG_SSE`. */
 export function resolveModelSseDebugMode(
   env: ModelTransportDebugEnv = process.env,
-): ModelSseDebugMode {
+): "off" | "events" | "peek" {
   const normalized = normalizeLowercaseStringOrEmpty(env.OPENCLAW_DEBUG_SSE);
   if (normalized === "peek") {
     return "peek";
@@ -45,21 +40,36 @@ export function resolveModelSseDebugMode(
   return isTruthyEnv(normalized) ? "events" : "off";
 }
 
-/** Returns whether any model transport debug channel is enabled. */
-function isModelTransportDebugEnabled(env: ModelTransportDebugEnv = process.env): boolean {
-  return (
+/** Emits transport diagnostics at debug, promoted to info by explicit debug flags. */
+export function emitModelTransportDebug(log: SubsystemLogger, message: string): void {
+  const env = process.env;
+  if (
     isTruthyEnv(env.OPENCLAW_DEBUG_MODEL_TRANSPORT) ||
     resolveModelPayloadDebugMode(env) !== "off" ||
     resolveModelSseDebugMode(env) !== "off" ||
     isTruthyEnv(env.OPENCLAW_DEBUG_CODE_MODE)
-  );
-}
-
-/** Emits transport diagnostics at debug, promoted to info by explicit debug flags. */
-export function emitModelTransportDebug(log: SubsystemLogger, message: string): void {
-  if (isModelTransportDebugEnabled()) {
+  ) {
     log.info(message);
     return;
   }
   log.debug(message);
+}
+
+/** The requesting layer owns AbortError classification; deadlines remain failures here. */
+export function emitModelTransportError(
+  log: SubsystemLogger & { warn(message: string): void },
+  label: string,
+  detail: string,
+  signal?: AbortSignal,
+): void {
+  const aborted =
+    signal?.aborted === true &&
+    signal.reason instanceof Error &&
+    signal.reason.name === "AbortError";
+  const message = `[${label}] ${aborted ? "aborted" : "error"} ${detail}`;
+  if (aborted) {
+    emitModelTransportDebug(log, message);
+  } else {
+    log.warn(message);
+  }
 }

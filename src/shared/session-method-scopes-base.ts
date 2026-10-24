@@ -7,12 +7,23 @@ export type SessionOperatorScope = "operator.sessions.read" | "operator.sessions
 const SESSION_READ_METHODS: ReadonlySet<string> = new Set([
   "agent.identity.get",
   "agents.list",
+  "artifacts.list",
+  "artifacts.get",
+  "artifacts.download",
+  "canvas.document.preview",
+  "canvas.document.view",
+  "controlUi.sessionPullRequests.subscribe",
+  "controlUi.sessionPullRequests.checks",
+  "mentions.dismiss",
+  "mentions.list",
   "models.list",
   "progressCard.get",
   "projects.list",
+  "projects.checkoutOptions",
   "session.suggestions.list",
   "session.reactions.list",
   "sessions.groups.list",
+  "sessions.processes.list",
   "sessions.list",
   "sessions.subscribe",
   "sessions.messages.subscribe",
@@ -20,6 +31,7 @@ const SESSION_READ_METHODS: ReadonlySet<string> = new Set([
   "sessions.viewers.set",
   "sessions.preview",
   "sessions.describe",
+  "sessions.diff",
   "sessions.branches.list",
   "sessions.get",
   "sessions.github.options",
@@ -28,6 +40,8 @@ const SESSION_READ_METHODS: ReadonlySet<string> = new Set([
   "sessions.search",
   "sessions.files.list",
   "sessions.files.get",
+  "sessions.files.download",
+  "sessions.files.assets",
   "sessions.setInvolvement",
   "chat.history",
   "chat.startup",
@@ -37,8 +51,12 @@ const SESSION_READ_METHODS: ReadonlySet<string> = new Set([
   "session.members.listEvidence",
   "themes.get",
   "themes.list",
+  "users.mentionable",
   "users.prefs.get",
+  "users.prefs.set",
   "users.self",
+  "users.setAvatar",
+  "users.setDisplayName",
 ]);
 
 const SESSION_WRITE_METHODS: ReadonlySet<string> = new Set([
@@ -56,6 +74,7 @@ const SESSION_WRITE_METHODS: ReadonlySet<string> = new Set([
   "sessions.recover",
   "sessions.send",
   "sessions.steer",
+  "sessions.processes.stop",
   "sessions.abort",
   "sessions.goal.update",
   "sessions.goal.clear",
@@ -66,6 +85,10 @@ export function resolveSessionMethodScope(
   method: string,
   params?: unknown,
 ): SessionOperatorScope | undefined {
+  // Selecting a device filesystem requires the broader operator capability.
+  if (method === "sessions.create" && isRecord(params) && params.deviceFolder !== undefined) {
+    return undefined;
+  }
   if (SESSION_READ_METHODS.has(method)) {
     return "operator.sessions.read";
   }
@@ -87,6 +110,7 @@ const SESSIONS_PATCH_WRITE_SCOPE_MUTATIONS: ReadonlySet<string> = new Set([
   "boardFace",
   "boardPresentation",
   "pinned",
+  "sidebarRoot",
   "archived",
   "snoozedUntil",
   "unread",
@@ -95,6 +119,7 @@ const SESSIONS_PATCH_WRITE_SCOPE_MUTATIONS: ReadonlySet<string> = new Set([
   "thinkingLevel",
   "fastMode",
   "permissionMode",
+  "communication",
 ]);
 
 const SESSIONS_PATCH_WRITE_SCOPE_ENVELOPE_FIELDS: ReadonlySet<string> = new Set([
@@ -104,6 +129,10 @@ const SESSIONS_PATCH_WRITE_SCOPE_ENVELOPE_FIELDS: ReadonlySet<string> = new Set(
   "expectedLifecycleRevision",
   "expectedPermissionMode",
   "expectedMarkedUnreadAt",
+  "expectedSidebarRoot",
+  "expectedCategory",
+  "expectedArchived",
+  "expectedSidebarAncestors",
 ]);
 
 const SESSIONS_DELETE_WRITE_SCOPE_FIELDS: ReadonlySet<string> = new Set([
@@ -114,61 +143,6 @@ const SESSIONS_DELETE_WRITE_SCOPE_FIELDS: ReadonlySet<string> = new Set([
   "archivedOnly",
 ]);
 
-function resolveSessionsPatchRequiredScope(params: unknown): SessionMutationOperatorScope {
-  if (!isRecord(params)) {
-    return "operator.write";
-  }
-  if (params.permissionMode === "full" || Object.hasOwn(params, "sandboxMode")) {
-    return "operator.admin";
-  }
-  return Object.keys(params).every(
-    (key) =>
-      SESSIONS_PATCH_WRITE_SCOPE_ENVELOPE_FIELDS.has(key) ||
-      SESSIONS_PATCH_WRITE_SCOPE_MUTATIONS.has(key),
-  )
-    ? "operator.write"
-    : "operator.admin";
-}
-
-function resolveSessionsPatchManyRequiredScope(params: unknown): SessionMutationOperatorScope {
-  if (!isRecord(params) || !isRecord(params.patch)) {
-    return "operator.write";
-  }
-  if (params.patch.permissionMode === "full" || Object.hasOwn(params.patch, "sandboxMode")) {
-    return "operator.admin";
-  }
-  return Object.keys(params.patch).every((key) => SESSIONS_PATCH_WRITE_SCOPE_MUTATIONS.has(key))
-    ? "operator.write"
-    : "operator.admin";
-}
-
-function resolveSessionsCreateRequiredScope(params: unknown): SessionMutationOperatorScope {
-  if (!isRecord(params)) {
-    return "operator.write";
-  }
-  if (
-    params.incognito === true ||
-    (typeof params.key === "string" && isIncognitoSessionKey(params.key)) ||
-    (typeof params.parentSessionKey === "string" &&
-      isIncognitoSessionKey(params.parentSessionKey)) ||
-    Object.hasOwn(params, "execNode") ||
-    Object.hasOwn(params, "toolOverrides") ||
-    params.permissionMode === "full"
-  ) {
-    return "operator.admin";
-  }
-  return "operator.write";
-}
-
-function resolveSessionsDeleteRequiredScope(params: unknown): SessionMutationOperatorScope {
-  if (!isRecord(params) || params.archivedOnly !== true) {
-    return "operator.admin";
-  }
-  return Object.keys(params).every((key) => SESSIONS_DELETE_WRITE_SCOPE_FIELDS.has(key))
-    ? "operator.write"
-    : "operator.admin";
-}
-
 /** Browser-safe session mutation policy for methods without protocol validation. */
 export function resolveBaseSessionMutationRequiredScope(
   method: string,
@@ -178,16 +152,55 @@ export function resolveBaseSessionMutationRequiredScope(
     return "operator.write";
   }
   if (method === "sessions.create") {
-    return resolveSessionsCreateRequiredScope(params);
+    if (!isRecord(params)) {
+      return "operator.write";
+    }
+    if (
+      params.incognito === true ||
+      (typeof params.key === "string" && isIncognitoSessionKey(params.key)) ||
+      (typeof params.parentSessionKey === "string" &&
+        isIncognitoSessionKey(params.parentSessionKey)) ||
+      Object.hasOwn(params, "execNode") ||
+      Object.hasOwn(params, "toolOverrides") ||
+      params.permissionMode === "full"
+    ) {
+      return "operator.admin";
+    }
+    return "operator.write";
   }
   if (method === "sessions.patch") {
-    return resolveSessionsPatchRequiredScope(params);
+    if (!isRecord(params)) {
+      return "operator.write";
+    }
+    if (params.permissionMode === "full" || Object.hasOwn(params, "sandboxMode")) {
+      return "operator.admin";
+    }
+    return Object.keys(params).every(
+      (key) =>
+        SESSIONS_PATCH_WRITE_SCOPE_ENVELOPE_FIELDS.has(key) ||
+        SESSIONS_PATCH_WRITE_SCOPE_MUTATIONS.has(key),
+    )
+      ? "operator.write"
+      : "operator.admin";
   }
   if (method === "sessions.patchMany") {
-    return resolveSessionsPatchManyRequiredScope(params);
+    if (!isRecord(params) || !isRecord(params.patch)) {
+      return "operator.write";
+    }
+    if (params.patch.permissionMode === "full" || Object.hasOwn(params.patch, "sandboxMode")) {
+      return "operator.admin";
+    }
+    return Object.keys(params.patch).every((key) => SESSIONS_PATCH_WRITE_SCOPE_MUTATIONS.has(key))
+      ? "operator.write"
+      : "operator.admin";
   }
   if (method === "sessions.delete") {
-    return resolveSessionsDeleteRequiredScope(params);
+    if (!isRecord(params) || params.archivedOnly !== true) {
+      return "operator.admin";
+    }
+    return Object.keys(params).every((key) => SESSIONS_DELETE_WRITE_SCOPE_FIELDS.has(key))
+      ? "operator.write"
+      : "operator.admin";
   }
   return undefined;
 }

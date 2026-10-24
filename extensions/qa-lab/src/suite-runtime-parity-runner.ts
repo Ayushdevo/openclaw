@@ -6,17 +6,22 @@ import type { QaEvidenceSummaryV3Json } from "./evidence-summary.js";
 import { remapModelRefForForcedRuntime } from "./model-selection.js";
 import { sanitizeQaProgressValue as sanitizeQaSuiteProgressValue } from "./progress-format.js";
 import type { RuntimeId } from "./runtime-id.js";
-import { runRuntimeParityScenario, type RuntimeParityCell } from "./runtime-parity.js";
+import {
+  isRuntimeParityResultPass,
+  runRuntimeParityScenario,
+  runtimeParityCellStatus,
+  type RuntimeParityCell,
+  type RuntimeParityResult,
+} from "./runtime-parity.js";
 import { createQaSuiteEvidenceInvocation, rebaseQaSuiteEvidence } from "./suite-evidence.js";
 import {
-  collectQaSuiteTransportPolicy,
   mapQaSuiteWithConcurrency,
   resolveQaSuiteWorkerStartStaggerMs,
   scenarioRequiresControlUi,
 } from "./suite-planning.js";
 import { createQaSuiteProgressController } from "./suite-progress.js";
 import { completeQaSuiteRun } from "./suite-run-completion.js";
-import { buildRuntimeParityScenarioResult } from "./suite-runtime-parity-result.js";
+import { createQaSuiteRunResources } from "./suite-run-resources.js";
 import type {
   QaSuiteRunParams,
   QaSuiteRunner,
@@ -25,13 +30,40 @@ import type {
   QaSuiteResolvedRunContext,
 } from "./suite-types.js";
 import {
-  createQaSuiteTransportAdapter,
   markQaSuiteNestedRun,
   requireQaSuiteStartLab,
   runQaSuiteCleanupSteps,
   throwQaSuiteCleanupErrors,
   writeQaSuiteProgress,
 } from "./suite.js";
+
+// QA Lab projects canonical runtime-pair results into suite scenario results.
+function formatRuntimeParityCellDetails(cell: RuntimeParityCell) {
+  const errors = [cell.transportErrorClass, cell.runtimeErrorClass].filter(Boolean).join(", ");
+  const sentinels = cell.sentinelFindings?.map((finding) => finding.kind).join(", ");
+  return [
+    `runtime=${cell.runtime}`,
+    `wallMs=${cell.wallClockMs}`,
+    ...(cell.bootstrapWallClockMs === undefined
+      ? []
+      : [`bootstrapMs=${cell.bootstrapWallClockMs}`]),
+    `toolCalls=${cell.toolCalls.length}`,
+    `finalChars=${cell.finalText.length}`,
+    `tokens=${cell.usage.totalTokens}`,
+    ...(errors ? [`errors=${errors}`] : []),
+    ...(sentinels ? [`sentinels=${sentinels}`] : []),
+  ].join(" ");
+}
+
+function runtimeParityScenarioResultStatus(result: RuntimeParityResult) {
+  if (isRuntimeParityResultPass(result)) {
+    return "pass";
+  }
+  const statuses = new Set(
+    [result.cells.openclaw, result.cells.codex].map(runtimeParityCellStatus),
+  );
+  return !statuses.has("fail") && statuses.has("skip") ? "skip" : "fail";
+}
 
 export async function runQaRuntimeParitySuite(
   params: Omit<QaSuiteRunParams, "channelDriver" | "scenarioIds"> &
@@ -66,28 +98,9 @@ export async function runQaRuntimeParitySuite(
     },
     params,
   );
-  const ownsLab = !params.lab;
   const startLab = requireQaSuiteStartLab(params.startLab);
-  const lab =
-    params.lab ??
-    (await startLab({
-      repoRoot: params.repoRoot,
-      host: "127.0.0.1",
-      port: 0,
-      embeddedGateway: "disabled",
-    }));
-  const transportFactoryResult = await createQaSuiteTransportAdapter({
-    adapterFactories: params.adapterFactories,
-    channelDriver: params.channelDriver,
-    channelId: params.channelId,
-    adapterOptions: params.adapterOptions,
-    cleanupOnFailure: ownsLab ? () => lab.stop() : undefined,
-    outputDir: params.outputDir,
-    transportPolicy: collectQaSuiteTransportPolicy(params.selectedScenarios),
-    state: lab.state,
-    transportId: params.transportId,
-  });
-  const transport = transportFactoryResult.adapter;
+  const { lab, ownsLab, transportFactoryResult, transport, artifactParams } =
+    await createQaSuiteRunResources(params, params, "runtime-pair");
   const progress = createQaSuiteProgressController({
     lab,
     scenarios: params.selectedScenarios,
@@ -100,7 +113,6 @@ export async function runQaRuntimeParitySuite(
   let parentTransportCleaned = false;
   let terminalScenarios: QaSuiteScenarioResult[] | undefined;
   let transportArtifacts: QaRunnerTransportArtifacts | undefined;
-  let publishTerminalResult: (() => Promise<QaSuiteResult>) | undefined;
   const startedScenarioIndexes = new Set<number>();
   try {
     if (params.channelDriver === "live") {
@@ -207,7 +219,7 @@ export async function runQaRuntimeParitySuite(
                     writeEvidenceFile: params.writeEvidenceFile,
                     evidenceAnchors: [cells.invocation.anchors[cellIndex]!],
                     onEvidence: (summary) => {
-                      childEvidence = structuredClone(summary);
+                      childEvidence = summary;
                       importChild();
                     },
                   }),
@@ -262,10 +274,27 @@ export async function runQaRuntimeParitySuite(
             },
           });
 
-          const parityResult = buildRuntimeParityScenarioResult({
-            scenarioName: scenario.title,
-            result: parity,
-          });
+          const driftStepStatus = runtimeParityScenarioResultStatus(parity);
+          const parityResult: QaSuiteScenarioResult = {
+            name: scenario.title,
+            status: driftStepStatus,
+            details: parity.driftDetails ?? `runtime drift classified as ${parity.drift}`,
+            steps: [
+              ...[parity.cells.openclaw, parity.cells.codex].map((cell) => ({
+                name: cell.runtime,
+                status: runtimeParityCellStatus(cell),
+                details: [cell.details, formatRuntimeParityCellDetails(cell)]
+                  .filter(Boolean)
+                  .join("\n"),
+              })),
+              {
+                name: "runtime drift",
+                status: driftStepStatus,
+                details: parity.driftDetails ?? parity.drift,
+              },
+            ],
+            runtimeParity: parity,
+          };
           recordingComparison = true;
           const parityScenarioResult = await recording.record(index, comparisonId, parityResult, {
             diagnostic: true,
@@ -312,38 +341,6 @@ export async function runQaRuntimeParitySuite(
 
     transportArtifacts = await transport.captureArtifacts?.({ outputDir: params.outputDir });
     terminalScenarios = scenarios;
-    publishTerminalResult = async () => {
-      const finishedAt = new Date();
-      return await completeQaSuiteRun(
-        {
-          outputDir: params.outputDir,
-          startedAt: params.startedAt,
-          finishedAt,
-          scenarios,
-          recordedEvidence: recording.snapshot(),
-          transport,
-          providerMode: params.providerMode,
-          primaryModel: params.primaryModel,
-          alternateModel: params.alternateModel,
-          fastMode: params.fastMode,
-          concurrency: params.concurrency,
-          channel: params.channelId ?? transport.id,
-          channelDriver: transportFactoryResult.driver,
-          transportArtifacts,
-          scenarioIds:
-            params.scenarioIds && params.scenarioIds.length > 0
-              ? params.selectedScenarios.map((scenario) => scenario.id)
-              : undefined,
-          runtimePair: params.runtimePair,
-          writeEvidenceFile: params.writeEvidenceFile,
-        },
-        lab,
-        progress,
-        params.selectedScenarios
-          .filter((_scenario, index) => startedScenarioIndexes.has(index))
-          .map((scenario) => scenario.id),
-      );
-    };
   } catch (error) {
     runFailed = true;
     runError = error;
@@ -362,10 +359,23 @@ export async function runQaRuntimeParitySuite(
       scenarios: terminalScenarios,
     });
   }
-  if (!publishTerminalResult) {
-    throw new Error("QA runtime parity suite completed without a result");
-  }
-  const result = await publishTerminalResult();
+  const finishedAt = new Date();
+  const result = await completeQaSuiteRun(
+    {
+      ...artifactParams,
+      finishedAt,
+      scenarios: terminalScenarios,
+      recordedEvidence: recording.snapshot(),
+      transportArtifacts,
+      runtimePair: params.runtimePair,
+      writeEvidenceFile: params.writeEvidenceFile,
+    },
+    lab,
+    progress,
+    params.selectedScenarios
+      .filter((_scenario, index) => startedScenarioIndexes.has(index))
+      .map((scenario) => scenario.id),
+  );
   writeQaSuiteProgress(params.progressEnabled, "run complete");
   return result;
 }

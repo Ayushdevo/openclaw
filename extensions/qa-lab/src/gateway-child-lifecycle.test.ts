@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, type WriteStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { extractErrorCode } from "openclaw/plugin-sdk/error-runtime";
@@ -120,7 +120,10 @@ if (previous.length && failReplacement !== "false") {
   }
   process.exit(17);
 }
-http.createServer((_request, response) => response.end("ok")).listen(Number(args[args.indexOf("--port") + 1]), "127.0.0.1");
+http.createServer((request, response) => {
+  response.setHeader("content-type", "application/json");
+  response.end(JSON.stringify(request.url === "/readyz" ? { ready: true, agentDatabases: [] } : { ok: true }));
+}).listen(Number(args[args.indexOf("--port") + 1]), "127.0.0.1");
 }
 `,
   );
@@ -168,6 +171,59 @@ function deferred() {
 }
 
 describe.skipIf(process.platform === "win32")("QA gateway lifetime ownership", () => {
+  it.each(["stdout", "stderr"] as const)(
+    "fails and releases a child when its %s log sink stops draining",
+    async (label) => {
+      const prepare = gatewaySetup.prepareQaGatewayChild;
+      let sink: WriteStream | undefined;
+      let maxQueuedBytes = 0;
+      vi.spyOn(gatewaySetup, "prepareQaGatewayChild").mockImplementation(async (...args) => {
+        const setup = await prepare(...args);
+        sink = label === "stdout" ? setup.stdoutLog : setup.stderrLog;
+        // Cork the real file stream: disk never accepts the child's diagnostic burst.
+        sink.cork();
+        const write = sink.write.bind(sink);
+        vi.spyOn(sink, "write").mockImplementation((chunk: Buffer) => {
+          const accepted = write(chunk);
+          maxQueuedBytes = Math.max(maxQueuedBytes, sink!.writableLength);
+          return accepted;
+        });
+        return setup;
+      });
+      const { params, pids } = await fixture();
+      const cliPath = params.command.argsPrefix[0]!;
+      const cli = await fs.readFile(cliPath, "utf8");
+      await fs.writeFile(
+        cliPath,
+        cli.replace(
+          "http.createServer((request, response) => {",
+          `const chunk = Buffer.alloc(64 * 1024, 120);
+for (let index = 0; index < 128; index++) {
+  if (!process.${label}.write(chunk)) await once(process.${label}, "drain");
+}
+http.createServer((request, response) => {`,
+        ),
+      );
+      const owner = own(params);
+      try {
+        const failure = await owner.start().then(
+          () => null,
+          (error: unknown) => error,
+        );
+        expect(maxQueuedBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
+        expect(failure).toMatchObject({
+          message: expect.stringContaining(`${label} log backlog exceeded`),
+        });
+        expect(pids().every((pid) => !isQaPosixProcessGroupAlive(pid))).toBe(true);
+        expect((await owner.stop()).process).toBe("confirmed-stopped");
+        expect(sink?.destroyed).toBe(true);
+      } finally {
+        sink?.destroy();
+        await owner.stop();
+      }
+    },
+  );
+
   it("captures final receipts after process stop and before removing runtime state", async () => {
     const { params, pids } = await fixture();
     const owner = own(params);
@@ -317,9 +373,11 @@ describe.skipIf(process.platform === "win32")("QA gateway lifetime ownership", (
     async (phase) => {
       const { params, pids } = await fixture(phase === "replacement");
       const failure = new Error("fixture listening failed");
+      let listeningLogs: (() => string) | undefined;
       const owner = own({
         ...params,
-        onListening: () => {
+        onListening: ({ logs }) => {
+          listeningLogs = logs;
           pids();
           if (phase === "startup") {
             throw failure;
@@ -336,6 +394,9 @@ describe.skipIf(process.platform === "win32")("QA gateway lifetime ownership", (
           "exitCode=17",
         );
       }
+      expect(listeningLogs?.()).toContain("QA_GATEWAY_ATTEMPT_1");
+      expect(listeningLogs?.()).toContain("apiKey=<redacted>");
+      expect(listeningLogs?.()).not.toContain("synthetic-fixture-secret");
       const artifactRoot = path.join(process.cwd(), ".artifacts/qa-e2e/startup-lease-fix");
       await fs.mkdir(artifactRoot, { recursive: true });
       const preserveToDir = await fs.mkdtemp(path.join(artifactRoot, "preserved-log-"));

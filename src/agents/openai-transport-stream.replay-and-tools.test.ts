@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import type { Model } from "openclaw/plugin-sdk/llm";
 import { describe, expect, it, vi } from "vitest";
+import { serializeModelRequestBody } from "../../packages/ai/src/transports/model-request-body.js";
 import { buildOpenAICompletionsParams } from "./openai-transport-stream.js";
 import {
   buildOpenAIResponsesParams,
@@ -99,7 +100,7 @@ function emptyResponsesContext() {
 
 describe("openai transport stream", () => {
   it("omits Responses replay item ids when OpenAI Responses requests disable store", () => {
-    const params = buildOpenAIResponsesParams(
+    const request = buildOpenAIResponsesParams(
       makeResponsesModel({
         id: "gpt-5.5",
         name: "GPT-5.5",
@@ -126,6 +127,9 @@ describe("openai transport stream", () => {
         ],
       }),
       { sessionId: "session-123" },
+    );
+    const params = JSON.parse(
+      new TextDecoder().decode(serializeModelRequestBody(request).body),
     ) as {
       store?: boolean;
       input?: Array<{
@@ -401,11 +405,13 @@ describe("openai transport stream", () => {
         }),
       });
     const onCompactionRejected = vi.fn();
+    const recoveryRequest = request as never;
 
     await expect(
-      testing.createResponsesStreamWithEncryptedContentRetry({
+      testing.createResponsesStreamWithRecovery({
         client: { responses: { create } } as never,
-        request: request as never,
+        request: recoveryRequest,
+        buildFullHistoryRequest: () => recoveryRequest,
         requestOptions: undefined,
         model: makeResponsesModel({ id: "gpt-5.5", name: "GPT-5.5" }),
         onCompactionRejected,
@@ -440,17 +446,19 @@ describe("openai transport stream", () => {
       .mockReturnValueOnce({ withResponse: vi.fn().mockRejectedValue(finalFailure) });
     const onCompactionRejected = vi.fn();
 
+    const request = {
+      model: "gpt-5.5",
+      stream: true,
+      input: [
+        { type: "reasoning", encrypted_content: "reasoning", summary: [] },
+        { type: "compaction", encrypted_content: "compaction" },
+      ],
+    } as never;
     await expect(
-      testing.createResponsesStreamWithEncryptedContentRetry({
+      testing.createResponsesStreamWithRecovery({
         client: { responses: { create } } as never,
-        request: {
-          model: "gpt-5.5",
-          stream: true,
-          input: [
-            { type: "reasoning", encrypted_content: "reasoning", summary: [] },
-            { type: "compaction", encrypted_content: "compaction" },
-          ],
-        } as never,
+        request,
+        buildFullHistoryRequest: () => request,
         requestOptions: undefined,
         model: makeResponsesModel({ id: "gpt-5.5", name: "GPT-5.5" }),
         onCompactionRejected,
@@ -475,17 +483,19 @@ describe("openai transport stream", () => {
       .mockReturnValueOnce({ withResponse: vi.fn().mockRejectedValue(unrelatedFailure) });
     const onCompactionRejected = vi.fn();
 
+    const request = {
+      model: "gpt-5.5",
+      stream: true,
+      input: [
+        { type: "reasoning", encrypted_content: "reasoning", summary: [] },
+        { type: "compaction", encrypted_content: "compaction" },
+      ],
+    } as never;
     await expect(
-      testing.createResponsesStreamWithEncryptedContentRetry({
+      testing.createResponsesStreamWithRecovery({
         client: { responses: { create } } as never,
-        request: {
-          model: "gpt-5.5",
-          stream: true,
-          input: [
-            { type: "reasoning", encrypted_content: "reasoning", summary: [] },
-            { type: "compaction", encrypted_content: "compaction" },
-          ],
-        } as never,
+        request,
+        buildFullHistoryRequest: () => request,
         requestOptions: undefined,
         model: makeResponsesModel({ id: "gpt-5.5", name: "GPT-5.5" }),
         onCompactionRejected,
@@ -509,13 +519,15 @@ describe("openai transport stream", () => {
         response: new Response(null, { status: 200 }),
       }),
     });
-    const result = await testing.createResponsesStreamWithEncryptedContentRetry({
+    const request = {
+      model: "gpt-5.5",
+      stream: true,
+      input: [{ type: "reasoning", encrypted_content: "reasoning", summary: [] }],
+    } as never;
+    const result = await testing.createResponsesStreamWithRecovery({
       client: { responses: { create } } as never,
-      request: {
-        model: "gpt-5.5",
-        stream: true,
-        input: [{ type: "reasoning", encrypted_content: "reasoning", summary: [] }],
-      } as never,
+      request,
+      buildFullHistoryRequest: () => request,
       requestOptions: undefined,
       model: makeResponsesModel({ id: "gpt-5.5", name: "GPT-5.5" }),
     });
@@ -714,7 +726,20 @@ describe("openai transport stream", () => {
     expect(completions.reasoning_effort).toBe("xhigh");
   });
 
-  it("raises minimal OpenAI Responses reasoning when web_search is available", () => {
+  it.each([
+    [
+      "raises minimal OpenAI Responses reasoning when web_search is available",
+      "web_search",
+      "Search the web",
+      "low",
+    ],
+    [
+      "keeps minimal OpenAI Responses reasoning without web_search",
+      "lookup_weather",
+      "Get forecast",
+      "minimal",
+    ],
+  ] as const)("%s", (_name, toolName, description, effort) => {
     const model = makeResponsesModel({
       id: "gpt-5.4",
       name: "GPT-5.4",
@@ -730,8 +755,8 @@ describe("openai transport stream", () => {
         messages: [],
         tools: [
           {
-            name: "web_search",
-            description: "Search the web",
+            name: toolName,
+            description,
             parameters: { type: "object", properties: {}, additionalProperties: false },
           },
         ],
@@ -741,37 +766,7 @@ describe("openai transport stream", () => {
       } as never,
     ) as { reasoning?: unknown };
 
-    expect(params.reasoning).toEqual({ effort: "low", summary: "auto" });
-  });
-
-  it("keeps minimal OpenAI Responses reasoning without web_search", () => {
-    const model = makeResponsesModel({
-      id: "gpt-5.4",
-      name: "GPT-5.4",
-      compat: {
-        supportedReasoningEfforts: ["minimal", "low", "medium", "high"],
-      },
-    });
-
-    const params = buildOpenAIResponsesParams(
-      model,
-      {
-        systemPrompt: "system",
-        messages: [],
-        tools: [
-          {
-            name: "lookup_weather",
-            description: "Get forecast",
-            parameters: { type: "object", properties: {}, additionalProperties: false },
-          },
-        ],
-      } as never,
-      {
-        reasoning: "minimal",
-      } as never,
-    ) as { reasoning?: unknown };
-
-    expect(params.reasoning).toEqual({ effort: "minimal", summary: "auto" });
+    expect(params.reasoning).toEqual({ effort, summary: "auto" });
   });
 
   it("does not reread an unreadable tool inventory length", () => {

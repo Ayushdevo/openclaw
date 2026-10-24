@@ -1,7 +1,10 @@
 /* @vitest-environment jsdom */
 import { GatewayProtocolRequestTimeoutError } from "@openclaw/gateway-client/browser";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { GatewayPendingRequests } from "../../../../packages/gateway-client/src/pending-request.js";
+import type { RequestFrame } from "../../../../packages/gateway-protocol/src/schema/frames.js";
 import { GatewayRequestError } from "../../api/gateway.ts";
+import { listStoredChatOutboxes } from "../../lib/chat/outbox-store-projection.ts";
 import { createTestGatewayClient as clientWithRequest } from "../../test-helpers/gateway-client.ts";
 import { waitForFast } from "../../test-helpers/wait-for.ts";
 import {
@@ -10,125 +13,316 @@ import {
   requestCalls,
   requireRecord,
 } from "./chat-host.test-support.ts";
-import { admitHostQueueItems, idleChatHistory, row } from "./chat-outbox-recovery.test-support.ts";
+import { admitHostQueueItems, idleChatHistory } from "./chat-outbox-recovery.test-support.ts";
+import { markQueuedChatSendsWaitingForReconnect } from "./chat-queue-reconnect.ts";
+import { updateQueuedMessage } from "./chat-queue.ts";
 import { resumeStoredChatOutboxes } from "./chat-send-actions.ts";
 import { handleSendChat } from "./chat-send-submit.ts";
-import { listStoredChatOutboxes } from "./composer-persistence.ts";
 import { useChatSendBrowserFixture } from "./outbox-browser.test-support.ts";
 useChatSendBrowserFixture();
 
-describe("transient outbox delivery recovery", () => {
-  it("retries an explicitly retryable send rejection while still connected", async () => {
-    const sendRunIds: string[] = [];
-    let sendAttempts = 0;
+function useFakeClock() {
+  vi.useFakeTimers();
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
+}
+function unavailable(message = "History is temporarily unavailable") {
+  return new GatewayRequestError({
+    code: "UNAVAILABLE",
+    message,
+    retryable: true,
+    retryAfterMs: 100,
+  });
+}
+function requestTimeout(method: string) {
+  return new GatewayProtocolRequestTimeoutError({ method, timeoutMs: 30_000, requestSent: true });
+}
 
+describe("transient outbox delivery recovery", () => {
+  it.each([undefined, "steer"] as const)(
+    "parks %s delivery until Gateway work resumes",
+    async (queueMode) => {
+      const host = makeChatHost({
+        chatMessage: "Keep this input while the Gateway is suspended",
+        ...(queueMode ? { chatRunId: "active-run", chatFollowUpMode: queueMode } : {}),
+        requestHandlers: {
+          "chat.history": idleChatHistory(),
+          "chat.send": (params: unknown) => ({
+            runId: requireRecord(params, "resumed payload").idempotencyKey,
+            status: "started",
+            messageSeq: 1,
+          }),
+        },
+      });
+      host.gatewayWorkPaused = true;
+      await handleSendChat(host);
+      expect(requestCalls(host.request, "chat.send")).toHaveLength(0);
+      expect(host.chatQueue).toHaveLength(1);
+      const queuedRunId = host.chatQueue[0]?.sendRunId;
+      expect(host.chatMessage).toBe("");
+      await resumeStoredChatOutboxes(host);
+      expect(requestCalls(host.request, "chat.history")).toHaveLength(0);
+      host.gatewayWorkPaused = false;
+      await resumeStoredChatOutboxes(host);
+      expect(requestCalls(host.request, "chat.send")).toHaveLength(1);
+      expect(requestCalls(host.request, "chat.send")[0]?.[1]).toMatchObject({
+        idempotencyKey: queuedRunId,
+      });
+      await resumeStoredChatOutboxes(host);
+      expect(requestCalls(host.request, "chat.send")).toHaveLength(1);
+    },
+  );
+
+  it.each(["durable", "volatile", "changed connection"] as const)(
+    "retries a timed-out send only for its current owner (%s)",
+    async (mode) => {
+      const volatile = mode !== "durable";
+      useFakeClock();
+      if (volatile) {
+        vi.spyOn(sessionStorage, "setItem").mockImplementation(() => {
+          throw new Error("quota");
+        });
+      }
+      const sends: unknown[] = [];
+      const host = makeChatHost({
+        sessionKey: "agent:main",
+        currentSessionId: "physical-session",
+        chatMessage: "Retain this input",
+        requestHandlers: {
+          "chat.send": (params: unknown) => {
+            sends.push(params);
+            if (sends.length === 1) {
+              throw requestTimeout("chat.send");
+            }
+            return { runId: requireRecord(params, "retry").idempotencyKey, status: "ok" };
+          },
+        },
+      });
+      await handleSendChat(host);
+      expect(host.chatQueue[0]).toMatchObject({ sendState: "waiting-reconnect", sendAttempts: 1 });
+      if (volatile) {
+        expect(listStoredChatOutboxes(host)).toEqual([]);
+      }
+      if (mode === "changed connection") {
+        host.connectionEpoch += 1;
+      }
+      await vi.advanceTimersByTimeAsync(499);
+      expect(sends).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      if (mode === "changed connection") {
+        expect(sends).toHaveLength(1);
+        expect(host.chatQueue[0]?.sendState).toBe("waiting-reconnect");
+        return;
+      }
+      await waitForFast(() => {
+        expect(sends).toHaveLength(2);
+        expect(host.chatQueue).toEqual([]);
+      });
+      expect(sends[1]).toEqual(sends[0]);
+    },
+  );
+
+  it("binds a background first attempt and its replay to the physical session", async () => {
+    const sessionKey = "agent:main:background";
+    const attempts: Record<string, unknown>[] = [];
     const host = makeChatHost({
+      currentSessionId: "unrelated-visible-session",
+      chatQueue: [{ id: "background", text: "Retained input", createdAt: 1, sessionKey }],
       requestHandlers: {
-        "chat.history": idleChatHistory(),
+        "chat.history": {
+          ...idleChatHistory(sessionKey),
+          sessionId: "original-background-session",
+        },
         "chat.send": (params: unknown) => {
-          const payload = requireRecord(params, "retryable send payload");
-          sendRunIds.push(String(payload.idempotencyKey));
-          sendAttempts += 1;
-          if (sendAttempts === 1) {
-            throw new GatewayRequestError({
-              code: "UNAVAILABLE",
-              message: "Gateway is temporarily busy",
-              retryable: true,
-              retryAfterMs: 100,
-            });
+          const payload = requireRecord(params, "background send");
+          attempts.push(payload);
+          if (attempts.length === 1) {
+            host.connected = false;
+            throw requestTimeout("chat.send");
           }
-          return { runId: payload.idempotencyKey, status: "started", messageSeq: 1 };
+          throw new GatewayRequestError({ code: "INVALID_REQUEST", message: "Session changed" });
         },
       },
-      chatMessage: "retry without disconnecting",
     });
+    admitHostQueueItems(host);
+    await resumeStoredChatOutboxes(host);
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]).toMatchObject({
+      sessionKey,
+      sessionId: "original-background-session",
+      expectedLeafEntryId: null,
+    });
+    expect(listStoredChatOutboxes(host)[0]?.queue[0]).toMatchObject({
+      sessionId: "original-background-session",
+      sendState: "waiting-reconnect",
+    });
+    host.currentSessionId = "replacement-visible-session";
+    host.connected = true;
+    host.connectionEpoch += 1;
+    await resumeStoredChatOutboxes(host);
+    expect(attempts).toEqual([attempts[0], attempts[0]]);
+    expect(listStoredChatOutboxes(host)[0]?.queue[0]).toMatchObject({
+      sendState: "failed",
+      sendError: "Session changed",
+    });
+  });
 
-    vi.useFakeTimers();
-    try {
+  it.each(["started", "in_flight", "ok", "rejected"] as const)(
+    "keeps a written frame pending and replays its original key after reconnect (%s)",
+    async (outcome) => {
+      const frames: RequestFrame[] = [];
+      const issued = Promise.withResolvers<void>();
+      const pending = new GatewayPendingRequests({
+        createRequestId: () => "transport-request",
+        createRequestError: (error) =>
+          new GatewayRequestError({
+            ...error,
+            code: error.code ?? "UNAVAILABLE",
+            message: error.message ?? "Request failed",
+          }),
+        nowMs: Date.now,
+      });
+      onTestFinished(() => pending.flush(new Error("test request owner disposed")));
+      const wire = {
+        send: (raw: string) => {
+          const frame = JSON.parse(raw) as RequestFrame;
+          frames.push(frame);
+          if (frames.length === 1) {
+            issued.resolve();
+            return;
+          }
+          expect(methods).toEqual(["chat.send", "chat.send"]);
+          const runId = requireRecord(frame.params, "replayed frame").idempotencyKey;
+          pending.handleResponse({
+            type: "res",
+            id: frame.id,
+            ok: outcome !== "rejected",
+            ...(outcome === "rejected"
+              ? { error: { code: "INVALID_REQUEST", message: "Synthetic rejection" } }
+              : { payload: { runId, status: outcome } }),
+          });
+        },
+      };
+      const methods: string[] = [];
+      const host = makeChatHost({
+        client: clientWithRequest((method, params, options) => {
+          methods.push(method);
+          return method === "chat.send"
+            ? pending.request(wire, method, params, options)
+            : Promise.resolve(idleChatHistory());
+        }),
+        chatMessage: "Keep the original submission",
+        currentSessionId: "original-physical-session",
+      });
+      const sending = handleSendChat(host);
+      await issued.promise;
+      const original = requireRecord(frames[0]!.params, "written frame");
+      host.connected = false;
+      markQueuedChatSendsWaitingForReconnect(host);
+      pending.flush(new Error("gateway closed (1006): network lost"));
+      await sending;
+      expect(host.chatQueue[0]).toMatchObject({
+        sendState: "waiting-reconnect",
+        sendAttempts: 1,
+        sendRunId: original.idempotencyKey,
+      });
+      expect(listStoredChatOutboxes(host)[0]?.queue[0]?.sendState).toBe("waiting-reconnect");
+      host.chatMessage = "Newer draft";
+      host.currentSessionId = "replacement-physical-session";
+      host.connected = true;
+      host.connectionEpoch += 1;
+      await resumeStoredChatOutboxes(host);
+      expect(frames[1]?.params).toEqual(frames[0]?.params);
+      expect(frames[1]?.params).toMatchObject({ sessionId: "original-physical-session" });
+      expect(host.chatMessage).toBe("Newer draft");
+      if (outcome === "rejected") {
+        expect(host.chatQueue[0]).toMatchObject({
+          sendState: "failed",
+          sendError: "Synthetic rejection",
+        });
+      } else {
+        expect(host.chatQueue).toEqual([]);
+        expect(listStoredChatOutboxes(host)).toEqual([]);
+      }
+    },
+  );
+
+  it.each([
+    ["backoff", false],
+    ["backoff", true],
+    ["reconnect", false],
+    ["reconnect", true],
+    ["suspension", false],
+    ["suspension", true],
+  ] as const)(
+    "retries a retryable send rejection after %s (volatile=%s)",
+    async (trigger, volatile) => {
+      if (volatile) {
+        vi.spyOn(sessionStorage, "setItem").mockImplementation(() => {
+          throw new Error("quota");
+        });
+      }
+      const sendRunIds: string[] = [];
+      let sendAttempts = 0;
+
+      const host = makeChatHost({
+        requestHandlers: {
+          "chat.history": idleChatHistory(),
+          "chat.send": (params: unknown) => {
+            const payload = requireRecord(params, "retryable send payload");
+            sendRunIds.push(String(payload.idempotencyKey));
+            sendAttempts += 1;
+            if (sendAttempts === 1) {
+              throw trigger === "suspension"
+                ? new GatewayRequestError({
+                    code: "UNAVAILABLE",
+                    message: "chat.send unavailable during gateway suspension",
+                    retryable: true,
+                    retryAfterMs: 100,
+                    details: { reason: "gateway-suspending" },
+                  })
+                : unavailable("Gateway is temporarily busy");
+            }
+            return { runId: payload.idempotencyKey, status: "started", messageSeq: 1 };
+          },
+        },
+        chatMessage: "retry without disconnecting",
+      });
+
+      useFakeClock();
       await handleSendChat(host);
 
       expect(host.connected).toBe(true);
+      expect(host.chatMessage).toBe("");
       expect(host.chatQueue[0]).toMatchObject({
         sendAttempts: 0,
         sendState: "waiting-reconnect",
       });
       expect(sendAttempts).toBe(1);
-      await vi.advanceTimersByTimeAsync(100);
-      // The retry timer only kicks off a fire-and-forget drain, so the resend
-      // lands after the tick returns. Wait for the outcome, not the tick.
-      await waitForFast(() => {
-        expect(sendAttempts).toBe(2);
-        expect(listStoredChatOutboxes(host)).toStrictEqual([]);
-      });
-      expect(sendRunIds[1]).toBe(sendRunIds[0]);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it.each([false, true])(
-    "reconciles a timed-out send without resending (receipt=%s)",
-    async (received) => {
-      let runId = "";
-      const host = makeChatHost({
-        chatMessage: "Keep this exact submission",
-        currentSessionId: "timeout-session",
-        requestHandlers: {
-          "chat.send": (params: unknown) => {
-            runId = String(requireRecord(params, "timeout send").idempotencyKey);
-            throw new GatewayProtocolRequestTimeoutError({
-              method: "chat.send",
-              timeoutMs: 30_000,
-              requestSent: true,
-            });
-          },
-          "chat.history": () => ({
-            ...idleChatHistory(),
-            sessionId: "timeout-session",
-            sessionInfo: row("agent:main", {
-              sessionId: "timeout-session",
-              hasActiveRun: false,
-              status: "done",
-            }),
-            messages: received
-              ? [
-                  {
-                    role: "user",
-                    content: "Keep this exact submission",
-                    __openclaw: { id: "timeout-receipt", idempotencyKey: runId + ":user" },
-                  },
-                ]
-              : [],
-          }),
-        },
-      });
-      vi.useFakeTimers();
-      try {
-        await handleSendChat(host);
-        expect(host.chatQueue[0]).toMatchObject({
-          sendRunId: runId,
-          sendAttempts: 1,
-          sendState: "unconfirmed",
-        });
+      if (trigger === "suspension") {
+        expect(host.chatQueue[0]?.sendError).toBeUndefined();
         expect(host.chatError).toBeNull();
-        host.chatMessage = "A newer offline draft";
-        await vi.advanceTimersByTimeAsync(500);
+        host.gatewayWorkPaused = true;
+        await vi.advanceTimersByTimeAsync(100);
+        expect(sendAttempts).toBe(1);
+        host.gatewayWorkPaused = false;
         await resumeStoredChatOutboxes(host);
-        expect(requestCalls(host.request, "chat.history").length).toBeGreaterThan(0);
-        expect(requestCalls(host.request, "chat.send")).toHaveLength(1);
-        expect(host.chatMessage).toBe("A newer offline draft");
-        if (received) {
-          expect(listStoredChatOutboxes(host)).toEqual([]);
-        } else {
-          expect(host.chatQueue[0]).toMatchObject({
-            sendRunId: runId,
-            sendAttempts: 1,
-            sendState: "unconfirmed",
-          });
-        }
-      } finally {
-        vi.useRealTimers();
+      } else if (trigger === "reconnect") {
+        host.connectionEpoch += 1;
+        await resumeStoredChatOutboxes(host);
+      } else {
+        await vi.advanceTimersByTimeAsync(100);
+        // The timer starts a fire-and-forget drain; join its observable outcome.
+        await waitForFast(() => {
+          expect(sendAttempts).toBe(2);
+          expect(listStoredChatOutboxes(host)).toStrictEqual([]);
+        });
       }
+      expect(sendAttempts).toBe(2);
+      expect(host.chatQueue).toEqual([]);
+      expect(listStoredChatOutboxes(host)).toStrictEqual([]);
+      expect(sendRunIds[1]).toBe(sendRunIds[0]);
     },
   );
 
@@ -148,18 +342,9 @@ describe("transient outbox delivery recovery", () => {
           historyAttempts += 1;
           if (historyAttempts === 1) {
             if (failure === "timeout") {
-              throw new GatewayProtocolRequestTimeoutError({
-                method: "chat.history",
-                timeoutMs: 30_000,
-                requestSent: true,
-              });
+              throw requestTimeout("chat.history");
             }
-            throw new GatewayRequestError({
-              code: "UNAVAILABLE",
-              message: "History is temporarily unavailable",
-              retryable: true,
-              retryAfterMs: 100,
-            });
+            throw unavailable();
           }
           return idleChatHistory();
         },
@@ -172,61 +357,85 @@ describe("transient outbox delivery recovery", () => {
       host.client = clientWithRequest(request);
       host.connected = true;
 
-      vi.useFakeTimers();
-      try {
-        await resumeStoredChatOutboxes(host);
+      useFakeClock();
+      await resumeStoredChatOutboxes(host);
 
-        expect(historyAttempts).toBe(1);
-        expect(sendAttempts).toBe(0);
-        await Promise.all(Array.from({ length: 20 }, () => resumeStoredChatOutboxes(host)));
-        expect(historyAttempts).toBe(1);
-        await vi.advanceTimersByTimeAsync(failure === "timeout" ? 500 : 100);
-        // Same fire-and-forget retry hand-off as the send-rejection case above.
-        await waitForFast(() => {
-          expect(sendAttempts).toBe(1);
-          expect(historyAttempts).toBeGreaterThanOrEqual(2);
-          expect(listStoredChatOutboxes(host)).toStrictEqual([]);
-        });
-      } finally {
-        vi.useRealTimers();
-      }
+      expect(historyAttempts).toBe(1);
+      expect(sendAttempts).toBe(0);
+      await Promise.all(Array.from({ length: 20 }, () => resumeStoredChatOutboxes(host)));
+      expect(historyAttempts).toBe(1);
+      await vi.advanceTimersByTimeAsync(failure === "timeout" ? 500 : 100);
+      await waitForFast(() => {
+        expect(sendAttempts).toBe(1);
+        expect(historyAttempts).toBeGreaterThanOrEqual(2);
+        expect(listStoredChatOutboxes(host)).toStrictEqual([]);
+      });
     },
   );
 
-  it("retries after reconnecting with the same Gateway client", async () => {
-    let sendAttempts = 0;
+  it("does not apply a stale readiness rejection to an edited queued input", async () => {
+    const historyStarted = Promise.withResolvers<void>();
+    const firstHistory = Promise.withResolvers<ReturnType<typeof idleChatHistory>>();
+    const sends: unknown[] = [];
+    let historyReads = 0;
     const host = makeChatHost({
+      chatQueue: [
+        {
+          id: "edited-during-readiness",
+          text: "Original draft",
+          createdAt: 1,
+          sendRunId: "original-submission",
+          sendState: "waiting-reconnect",
+          sessionKey: "agent:main",
+        },
+      ],
       requestHandlers: {
-        "chat.history": idleChatHistory(),
-        "chat.send": (params: unknown) => {
-          sendAttempts += 1;
-          if (sendAttempts === 1) {
-            throw new GatewayRequestError({
-              code: "UNAVAILABLE",
-              message: "Gateway is temporarily busy",
-              retryable: true,
-              retryAfterMs: 100,
-            });
+        "chat.history": () => {
+          if (++historyReads === 1) {
+            historyStarted.resolve();
+            return firstHistory.promise;
           }
-          const payload = requireRecord(params, "reconnected send payload");
-          return { runId: payload.idempotencyKey, status: "started", messageSeq: 1 };
+          return idleChatHistory();
+        },
+        "chat.send": (params: unknown) => {
+          sends.push(params);
+          return {
+            runId: requireRecord(params, "edited input").idempotencyKey,
+            status: "started",
+            messageSeq: 1,
+          };
         },
       },
-      chatMessage: "retry after reconnecting",
     });
-
-    vi.useFakeTimers();
+    admitHostQueueItems(host);
+    const draining = resumeStoredChatOutboxes(host);
     try {
-      await handleSendChat(host);
-      expect(sendAttempts).toBe(1);
-
-      host.connectionEpoch += 1;
-      await resumeStoredChatOutboxes(host);
-
-      expect(sendAttempts).toBe(2);
-      expect(listStoredChatOutboxes(host)).toStrictEqual([]);
+      await historyStarted.promise;
+      expect(
+        updateQueuedMessage(host, "edited-during-readiness", (item) => ({
+          ...item,
+          text: "Revised draft",
+          sendRunId: "revised-submission",
+        })),
+      ).not.toBeNull();
+      firstHistory.reject(
+        new GatewayRequestError({
+          code: "INVALID_REQUEST",
+          message: "Rejection for the original draft",
+        }),
+      );
+      await draining;
+      expect(sends).toEqual([
+        expect.objectContaining({
+          message: "Revised draft",
+          idempotencyKey: "revised-submission",
+        }),
+      ]);
+      expect(host.lastError).toBeNull();
+      expect(listStoredChatOutboxes(host)).toEqual([]);
     } finally {
-      vi.useRealTimers();
+      firstHistory.resolve(idleChatHistory());
+      await draining;
     }
   });
 
@@ -237,12 +446,7 @@ describe("transient outbox delivery recovery", () => {
       requestHandlers: {
         "chat.history": () => {
           historyAttempts += 1;
-          throw new GatewayRequestError({
-            code: "UNAVAILABLE",
-            message: "History is temporarily unavailable",
-            retryable: true,
-            retryAfterMs: 100,
-          });
+          throw unavailable();
         },
       },
       chatQueue: [
@@ -263,16 +467,12 @@ describe("transient outbox delivery recovery", () => {
       chatQueue: owner.chatQueue,
     });
 
-    vi.useFakeTimers();
-    try {
-      await resumeStoredChatOutboxes(owner);
-      owner.sessionKey = "agent:main:other";
-      await resumeStoredChatOutboxes(sibling);
-      expect(historyAttempts).toBe(1);
-      await vi.advanceTimersByTimeAsync(100);
-      await waitForFast(() => expect(historyAttempts).toBe(2));
-    } finally {
-      vi.useRealTimers();
-    }
+    useFakeClock();
+    await resumeStoredChatOutboxes(owner);
+    owner.sessionKey = "agent:main:other";
+    await resumeStoredChatOutboxes(sibling);
+    expect(historyAttempts).toBe(1);
+    await vi.advanceTimersByTimeAsync(100);
+    await waitForFast(() => expect(historyAttempts).toBe(2));
   });
 });

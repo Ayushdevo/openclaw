@@ -7,9 +7,13 @@ import {
   withDelegatedUpdateCommandExecutor,
   withUpdateCommandExecutor,
 } from "../cli/update-cli/update-command-executor.js";
+import {
+  readUpdateDoctorInput,
+  readUpdatePostCoreInput,
+  type DecodedUpdateDoctorInput,
+  type DecodedUpdatePostCoreInput,
+} from "../cli/update-cli/update-command-migrated-input.js";
 import type {
-  UpdateDoctorInput,
-  UpdatePostCoreInput,
   MigratedUpdateFinalizationInput,
   MigratedUpdateFinalizationResult,
 } from "../cli/update-cli/update-command-migrated-types.js";
@@ -52,15 +56,17 @@ import {
   POST_CORE_UPDATE_RESULT_PATH_ENV,
 } from "./update-post-core-context.js";
 import {
-  createManagedUpdateRequesterAuthority,
-  createManagedUpdateRequesterContinuationAuthority,
+  createDelegatedUpdateRequesterAuthority,
   UpdateRequesterRevokedError,
 } from "./update-requester-authority.js";
-import { adoptUpdateRun, getUpdateRun } from "./update-run-ledger.js";
-import type { UpdateRunRecord } from "./update-run-record.js";
+import { adoptUpdateRun, getUpdateRun, recordUpdateRunStep } from "./update-run-ledger.js";
+import type { UpdateRunRecord, UpdateRunStep } from "./update-run-record.js";
 import type { UpdateRecoveryFence } from "./update-run-recovery.js";
+import { updateRunStepsFromResultStep } from "./update-run-step.js";
 import { recordUpdateRunStepAsync } from "./update-run-write.async.js";
+import type { UpdateRunResult } from "./update-runner-types.js";
 import { isOmittedUpdateTimeout } from "./update-timeout-provenance.js";
+import { closeDefaultRetainedNativeWorkerSource } from "./worker-native-lifecycle.js";
 
 async function finalizeMigratedUpdate(): Promise<void> {
   // Validation imports this whole candidate graph before activation. The helper
@@ -95,12 +101,10 @@ async function finalizeMigratedUpdate(): Promise<void> {
   }
   const text = Buffer.concat(chunks).toString("utf8");
   if (process.argv[2] === "--post-core") {
-    // SAFETY: The parent binds this receiver before releasing its private input.
-    return await runDelegatedPostCore(JSON.parse(text) as UpdatePostCoreInput);
+    return await runDelegatedPostCore(readUpdatePostCoreInput(JSON.parse(text)));
   }
   if (process.argv[2] === "--doctor") {
-    // SAFETY: The typed parent sends this private input only after binding this child.
-    return await runDelegatedDoctor(JSON.parse(text) as UpdateDoctorInput);
+    return await runDelegatedDoctor(readUpdateDoctorInput(JSON.parse(text)));
   }
   // SAFETY: Only the typed parent continuation serializes this private input.
   const input = JSON.parse(text) as MigratedUpdateFinalizationInput;
@@ -216,13 +220,12 @@ async function finalizeMigratedUpdate(): Promise<void> {
       ? { restartRunId: terminal.runId }
       : { terminalRunId: terminal.runId }),
     executorDelegation: "pid-start-v1",
-    automaticTriage: finalized.automaticTriage,
   };
   // Private response publication follows executor settlement and terminal history.
   await fs.writeFile(input.resultPath, JSON.stringify(response), { mode: 0o600 });
 }
 
-async function runDelegatedPostCore(input: UpdatePostCoreInput): Promise<void> {
+async function runDelegatedPostCore(input: DecodedUpdatePostCoreInput): Promise<void> {
   const resultPath = process.env[POST_CORE_UPDATE_RESULT_PATH_ENV]?.trim();
   const executingRoot = resolveOpenClawPackageRootSync({ moduleUrl: import.meta.url });
   if (
@@ -247,14 +250,9 @@ async function runDelegatedPostCore(input: UpdatePostCoreInput): Promise<void> {
       input.runId,
       input.root,
       async (fence) => {
-        const requesterAuthority = input.requester?.authorizationSource?.startsWith("profile:")
-          ? await createManagedUpdateRequesterContinuationAuthority(input.requester, {
-              runId: input.runId,
-              executor: fence,
-            })
-          : input.requester
-            ? await createManagedUpdateRequesterAuthority(input.requester)
-            : undefined;
+        const requesterAuthority = input.requester
+          ? await createDelegatedUpdateRequesterAuthority(input.requester, input.runId, fence)
+          : undefined;
         const { updateCommand } = await import("../cli/update-cli/update-command.js");
         fence.assertCurrent();
         if (requesterAuthority?.isCurrent() === false) {
@@ -265,6 +263,7 @@ async function runDelegatedPostCore(input: UpdatePostCoreInput): Promise<void> {
           run: {
             runId: input.runId,
             originalRecoveryCapture: input.originalRecoveryCapture,
+            busyTimeoutMs: input.busyTimeoutMs,
             env: { ...process.env },
             executorFence: fence,
             ...(requesterAuthority ? { requesterAuthority } : {}),
@@ -281,7 +280,7 @@ async function runDelegatedPostCore(input: UpdatePostCoreInput): Promise<void> {
   }
 }
 
-async function runDelegatedDoctor(input: UpdateDoctorInput): Promise<void> {
+async function runDelegatedDoctor(input: DecodedUpdateDoctorInput): Promise<void> {
   const resultPath = process.env[UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH_ENV]?.trim();
   if (!resultPath || !input.executor) {
     throw new Error("Update Doctor requires its delegated executor and result path.");
@@ -291,14 +290,9 @@ async function runDelegatedDoctor(input: UpdateDoctorInput): Promise<void> {
     input.runId,
     input.root,
     async (fence, commandAuthority) => {
-      const requester = input.requester?.authorizationSource?.startsWith("profile:")
-        ? await createManagedUpdateRequesterContinuationAuthority(input.requester, {
-            runId: input.runId,
-            executor: fence,
-          })
-        : input.requester
-          ? await createManagedUpdateRequesterAuthority(input.requester)
-          : undefined;
+      const requester = input.requester
+        ? await createDelegatedUpdateRequesterAuthority(input.requester, input.runId, fence)
+        : undefined;
       const assertCurrent = () => {
         try {
           fence.assertCurrent();
@@ -349,6 +343,7 @@ async function runDelegatedDoctor(input: UpdateDoctorInput): Promise<void> {
         },
         {
           repair: input.repair,
+          fullIntegrityCheck: input.fullIntegrityCheck,
           nonInteractive: true,
           ...(input.yes !== undefined ? { yes: input.yes } : {}),
           ...(input.workspaceSuggestions !== undefined
@@ -365,6 +360,9 @@ async function runDelegatedDoctor(input: UpdateDoctorInput): Promise<void> {
             ref: input.originalRecoveryCapture,
           },
           ...(input.databaseGenerations ? { databaseGenerations: input.databaseGenerations } : {}),
+          ...(input.databasePluginOwners
+            ? { databasePluginOwners: input.databasePluginOwners }
+            : {}),
           ...(input.postCoreSchemaRepair === true
             ? { postCoreSchemaRepair: { runId: input.runId, assertCurrent } }
             : {}),
@@ -372,6 +370,58 @@ async function runDelegatedDoctor(input: UpdateDoctorInput): Promise<void> {
       );
     },
   );
+}
+
+/**
+ * Time the handoff from receipts the previous driver already wrote, so an
+ * installed driver that predates this step still yields its start: its last
+ * completed row starts the handoff, and this fresh driver ends it before
+ * resuming verification. Timing never changes the update outcome.
+ */
+function recordDriverHandoff(
+  run: NonNullable<UpdateCommandOptions["run"]>,
+  result: UpdateRunResult,
+  adopted: UpdateRunRecord,
+  bufferedSteps: readonly UpdateRunStep[],
+): void {
+  try {
+    const steps = [...adopted.steps, ...bufferedSteps];
+    let previous: UpdateRunStep | undefined;
+    for (const step of steps) {
+      if (
+        step.endedAtMs !== undefined &&
+        !step.step.startsWith("driver:") &&
+        step.endedAtMs > (previous?.endedAtMs ?? 0)
+      ) {
+        previous = step;
+      }
+    }
+    if (previous?.endedAtMs === undefined) {
+      return;
+    }
+    const endedAtMs = Date.now();
+    const startedAtMs = Math.min(previous.endedAtMs, endedAtMs);
+    const adoptedAtMs = steps.find((step) => step.step === "driver:adopted")?.endedAtMs;
+    const step = {
+      name: "update-driver-handoff",
+      command: "openclaw update",
+      cwd: result.root ?? "",
+      durationMs: endedAtMs - startedAtMs,
+      exitCode: 0,
+      diagnostics: [
+        `Handoff began after "${previous.step}"` +
+          (adoptedAtMs === undefined
+            ? "."
+            : `; the fresh driver adopted the run after ${Math.max(0, adoptedAtMs - startedAtMs)}ms.`),
+      ],
+    };
+    result.steps.push(step);
+    for (const row of updateRunStepsFromResultStep(step)) {
+      recordUpdateRunStep(run.runId, { ...row, startedAtMs, endedAtMs }, run);
+    }
+  } catch {
+    // Handoff timing is diagnostic; finalization proceeds without it.
+  }
 }
 
 async function finalizeInput(
@@ -383,15 +433,16 @@ async function finalizeInput(
   if (
     !transferredRun ||
     "executorFence" in transferredRun ||
-    (!input.recoveryHandoff &&
-      input.params.rollbackBlockedReason !== "state-migrated-no-rollback" &&
+    (input.params.rollbackBlockedReason !== "state-migrated-no-rollback" &&
       input.params.rollbackBlockedReason !== "rollback-state-unverified")
   ) {
     throw new Error("Update finalization requires its migrated update run.");
   }
   const { requesterAuthority: descriptor, ...runIdentity } = transferredRun;
+  // Shipped parents carry the admitted allowance in the existing step timeout.
+  runIdentity.busyTimeoutMs ??= input.params.updateStepTimeoutMs;
   executorFence.assertCurrent();
-  adoptUpdateRun(runIdentity.runId, { env: runIdentity.env });
+  const adopted = adoptUpdateRun(runIdentity.runId, runIdentity);
   // Parent closures cannot cross JSON. The fresh runtime retains identity checks
   // under its validated original native update lineage.
   const run: NonNullable<UpdateCommandOptions["run"]> = {
@@ -399,13 +450,12 @@ async function finalizeInput(
     executorFence,
     ...(descriptor
       ? {
-          requesterAuthority: descriptor.requester.authorizationSource?.startsWith("profile:")
-            ? await createManagedUpdateRequesterContinuationAuthority(
-                descriptor.requester,
-                { runId: runIdentity.runId, executor: executorFence },
-                runIdentity.env,
-              )
-            : await createManagedUpdateRequesterAuthority(descriptor.requester, runIdentity.env),
+          requesterAuthority: await createDelegatedUpdateRequesterAuthority(
+            descriptor.requester,
+            runIdentity.runId,
+            executorFence,
+            runIdentity.env,
+          ),
         }
       : {}),
   };
@@ -422,9 +472,10 @@ async function finalizeInput(
       }
     };
     for (const step of input.bufferedSteps) {
-      await recordUpdateRunStepAsync(run.runId, step, { env, context, assertCurrent });
+      await recordUpdateRunStepAsync(run.runId, step, { ...run, env, context, assertCurrent });
     }
   }
+  recordDriverHandoff(run, input.params.result, adopted, input.bufferedSteps);
   const stopped = input.params.preManagedServiceStop;
   if (input.windowsTaskAutoStartSuspended && !stopped?.serviceEnv) {
     throw new Error("Transferred Windows task suspension is missing its stopped service owner.");
@@ -451,7 +502,6 @@ async function finalizeInput(
   let result;
   let exitCode = 0;
   let candidateStartAttempted = false;
-  let automaticTriage: MigratedUpdateFinalizationResult["automaticTriage"];
   try {
     // This worker already loaded the candidate; the local flag conveys no authority.
     result = await finishUpdate(
@@ -465,6 +515,7 @@ async function finalizeInput(
       },
       {
         candidateRuntime: true,
+        adoptedFinalization: true,
         onGatewayStartAttempted: () => {
           candidateStartAttempted = true;
         },
@@ -476,7 +527,6 @@ async function finalizeInput(
     }
     result = error.result;
     exitCode = error.exitCode;
-    automaticTriage = error.automaticTriage;
   } finally {
     await windowsRecovery?.complete(
       result?.status === "ok" ||
@@ -484,7 +534,7 @@ async function finalizeInput(
     );
   }
   executorFence.assertCurrent();
-  return { run, result, exitCode, automaticTriage, candidateStartAttempted };
+  return { run, result, exitCode, candidateStartAttempted };
 }
 
 void (async () => {
@@ -493,6 +543,7 @@ void (async () => {
     finalizeMigratedUpdate,
     finalizeActiveDebugProxyCaptures,
     closeOpenClawStateDatabaseAsync,
+    closeDefaultRetainedNativeWorkerSource,
   ]) {
     try {
       await finalize();

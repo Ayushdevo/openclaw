@@ -13,19 +13,12 @@ import {
 } from "./service-constants.js";
 import type { ModelCallLifecycleDiagnosticEvent } from "./service-types.js";
 
-function hasOtelSemconvOptIn(value: string | undefined, optIn: string): boolean {
+function emitLatestGenAiSemconv(): boolean {
   return (
-    value
+    process.env[OTEL_SEMCONV_STABILITY_OPT_IN_ENV]
       ?.split(",")
       .map((part) => part.trim())
-      .includes(optIn) ?? false
-  );
-}
-
-function emitLatestGenAiSemconv(): boolean {
-  return hasOtelSemconvOptIn(
-    process.env[OTEL_SEMCONV_STABILITY_OPT_IN_ENV],
-    GEN_AI_LATEST_EXPERIMENTAL_OPT_IN,
+      .includes(GEN_AI_LATEST_EXPERIMENTAL_OPT_IN) ?? false
   );
 }
 
@@ -62,53 +55,6 @@ export function assignPositiveNumberAttr(
   }
 }
 
-export function assignModelCallSizeTimingAttrs(
-  attrs: Record<string, string | number | boolean>,
-  evt: {
-    requestPayloadBytes?: number;
-    responseStreamBytes?: number;
-    timeToFirstByteMs?: number;
-  },
-): void {
-  assignPositiveNumberAttr(attrs, "openclaw.model_call.request_bytes", evt.requestPayloadBytes);
-  assignPositiveNumberAttr(attrs, "openclaw.model_call.response_bytes", evt.responseStreamBytes);
-  assignPositiveNumberAttr(
-    attrs,
-    "openclaw.model_call.time_to_first_byte_ms",
-    evt.timeToFirstByteMs,
-  );
-}
-
-function assignNumberAttr(
-  attrs: Record<string, string | number | boolean>,
-  key: string,
-  value: number | undefined,
-): void {
-  const normalized = asFiniteNumber(value);
-  if (normalized !== undefined) {
-    attrs[key] = normalized;
-  }
-}
-
-function modelCallPromptTokens(usage: {
-  promptTokens?: number;
-  input?: number;
-  cacheRead?: number;
-  cacheWrite?: number;
-}): number | undefined {
-  const promptTokens = asNonNegativeFiniteNumber(usage.promptTokens);
-  if (promptTokens !== undefined) {
-    return promptTokens;
-  }
-  const input = asNonNegativeFiniteNumber(usage.input);
-  const cacheRead = asNonNegativeFiniteNumber(usage.cacheRead);
-  const cacheWrite = asNonNegativeFiniteNumber(usage.cacheWrite);
-  if (input === undefined && cacheRead === undefined && cacheWrite === undefined) {
-    return undefined;
-  }
-  return (input ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0);
-}
-
 export function assignModelCallPromptStatsAttrs(
   attrs: Record<string, string | number | boolean>,
   evt: Pick<Extract<DiagnosticEventPayload, { type: "model.call.started" }>, "promptStats">,
@@ -125,7 +71,10 @@ export function assignModelCallPromptStatsAttrs(
     ["openclaw.model_call.prompt.tool_definitions_chars", stats.toolDefinitionsChars],
     ["openclaw.model_call.prompt.total_chars", stats.totalChars],
   ] as const) {
-    assignNumberAttr(attrs, key, value);
+    const normalized = asFiniteNumber(value);
+    if (normalized !== undefined) {
+      attrs[key] = normalized;
+    }
   }
 }
 
@@ -137,7 +86,33 @@ export function assignModelCallUsageAttrs(
   if (!usage) {
     return;
   }
-  const promptTokens = modelCallPromptTokens(usage);
+  let promptTokens = asNonNegativeFiniteNumber(usage.promptTokens);
+  if (promptTokens === undefined) {
+    const input = asNonNegativeFiniteNumber(usage.input);
+    const cacheRead = asNonNegativeFiniteNumber(usage.cacheRead);
+    const cacheWrite = asNonNegativeFiniteNumber(usage.cacheWrite);
+    if (input !== undefined || cacheRead !== undefined || cacheWrite !== undefined) {
+      promptTokens = (input ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0);
+    }
+  }
+  assignModelUsageAttrs(attrs, usage, promptTokens);
+}
+
+export function assignModelResponseUsageAttrs(
+  attrs: Record<string, string | number | boolean>,
+  evt: Pick<Extract<DiagnosticEventPayload, { type: "model.response.observed" }>, "usage">,
+): void {
+  assignModelUsageAttrs(attrs, evt.usage, evt.usage?.promptTokens);
+}
+
+function assignModelUsageAttrs(
+  attrs: Record<string, string | number | boolean>,
+  usage: ModelCallLifecycleDiagnosticEvent["usage"],
+  promptTokens: number | undefined,
+): void {
+  if (!usage) {
+    return;
+  }
   for (const [key, value] of [
     ["openclaw.model_call.usage.input_tokens", usage.input],
     ["openclaw.model_call.usage.output_tokens", usage.output],
@@ -193,13 +168,7 @@ export function assignGenAiModelCallAttrs(
   },
 ): void {
   assignGenAiSpanIdentityAttrs(attrs, evt);
-  attrs["openclaw.model_call.observation_unit"] = modelCallObservationUnit(evt);
-}
-
-export function modelCallObservationUnit(evt: {
-  observationUnit?: "request" | "turn";
-}): "request" | "turn" {
-  return evt.observationUnit ?? "request";
+  attrs["openclaw.model_call.observation_unit"] = evt.observationUnit ?? "request";
 }
 
 export function modelCallSpanName(evt: {

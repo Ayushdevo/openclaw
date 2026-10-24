@@ -32,10 +32,6 @@ function hasReasoningItalics(text: string): boolean {
   return /^(?:Reasoning:|Thinking\.{0,3})\n+_/u.test(text) && text.trimEnd().endsWith("_");
 }
 
-function resolveDiscordChunkLimit(value: unknown, fallback: number) {
-  return resolveIntegerOption(value, fallback, { min: 1 });
-}
-
 function countLines(text: string) {
   if (!text) {
     return 0;
@@ -67,8 +63,8 @@ function closesFence(open: OpenFence, close: OpenFence): boolean {
 
 type DiscordFrame = { start: number; end: number };
 function chunkDiscordText(text: string, opts: ChunkDiscordTextOpts = {}): string[] {
-  const hardMaxChars = resolveDiscordChunkLimit(opts.maxChars, DEFAULT_MAX_CHARS);
-  const maxLines = resolveDiscordChunkLimit(opts.maxLines, DEFAULT_MAX_LINES);
+  const hardMaxChars = resolveIntegerOption(opts.maxChars, DEFAULT_MAX_CHARS, { min: 1 });
+  const maxLines = resolveIntegerOption(opts.maxLines, DEFAULT_MAX_LINES, { min: 1 });
   if (!text) {
     return [];
   }
@@ -85,9 +81,8 @@ function chunkDiscordText(text: string, opts: ChunkDiscordTextOpts = {}): string
   let consumed = 0;
   let lineStart = 0;
   // Keep existing soft breaks based on source bytes; render measures the full payload.
-  const raw = (frame: DiscordFrame) => {
+  const raw = (frame: DiscordFrame, body = text.slice(frame.start, frame.end)) => {
     const prefix = ranges.fenceAt(frame.start)?.reopenLine ?? "";
-    const body = text.slice(frame.start, frame.end);
     return prefix + (prefix ? "\n" : "") + body;
   };
   const render = (frame: DiscordFrame) => {
@@ -95,8 +90,7 @@ function chunkDiscordText(text: string, opts: ChunkDiscordTextOpts = {}): string
     if (body === undefined) {
       return undefined;
     }
-    const prefix = ranges.fenceAt(frame.start)?.reopenLine ?? "";
-    const result = prefix + (prefix ? "\n" : "") + body;
+    const result = raw(frame, body);
     const close = ranges.fenceAt(frame.end);
     return close?.reopenLine
       ? result + (result.endsWith("\n") ? "" : "\n") + close.closeLine
@@ -201,7 +195,7 @@ export function chunkDiscordTextWithMode(
   }
   const lineChunks = chunkByParagraph(
     text,
-    resolveDiscordChunkLimit(opts.maxChars, DEFAULT_MAX_CHARS),
+    resolveIntegerOption(opts.maxChars, DEFAULT_MAX_CHARS, { min: 1 }),
     { splitLongParagraphs: false },
   );
   return lineChunks.flatMap((line) => {
@@ -308,12 +302,6 @@ function renderInlineCode(body: string, delimiter: string): string | undefined {
   return marker + padding + body + padding + marker;
 }
 
-type InlineSpan = DiscordFrame & {
-  code: NonNullable<ReturnType<typeof findCodeRegions>[number]["source"]>;
-  base: number;
-  marker: string;
-  atomicTicks: boolean;
-};
 type FenceRange = DiscordFrame &
   OpenFence & {
     bodyStart: number;
@@ -321,7 +309,12 @@ type FenceRange = DiscordFrame &
   };
 // Inline spans are collected only between Discord fences, using the existing close grammar.
 function createDiscordRanges(source: string, maxChars: number, maxLines: number) {
-  const spans: InlineSpan[] = [];
+  const spans: (DiscordFrame & {
+    code: NonNullable<ReturnType<typeof findCodeRegions>[number]["source"]>;
+    base: number;
+    marker: string;
+    atomicTicks: boolean;
+  })[] = [];
   const fences: FenceRange[] = [];
   let offset = 0;
   let plainStart = 0;

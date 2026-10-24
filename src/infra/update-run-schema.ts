@@ -188,6 +188,9 @@ const UpdateRunStepSchema = z.object({
   startedAtMs: timestamp.optional(),
   endedAtMs: timestamp.optional(),
   exitCode: z.number().int().nullable().optional(),
+  termination: z.enum(["exit", "timeout", "no-output-timeout", "signal"]).optional(),
+  signal: z.string().max(32).nullable().optional(),
+  stderrTail: z.string().max(8192).optional(),
   detail: text.optional(),
   failureFacts: z.array(UpdateFailureFactSchema).max(5).optional(),
   configChange: z
@@ -227,6 +230,11 @@ export const UpdateRunRecordSchema = z.object({
   reason: text.nullable(),
   admission: admission.optional(),
   origin: z.object({
+    windowsUserSid: z
+      .string()
+      .max(184)
+      .regex(/^S-1-\d+(?:-\d+)+$/)
+      .optional(),
     admission: admission.optional(),
     candidateAdmission: candidateAdmission.optional(),
     updateRecoveryCapture: updateRecoveryCaptureStateSchema.optional(),
@@ -283,6 +291,7 @@ export const UpdateRunRecordSchema = z.object({
     pluginErrors: z.array(text).max(32).optional(),
     channelsReady: z.boolean().optional(),
     readyz: z.boolean().optional(),
+    coreReady: z.boolean().optional(),
     settled: z.boolean().optional(),
     noticeDelivered: z.boolean().optional(),
     doctorHint: text.optional(),

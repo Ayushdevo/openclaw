@@ -22,13 +22,11 @@ export type RunMediaUnderstandingFileParams = {
   activeModel?: ActiveMediaModel;
   prompt?: string;
   timeoutMs?: number;
-  scopeContext?: MediaUnderstandingScopeContext;
-};
-
-type MediaUnderstandingScopeContext = {
-  sessionKey?: string;
-  channel?: string;
-  chatType?: string;
+  scopeContext?: {
+    sessionKey?: string;
+    channel?: string;
+    chatType?: string;
+  };
 };
 
 export type RunMediaUnderstandingFileResult = {
@@ -41,19 +39,14 @@ export type RunMediaUnderstandingFileResult = {
 
 export type DescribeImageFileParams = Omit<RunMediaUnderstandingFileParams, "capability">;
 
-export type DescribeImageFileWithModelParams = {
-  filePath: string;
-  mediaUrl?: string;
-  cfg: OpenClawConfig;
-  agentId?: string;
-  agentDir?: string;
-  workspaceDir?: string;
-  mime?: string;
+export type DescribeImageFileWithModelParams = Omit<
+  RunMediaUnderstandingFileParams,
+  "capability" | "activeModel" | "scopeContext" | "prompt"
+> & {
   provider: string;
   model: string;
   prompt: string;
   maxTokens?: number;
-  timeoutMs?: number;
 };
 
 export type PreparedImageDescriptionInput = ImagesDescriptionInput;
@@ -84,10 +77,6 @@ export type ExtractStructuredWithModelParams = Omit<
   timeoutMs?: number;
 };
 
-type ExtractStructuredWithModelResult = Awaited<
-  ReturnType<NonNullable<MediaUnderstandingProvider["extractStructured"]>>
->;
-
 export type DescribeVideoFileParams = Omit<
   DescribeImageFileParams,
   "mediaUrl" | "prompt" | "timeoutMs" | "scopeContext"
@@ -117,7 +106,7 @@ export type MediaUnderstandingRuntime = {
   ) => Promise<DescribeImageFileWithModelResult>;
   extractStructuredWithModel: (
     params: ExtractStructuredWithModelParams,
-  ) => Promise<ExtractStructuredWithModelResult>;
+  ) => Promise<Awaited<ReturnType<NonNullable<MediaUnderstandingProvider["extractStructured"]>>>>;
   describeVideoFile: (params: DescribeVideoFileParams) => Promise<RunMediaUnderstandingFileResult>;
   transcribeAudioFile: (
     params: TranscribeAudioFileParams,

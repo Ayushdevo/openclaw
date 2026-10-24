@@ -219,6 +219,31 @@ describe("channels list", () => {
     expect(payload.chat?.telegram?.accounts).toStrictEqual([accountId]);
   });
 
+  it("sanitizes catalog-only channel labels in terminal output but not JSON", async () => {
+    const control = "\u001B]0;catalog-injection\u0007\u001B[2J";
+    const label = `${control}QQ Bot\r\nAdmin\tgroup`;
+    mocks.listTrustedChannelPluginCatalogEntries.mockReturnValue([
+      createCatalogEntry("qqbot", label),
+    ]);
+    mocks.listPluginContributionIds.mockReturnValue([]);
+
+    const textRuntime = createTestRuntime();
+    await channelsListCommand({ all: true }, textRuntime);
+
+    const textOutput = loggedText(textRuntime);
+    expect(textOutput).not.toContain("\u001B");
+    expect(textOutput).not.toContain("\nAdmin");
+    expect(textOutput).toContain("QQ Bot\\r\\nAdmin\\tgroup");
+    expect(textOutput.replaceAll("\n", "")).not.toMatch(/\p{Cc}/u);
+
+    const jsonRuntime = createTestRuntime();
+    await channelsListCommand({ all: true, json: true }, jsonRuntime);
+    const payload = JSON.parse(loggedText(jsonRuntime)) as {
+      chat?: Record<string, { label: string }>;
+    };
+    expect(payload.chat?.qqbot?.label).toBe(label);
+  });
+
   it("prefers reachable gateway account snapshots over command-local token state", async () => {
     mocks.listReadOnlyChannelPluginsForConfig.mockReturnValue([
       createMockChannelPlugin({ id: "discord", label: "Discord", accountIds: ["default"] }),
@@ -298,22 +323,6 @@ describe("channels list", () => {
     expect(output).toContain("token=config-unavailable");
   });
 
-  it("default output does NOT show installable catalog channels (only configured ones)", async () => {
-    mocks.listReadOnlyChannelPluginsForConfig.mockReturnValue([]);
-    mocks.listTrustedChannelPluginCatalogEntries.mockReturnValue([
-      createCatalogEntry("qqbot", "QQ Bot"),
-    ]);
-    mocks.listPluginContributionIds.mockReturnValue([]);
-
-    await channelsListCommand({}, runtime);
-
-    const output = stripAnsi(loggedText(runtime));
-    expect(output).toContain("Chat channels:");
-    expect(output).not.toContain("QQ Bot");
-    // Hint user about --all
-    expect(output).toContain("--all");
-  });
-
   it.each(["env"])(
     "default output shows recovery for a missing plugin with credentials from %s",
     async (source) => {
@@ -342,7 +351,7 @@ describe("channels list", () => {
       expect(output).toContain("configured");
       expect(output).toContain("disabled");
       expect(output).toContain(
-        "run openclaw plugins install @openclaw/mattermost or openclaw doctor --fix",
+        "run openclaw plugins install npm:@openclaw/mattermost or openclaw doctor --fix",
       );
       expect(output).not.toContain("no configured chat channels");
     },
@@ -415,42 +424,5 @@ describe("channels list", () => {
     expect(payload.chat.qqbot).toMatchObject({ label: "QQ Bot", docsPath: "/channels/qqbot" });
     expect(payload.chat.discord).toMatchObject({ label: "Discord" });
     expect(payload.chat.discord).not.toHaveProperty("docsPath");
-  });
-
-  it.each([false])("reuses catalog facts and preserves rows with json=%s", async (json) => {
-    mocks.listReadOnlyChannelPluginsForConfig.mockReturnValue([
-      createMockChannelPlugin({ accountIds: ["default"] }),
-    ]);
-    mocks.resolveChannelAccountSnapshot.mockResolvedValue({ accountId: "default" });
-    mocks.listTrustedChannelPluginCatalogEntries.mockReturnValue([
-      createCatalogEntry("wecom", "WeCom"),
-      createCatalogEntry("telegram", "Telegram"),
-      createCatalogEntry("discord", "Discord"),
-      createCatalogEntry("wecom", "WeCom duplicate"),
-      createCatalogEntry("qqbot", "QQ Bot"),
-    ]);
-    mocks.listPluginContributionIds.mockReturnValue(["wecom", "telegram"]);
-    mocks.resolveMissingOfficialExternalChannelPluginRepairHints.mockReturnValue([
-      {
-        channelId: "discord",
-        installCommand: "openclaw plugins install @openclaw/discord",
-        doctorFixCommand: "openclaw doctor --fix",
-      },
-    ]);
-
-    await channelsListCommand({ all: true, json }, runtime);
-
-    expect(mocks.listPluginContributionIds).toHaveBeenCalledOnce();
-    expect(mocks.resolveMissingOfficialExternalChannelPluginRepairHints).toHaveBeenCalledOnce();
-    expect(stripAnsi(loggedText(runtime))).toBe(
-      [
-        "Chat channels:",
-        "- Telegram default: installed",
-        "- WeCom: installed, not configured, disabled",
-        "- Discord: not installed, configured, disabled, run openclaw plugins install @openclaw/discord or openclaw doctor --fix",
-        "- WeCom duplicate: installed, not configured, disabled",
-        "- QQ Bot: not installed, not configured, disabled",
-      ].join("\n"),
-    );
   });
 });

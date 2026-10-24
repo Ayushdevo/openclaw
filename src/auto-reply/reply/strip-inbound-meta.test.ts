@@ -28,6 +28,11 @@ const LEGACY_PRETTY_CONV_BLOCK = `${markInboundContextLabel("Conversation info:"
 }
 \`\`\``;
 
+// Frozen #159694 producer bytes, before #161012 moved the hint inside JSON.
+const LEGACY_REQUESTER_HINT =
+  'requester_profile is the verified linked requester. For "assign to me", use sessions assign_owner with ownerType="human" and ownerId=requester_profile.id, if available.';
+const LEGACY_REQUESTER_BLOCK = `${markInboundContextLabel("Conversation info:")}\n\`\`\`json\n${JSON.stringify({ requester_profile: { id: "human-1", display_name: "Ada" } })}\n\`\`\``;
+
 const SENDER_BLOCK = `${markInboundContextLabel("Sender:")}
 \`\`\`json
 {
@@ -75,6 +80,49 @@ describe("stripInboundMetadata", () => {
   it("strips legacy pretty-printed Conversation info blocks", () => {
     const input = `${LEGACY_PRETTY_CONV_BLOCK}\n\nWhat is the weather today?`;
     expect(stripInboundMetadata(input)).toBe("What is the weather today?");
+  });
+
+  it.each(["\n", "\r\n"])(
+    "strips the historical requester companion before chained metadata with %j newlines",
+    (newline) => {
+      const body = `assign this to me\n\nQuoted guidance:\n${LEGACY_REQUESTER_HINT}`;
+      const input =
+        `${LEGACY_REQUESTER_BLOCK}\n\n${LEGACY_REQUESTER_HINT}\n\n${SENDER_BLOCK}\n\n${body}`.replaceAll(
+          "\n",
+          newline,
+        );
+      expect(stripInboundMetadata(input)).toBe(body.replaceAll("\n", newline));
+      expect(stripLeadingInboundMetadata(input)).toBe(body.replaceAll("\n", newline));
+    },
+  );
+
+  it.each([
+    ["no requester", {}],
+    ["null requester", { requester_profile: null }],
+    [
+      "current requester hint",
+      { requester_profile: { id: "human-1" }, requester_profile_hint: LEGACY_REQUESTER_HINT },
+    ],
+  ])("preserves user guidance after %s metadata", (_name, metadata) => {
+    const prefix = `${markInboundContextLabel("Conversation info:")}\n\`\`\`json\n${JSON.stringify(metadata)}\n\`\`\``;
+    const body = `${LEGACY_REQUESTER_HINT}\n\nPlease explain this instruction.`;
+    expect(stripInboundMetadata(`${prefix}\n\n${body}`)).toBe(body);
+    expect(stripLeadingInboundMetadata(`${prefix}\n\n${body}`)).toBe(body);
+  });
+
+  it.each([
+    `${LEGACY_REQUESTER_HINT} Extra user text.\n\nPlease explain.`,
+    `${LEGACY_REQUESTER_HINT}\nPlease explain.`,
+    `Please explain.\n\n${LEGACY_REQUESTER_HINT}`,
+  ])("preserves requester guidance outside its historical companion frame", (body) => {
+    expect(stripInboundMetadata(`${LEGACY_REQUESTER_BLOCK}\n\n${body}`)).toBe(body);
+    expect(stripLeadingInboundMetadata(`${LEGACY_REQUESTER_BLOCK}\n\n${body}`)).toBe(body);
+  });
+
+  it("preserves standalone exact requester guidance", () => {
+    const body = `${LEGACY_REQUESTER_HINT}\n\nPlease explain.`;
+    expect(stripInboundMetadata(body)).toBe(body);
+    expect(stripLeadingInboundMetadata(body)).toBe(body);
   });
 
   it("strips multiple chained metadata blocks", () => {
@@ -310,6 +358,7 @@ Hello from user`;
     } as TemplateContext)}\n\nHello from user`;
 
     expect(extractInboundSenderLabel(input)).toBe("Ali```ce");
+    expect(stripInboundMetadata(input)).toBe("Hello from user");
   });
 });
 
@@ -342,34 +391,22 @@ describe("builder compatibility", () => {
     expect(stripInboundMetadata(input)).toBe("Actual user message");
   });
 
-  it("strips stale message-tool delivery hints from replayed user text", () => {
-    const input = [
+  it.each([
+    [
+      "strips stale message-tool delivery hints from replayed user text",
       "Delivery: to send a message, use the `message` tool.",
-      "",
-      "Actual user message",
-    ].join("\n");
-
-    expect(stripInboundMetadata(input)).toBe("Actual user message");
-  });
-
-  it("strips current message-tool-only delivery hints from replayed user text", () => {
-    const input = [
+    ],
+    [
+      "strips current message-tool-only delivery hints from replayed user text",
       "Delivery: Final assistant text is not automatically delivered in this run. Use the `message` tool to send user-visible output.",
-      "",
-      "Actual user message",
-    ].join("\n");
-
-    expect(stripInboundMetadata(input)).toBe("Actual user message");
-  });
-
-  it("strips narration-aware message-tool-only delivery hints from replayed user text", () => {
-    const input = [MESSAGE_TOOL_ONLY_DELIVERY_HINT, "", "Actual user message"].join("\n");
-
-    expect(stripInboundMetadata(input)).toBe("Actual user message");
-  });
-
-  it("strips room-event delivery hints from replayed user text", () => {
-    const input = [ROOM_EVENT_DELIVERY_HINT, "", "Actual user message"].join("\n");
+    ],
+    [
+      "strips narration-aware message-tool-only delivery hints from replayed user text",
+      MESSAGE_TOOL_ONLY_DELIVERY_HINT,
+    ],
+    ["strips room-event delivery hints from replayed user text", ROOM_EVENT_DELIVERY_HINT],
+  ] as const)("%s", (_name, hint) => {
+    const input = [hint, "", "Actual user message"].join("\n");
 
     expect(stripInboundMetadata(input)).toBe("Actual user message");
   });

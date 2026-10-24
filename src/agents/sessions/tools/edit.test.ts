@@ -1,5 +1,5 @@
 // Edit tool tests cover exact-match diagnostics, post-write recovery, newline
-// preservation, and preview rendering for custom operations.
+// preservation, and custom operations.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -7,16 +7,12 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { applyPatch } from "diff";
 import { Value } from "typebox/value";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createDeferredCore } from "../../../shared/deferred.js";
-import type { Theme } from "../../modes/interactive/theme/theme.js";
-import { createEditTool, createEditToolDefinition, type EditOperations } from "./edit.js";
+import { hasErrnoCode } from "../../../infra/errno.js";
+import { createEditTool, type EditToolOptions } from "./edit.js";
+import { readPersistedFileStat } from "./file-write-verification.js";
 import type { EditToolDetails, EditToolInput } from "./tool-contracts.js";
 
-const testTheme = {
-  bg: (_name: string, text: string) => text,
-  bold: (text: string) => text,
-  fg: (_name: string, text: string) => text,
-} as Theme;
+type EditOperations = NonNullable<EditToolOptions["operations"]>;
 
 function executeEdit(
   tool: ReturnType<typeof createEditTool>,
@@ -24,23 +20,6 @@ function executeEdit(
   edits: EditToolInput["edits"],
 ) {
   return tool.execute("edit", { path: filePath, edits }, undefined);
-}
-
-function previewContext(args: EditToolInput, invalidate: () => void, cwd = "/workspace") {
-  return {
-    args,
-    argsComplete: true,
-    cwd,
-    executionStarted: false,
-    expanded: false,
-    invalidate,
-    isError: false,
-    isPartial: false,
-    lastComponent: undefined,
-    showImages: false,
-    state: {},
-    toolCallId: "call-preview",
-  };
 }
 
 describe("edit tool", () => {
@@ -60,20 +39,16 @@ describe("edit tool", () => {
     return filePath;
   }
 
-  async function statEditFile(absolutePath: string) {
-    try {
-      const stat = await fs.stat(absolutePath);
-      return {
-        type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : "other",
-        size: stat.size,
-        mtimeMs: stat.mtimeMs,
-      } as const;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return null;
-      }
-      throw error;
-    }
+  function createEditOperations(writeFile: EditOperations["writeFile"]): EditOperations {
+    return {
+      access: async (absolutePath) => {
+        await fs.access(absolutePath);
+      },
+      readFile: (absolutePath) => fs.readFile(absolutePath),
+      statFile: (absolutePath) =>
+        readPersistedFileStat(absolutePath, (error) => hasErrnoCode(error, "ENOENT")),
+      writeFile,
+    };
   }
 
   it("preserves a valid UTF-8 BOM when editing a real file", async () => {
@@ -172,17 +147,10 @@ describe("edit tool", () => {
     // Some backends throw after flushing content; a readback match is the
     // contract that lets the tool report success without duplicating edits.
     const filePath = await createTempFile('const value = "foo";\r\n');
-    const operations: EditOperations = {
-      access: async (absolutePath) => {
-        await fs.access(absolutePath);
-      },
-      readFile: (absolutePath) => fs.readFile(absolutePath),
-      statFile: statEditFile,
-      writeFile: async (absolutePath, content) => {
-        await fs.writeFile(absolutePath, content, "utf-8");
-        throw new Error("Simulated post-write failure");
-      },
-    };
+    const operations = createEditOperations(async (absolutePath, content) => {
+      await fs.writeFile(absolutePath, content, "utf-8");
+      throw new Error("Simulated post-write failure");
+    });
     const tool = createEditTool(tmpDir, { operations });
 
     const result = await executeEdit(tool, filePath, [
@@ -201,16 +169,9 @@ describe("edit tool", () => {
 
   it("does not recover false success when the file never changed", async () => {
     const filePath = await createTempFile("old replacement already present");
-    const operations: EditOperations = {
-      access: async (absolutePath) => {
-        await fs.access(absolutePath);
-      },
-      readFile: (absolutePath) => fs.readFile(absolutePath),
-      statFile: statEditFile,
-      writeFile: async () => {
-        throw new Error("Simulated write failure");
-      },
-    };
+    const operations = createEditOperations(async () => {
+      throw new Error("Simulated write failure");
+    });
     const tool = createEditTool(tmpDir, { operations });
 
     await expect(
@@ -220,14 +181,7 @@ describe("edit tool", () => {
 
   it("rejects false success when a delegated write resolves without persisting", async () => {
     const filePath = await createTempFile("old\n");
-    const operations: EditOperations = {
-      access: async (absolutePath) => {
-        await fs.access(absolutePath);
-      },
-      readFile: (absolutePath) => fs.readFile(absolutePath),
-      statFile: statEditFile,
-      writeFile: async () => {},
-    };
+    const operations = createEditOperations(async () => {});
     const tool = createEditTool(tmpDir, { operations });
 
     await expect(executeEdit(tool, filePath, [{ oldText: "old", newText: "new" }])).rejects.toThrow(
@@ -333,140 +287,6 @@ describe("edit tool", () => {
     );
   });
 
-  it.each(["local", "injected"] as const)(
-    "renders @ previews through %s operations",
-    async (backend) => {
-      await createTempFile("plain sibling\n");
-      await fs.writeFile(path.join(tmpDir, "@demo.txt"), "local original\n");
-      const readFile = vi.fn(async () => Buffer.from("remote original\n"));
-      const operations: EditOperations = {
-        access: async () => {},
-        readFile,
-        statFile: async () => null,
-        writeFile: async () => {},
-      };
-      const tool = createEditToolDefinition(
-        tmpDir,
-        backend === "injected" ? { operations } : undefined,
-      );
-      const owner = backend === "injected" ? "remote" : "local";
-      const args = {
-        path: "@demo.txt",
-        edits: [{ oldText: `${owner} original`, newText: `${owner} changed` }],
-      };
-      const invalidated = createDeferredCore();
-      const context = previewContext(args, invalidated.resolve, tmpDir);
-
-      const component = tool.renderCall?.(args, testTheme, context);
-      await invalidated.promise;
-
-      if (backend === "injected") {
-        expect(readFile).toHaveBeenCalledWith(path.join(tmpDir, "demo.txt"));
-      } else {
-        expect(readFile).not.toHaveBeenCalled();
-      }
-      const preview = (component as { preview?: { error?: string; diff?: string } } | undefined)
-        ?.preview;
-      expect(preview?.error).toBeUndefined();
-      expect(preview?.diff).toContain(`${owner} changed`);
-      await expect(fs.readFile(path.join(tmpDir, "@demo.txt"), "utf8")).resolves.toBe(
-        "local original\n",
-      );
-      await expect(fs.readFile(path.join(tmpDir, "demo.txt"), "utf8")).resolves.toBe(
-        "plain sibling\n",
-      );
-    },
-  );
-
-  it("renders fuzzy Unicode previews from the original source bytes", async () => {
-    const readFile = vi.fn(async () =>
-      Buffer.from(
-        "const label\u00A0= \u201Chello\u201D; // keep \uFF08\uFF13\uFF09 \u2014 unchanged\n",
-      ),
-    );
-    const operations: EditOperations = {
-      access: async () => {},
-      readFile,
-      statFile: async () => null,
-      writeFile: async () => {},
-    };
-    const tool = createEditToolDefinition("/workspace", { operations });
-    const args = {
-      path: "remote.txt",
-      edits: [{ oldText: 'const label = "hello";', newText: "const label = 'hi';" }],
-    };
-    const invalidated = createDeferredCore();
-    const context = previewContext(args, invalidated.resolve);
-
-    const component = tool.renderCall?.(args, testTheme, context);
-    await invalidated.promise;
-
-    const preview = (component as { preview?: { error?: string; diff?: string } } | undefined)
-      ?.preview;
-    expect(preview?.error).toBeUndefined();
-    expect(preview?.diff).toContain(
-      "+1 const label = 'hi'; // keep \uFF08\uFF13\uFF09 \u2014 unchanged",
-    );
-    expect(preview?.diff).not.toContain("// keep (3) - unchanged");
-  });
-
-  it("filters fuzzy no-op edits from mixed previews", async () => {
-    const readFile = vi.fn(async () => Buffer.from("foo\u00a0bar\n"));
-    const operations: EditOperations = {
-      access: async () => {},
-      readFile,
-      statFile: async () => null,
-      writeFile: async () => {},
-    };
-    const tool = createEditToolDefinition("/workspace", { operations });
-    const args = {
-      path: "remote.txt",
-      edits: [
-        { oldText: "foo bar", newText: "foo bar" },
-        { oldText: "foo\u00a0", newText: "baz" },
-      ],
-    };
-    const invalidated = createDeferredCore();
-    const context = previewContext(args, invalidated.resolve);
-
-    const component = tool.renderCall?.(args, testTheme, context);
-    await invalidated.promise;
-
-    expect(
-      (component as { preview?: { error?: string; diff?: string } } | undefined)?.preview,
-    ).toEqual(expect.objectContaining({ diff: expect.stringContaining("bazbar") }));
-    expect(
-      (component as { preview?: { error?: string } } | undefined)?.preview?.error,
-    ).toBeUndefined();
-  });
-
-  it("validates no-op targets in mixed previews", async () => {
-    const readFile = vi.fn(async () => Buffer.from("alpha beta\n"));
-    const operations: EditOperations = {
-      access: async () => {},
-      readFile,
-      statFile: async () => null,
-      writeFile: async () => {},
-    };
-    const tool = createEditToolDefinition("/workspace", { operations });
-    const args = {
-      path: "remote.txt",
-      edits: [
-        { oldText: "missing", newText: "missing" },
-        { oldText: "alpha", newText: "ALPHA" },
-      ],
-    };
-    const invalidated = createDeferredCore();
-    const context = previewContext(args, invalidated.resolve);
-
-    const component = tool.renderCall?.(args, testTheme, context);
-    await invalidated.promise;
-
-    expect((component as { preview?: { error?: string } } | undefined)?.preview?.error).toContain(
-      "Could not find the exact text",
-    );
-  });
-
   it("returns a non-terminal no-op when oldText equals newText", async () => {
     const filePath = await createTempFile("unchanged content\n");
     const tool = createEditTool(tmpDir);
@@ -481,75 +301,24 @@ describe("edit tool", () => {
     await expect(fs.readFile(filePath, "utf-8")).resolves.toBe("unchanged content\n");
   });
 
-  it("shows an empty preview for an all-no-op edit", async () => {
-    const readFile = vi.fn(async () => Buffer.from("unchanged content\n"));
-    const operations: EditOperations = {
-      access: async () => {},
-      readFile,
-      statFile: async () => null,
-      writeFile: async () => {},
-    };
-    const tool = createEditToolDefinition("/workspace", { operations });
-    const args = {
-      path: "remote.txt",
-      edits: [{ oldText: "unchanged", newText: "unchanged" }],
-    };
-    const invalidated = createDeferredCore();
-    const context = previewContext(args, invalidated.resolve);
-
-    const component = tool.renderCall?.(args, testTheme, context);
-    await invalidated.promise;
-
-    expect(
-      (component as { preview?: { error?: string; diff?: string } } | undefined)?.preview,
-    ).toEqual({ diff: "", firstChangedLine: undefined });
-  });
-
-  it("shows an empty preview for a fuzzy net no-op", async () => {
-    const readFile = vi.fn(async () => Buffer.from("foo\n"));
-    const operations: EditOperations = {
-      access: async () => {},
-      readFile,
-      statFile: async () => null,
-      writeFile: async () => {},
-    };
-    const tool = createEditToolDefinition("/workspace", { operations });
-    const args = {
-      path: "remote.txt",
-      edits: [{ oldText: "foo ", newText: "foo" }],
-    };
-    const invalidated = createDeferredCore();
-    const context = previewContext(args, invalidated.resolve);
-
-    const component = tool.renderCall?.(args, testTheme, context);
-    await invalidated.promise;
-
-    expect(
-      (component as { preview?: { error?: string; diff?: string } } | undefined)?.preview,
-    ).toEqual({ diff: "", firstChangedLine: undefined });
-  });
-
-  it("does not hide a mismatched no-op edit", async () => {
+  it.each([
+    { name: "alone", siblings: [] },
+    { name: "beside a real edit", siblings: [{ oldText: "actual", newText: "changed" }] },
+  ])("does not hide a mismatched no-op edit $name", async ({ siblings }) => {
     const filePath = await createTempFile("actual content\n");
     const tool = createEditTool(tmpDir);
 
     await expect(
-      executeEdit(tool, filePath, [{ oldText: "missing", newText: "missing" }]),
+      executeEdit(tool, filePath, [{ oldText: "missing", newText: "missing" }, ...siblings]),
     ).rejects.toThrow(/Current file contents:\nactual content/);
+    await expect(fs.readFile(filePath, "utf-8")).resolves.toBe("actual content\n");
   });
 
   it("does not hide unrelated errors that mention no changes", async () => {
     const filePath = await createTempFile("old content\n");
-    const operations: EditOperations = {
-      access: async (absolutePath) => {
-        await fs.access(absolutePath);
-      },
-      readFile: (absolutePath) => fs.readFile(absolutePath),
-      statFile: statEditFile,
-      writeFile: async () => {
-        throw new Error("No changes made to the disk because it is full");
-      },
-    };
+    const operations = createEditOperations(async () => {
+      throw new Error("No changes made to the disk because it is full");
+    });
     const tool = createEditTool(tmpDir, { operations });
 
     await expect(executeEdit(tool, filePath, [{ oldText: "old", newText: "new" }])).rejects.toThrow(

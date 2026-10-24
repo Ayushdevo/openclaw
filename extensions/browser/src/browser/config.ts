@@ -20,7 +20,6 @@ import {
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveUserPath } from "openclaw/plugin-sdk/text-utility-runtime";
 import {
-  DEFAULT_BROWSER_CONTROL_PORT,
   deriveDefaultBrowserCdpPortRange,
   deriveDefaultBrowserControlPort,
 } from "../config/port-defaults.js";
@@ -58,15 +57,15 @@ export {
 };
 export { parseBrowserHttpUrl as parseHttpUrl };
 
-/** Browser config after defaults, derived ports, and profile defaults are applied. */
 export type ResolvedBrowserConfig = Omit<ResolvedBrowserConfigContract, "profiles"> & {
   headlessSource?: "config" | "default";
   profiles: Record<string, BrowserProfileConfig>;
+  /** Explicit policy, including {}, suppresses request-scoped preview defaults. */
+  ssrfPolicyConfigured?: boolean;
   /** Default loopback port for extension-driver relay servers. */
   extensionRelayDefaultPort: number;
   /** Assigned loopback relay port per extension-driver profile (no explicit cdpPort). */
   extensionRelayPorts: Record<string, number>;
-  /** Extension relay authentication compatibility policy. */
   extensionRelay: {
     allowLegacyAuth: boolean;
   };
@@ -86,15 +85,9 @@ export function getOwnBrowserProfile<T>(
 
 const DEFAULT_BROWSER_REMOTE_CDP_TIMEOUT_MS = 1_500;
 const DEFAULT_BROWSER_REMOTE_CDP_HANDSHAKE_TIMEOUT_MS = 3_000;
-/**
- * Default extension relay port offset from the browser control port. Sits just
- * below the CDP allocation range (controlPort+9..) so profile port allocation
- * can never hand this port to a managed profile.
- */
 const EXTENSION_RELAY_PORT_OFFSET = 8;
 /** Username half of the process-only internal relay credential. */
 const EXTENSION_RELAY_CDP_USER = "openclaw-internal";
-/** Environment variable that overrides managed Chrome headless mode. */
 const BROWSER_HEADLESS_ENV_KEY = "OPENCLAW_BROWSER_HEADLESS";
 
 type ManagedBrowserHeadlessMode = {
@@ -104,10 +97,9 @@ type ManagedBrowserHeadlessMode = {
 
 type ManagedBrowserMissingDisplayError = {
   message: string;
-  headlessSource: Exclude<ManagedBrowserHeadlessSource, "linux-display-fallback">;
+  headlessSource: ManagedBrowserHeadlessSource;
 };
 
-/** Inputs used to resolve managed Chrome headless mode. */
 export type ManagedBrowserHeadlessOptions = {
   headlessOverride?: boolean;
   env?: NodeJS.ProcessEnv;
@@ -134,10 +126,8 @@ function normalizeExistingSessionCdpUrl(
     return undefined;
   }
 
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch {
+  const parsed = URL.parse(value);
+  if (!parsed) {
     throw new Error(`browser.profiles.${profileName}.cdpUrl must be a valid URL.`);
   }
 
@@ -217,8 +207,8 @@ function resolveExtensionRelayPorts(
   // allocation so an extension relay cannot bind another profile's listener.
   const reservedPorts = new Set(
     Object.values(profiles)
-      .map((profile) => profile.cdpPort)
-      .filter((port): port is number => typeof port === "number"),
+      .flatMap((profile) => [profile.cdpPort, Number(URL.parse(profile.cdpUrl ?? "")?.port)])
+      .filter((port): port is number => typeof port === "number" && port > 0),
   );
   const ports: Record<string, number> = {};
   const minimumPort = defaultPort - EXTENSION_RELAY_PORT_OFFSET;
@@ -263,13 +253,12 @@ function assertDedicatedEngineEndpoints(profiles: Record<string, BrowserProfileC
   }
 }
 
-/** Resolve raw browser config into runtime browser defaults. */
 export function resolveBrowserConfig(
   cfg: BrowserConfig | undefined,
   rootConfig?: OpenClawConfig,
 ): ResolvedBrowserConfig {
   const gatewayPort = resolveGatewayPort(rootConfig);
-  const controlPort = deriveDefaultBrowserControlPort(gatewayPort ?? DEFAULT_BROWSER_CONTROL_PORT);
+  const controlPort = deriveDefaultBrowserControlPort(gatewayPort);
 
   const derivedCdpRange = deriveDefaultBrowserCdpPortRange(controlPort);
 
@@ -330,7 +319,7 @@ export function resolveBrowserConfig(
     actionTimeoutMs: DEFAULT_BROWSER_ACTION_TIMEOUT_MS,
     color: DEFAULT_OPENCLAW_BROWSER_COLOR,
     executablePath,
-    headless: cfg?.headless === true,
+    headless: cfg?.headless ?? true,
     headlessSource: typeof cfg?.headless === "boolean" ? "config" : "default",
     noSandbox: cfg?.noSandbox === true,
     attachOnly: cfg?.attachOnly === true,
@@ -338,6 +327,7 @@ export function resolveBrowserConfig(
     profiles,
     tabCleanup: resolveBrowserTabCleanupConfig(cfg),
     ssrfPolicy: resolveBrowserSsrFPolicy(cfg),
+    ssrfPolicyConfigured: cfg?.ssrfPolicy !== undefined,
     extraArgs,
     extensionRelayDefaultPort: controlPort + EXTENSION_RELAY_PORT_OFFSET,
     extensionRelayPorts: resolveExtensionRelayPorts(
@@ -360,7 +350,6 @@ export function resolveFirstExtensionProfileName(
   )?.[0];
 }
 
-/** Resolve one configured browser profile by name. */
 export function resolveProfile(
   resolved: ResolvedBrowserConfig,
   profileName: string,
@@ -397,10 +386,6 @@ export function resolveProfile(
   };
 
   if (driver === "extension") {
-    // Each extension profile needs its own loopback relay port. Explicit
-    // profile.cdpPort wins; otherwise a distinct port is assigned per profile
-    // (see resolveExtensionRelayPorts) so multiple extension profiles never
-    // collide on the same port and silently fail to bind.
     const relayPort =
       profile.cdpPort ??
       resolved.extensionRelayPorts[profileName] ??
@@ -424,7 +409,7 @@ export function resolveProfile(
   }
 
   if (driver === "existing-session") {
-    const mcpArgs = normalizeOptionalTrimmedStringList(profile.mcpArgs) ?? undefined;
+    const mcpArgs = normalizeOptionalTrimmedStringList(profile.mcpArgs);
     const existingSessionCdp = normalizeExistingSessionCdpUrl(
       normalizeChromeMcpOptions({ ...profile, mcpArgs }).browserUrl,
       profileName,
@@ -438,7 +423,7 @@ export function resolveProfile(
       userDataDir: resolveUserPath(profile.userDataDir?.trim() || "") || undefined,
       mcpCommand: normalizeOptionalString(profile.mcpCommand),
       mcpArgs,
-      headless,
+      headless: headlessSource === "default" ? false : headless,
       headlessSource,
       attachOnly: true,
     };
@@ -483,13 +468,16 @@ export function resolveProfile(
     cdpUrl,
     cdpHost,
     cdpIsLoopback: isLoopbackHost(cdpHost),
-    headless,
+    headless:
+      headlessSource === "default" &&
+      (!isLoopbackHost(cdpHost) || (profile.attachOnly ?? resolved.attachOnly))
+        ? false
+        : headless,
     headlessSource,
     attachOnly: profile.attachOnly ?? resolved.attachOnly,
   };
 }
 
-/** Resolve effective headless mode for a managed browser profile. */
 export function resolveManagedBrowserHeadlessMode(
   resolved: ResolvedBrowserConfig,
   profile: ResolvedBrowserProfile,
@@ -504,7 +492,6 @@ export function resolveManagedBrowserHeadlessMode(
   }
 
   const env = params.env ?? process.env;
-  const platform = params.platform ?? process.platform;
   const envHeadless = parseBooleanValue(env[BROWSER_HEADLESS_ENV_KEY]);
   if (envHeadless !== undefined) {
     return { headless: envHeadless, source: "env" };
@@ -515,14 +502,9 @@ export function resolveManagedBrowserHeadlessMode(
     return { headless: profile.headless, source: profileHeadlessSource };
   }
 
-  if (platform === "linux" && !hasLinuxDisplay(env)) {
-    return { headless: true, source: "linux-display-fallback" };
-  }
-
   return { headless: resolved.headless, source: "default" };
 }
 
-/** Return a Linux display error for headed managed Chrome when no display exists. */
 export function getManagedBrowserMissingDisplayError(
   resolved: ResolvedBrowserConfig,
   profile: ResolvedBrowserProfile,
@@ -542,7 +524,7 @@ export function getManagedBrowserMissingDisplayError(
     env,
     platform,
   });
-  if (mode.headless || mode.source === "linux-display-fallback") {
+  if (mode.headless) {
     return null;
   }
 

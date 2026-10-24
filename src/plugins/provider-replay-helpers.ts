@@ -68,6 +68,7 @@ export function buildStrictAnthropicReplayPolicy(
   options: {
     dropThinkingBlocks?: boolean;
     appendOnlyRuntimeContext?: boolean;
+    inHistorySystemUpdates?: boolean;
     sanitizeToolCallIds?: boolean;
     preserveNativeAnthropicToolUseIds?: boolean;
   } = {},
@@ -85,7 +86,9 @@ export function buildStrictAnthropicReplayPolicy(
         }
       : {}),
     preserveSignatures: true,
-    appendOnlyRuntimeContext: options.appendOnlyRuntimeContext ?? false,
+    appendOnlyRuntimeContext:
+      options.inHistorySystemUpdates || options.appendOnlyRuntimeContext || false,
+    ...(options.inHistorySystemUpdates ? { inHistorySystemUpdates: true } : {}),
     repairToolUseResultPairing: true,
     validateAnthropicTurns: true,
     allowSyntheticToolResults: true,
@@ -93,8 +96,7 @@ export function buildStrictAnthropicReplayPolicy(
   };
 }
 
-/** @deprecated Anthropic-family provider replay helper; prefer provider-local replay hooks. */
-export function shouldDropClaudeThinkingBlocks(
+function shouldDropClaudeThinkingBlocks(
   modelId?: string,
   model?: Pick<ProviderRuntimeModel, "params">,
 ): boolean {
@@ -103,6 +105,7 @@ export function shouldDropClaudeThinkingBlocks(
   const isClaude =
     canonicalId.startsWith("claude-") || resolveClaudeOpus5ModelIdentity(ref) !== undefined;
   const preservesThinking =
+    bindsClaudeThinkingPrefix(ref) ||
     resolveClaudeOpus5ModelIdentity(ref) !== undefined ||
     /(?:^|-)claude-(?:fable-5|mythos-(?:5|preview)|opus-4-(?:5|6|7|8)|sonnet-(?:5|4-6))(?=$|[^a-z0-9])/.test(
       canonicalId,
@@ -114,8 +117,10 @@ export function shouldDropClaudeThinkingBlocks(
 export function buildAnthropicReplayPolicyForModel(
   modelId?: string,
   model?: Pick<ProviderRuntimeModel, "params">,
+  inHistorySystemUpdates = false,
 ): ProviderReplayPolicy {
   return buildStrictAnthropicReplayPolicy({
+    inHistorySystemUpdates,
     dropThinkingBlocks: shouldDropClaudeThinkingBlocks(modelId, model),
     appendOnlyRuntimeContext: bindsClaudeThinkingPrefix({ id: modelId, params: model?.params }),
   });
@@ -125,9 +130,10 @@ export function buildAnthropicReplayPolicyForModel(
 export function buildNativeAnthropicReplayPolicyForModel(
   modelId?: string,
   model?: Pick<ProviderRuntimeModel, "params">,
+  inHistorySystemUpdates = false,
 ): ProviderReplayPolicy {
   return {
-    ...buildAnthropicReplayPolicyForModel(modelId, model),
+    ...buildAnthropicReplayPolicyForModel(modelId, model, inHistorySystemUpdates),
     preserveNativeAnthropicToolUseIds: true,
   };
 }
@@ -139,6 +145,7 @@ export function buildHybridAnthropicOrOpenAIReplayPolicy(
 ): ProviderReplayPolicy | undefined {
   if (ctx.modelApi === "anthropic-messages" || ctx.modelApi === "bedrock-converse-stream") {
     return buildStrictAnthropicReplayPolicy({
+      inHistorySystemUpdates: ctx.inHistorySystemUpdates,
       appendOnlyRuntimeContext: bindsClaudeThinkingPrefix({
         id: ctx.modelId,
         params: ctx.model?.params,
@@ -206,7 +213,7 @@ export function buildPassthroughGeminiSanitizingReplayPolicy(
   };
 }
 
-/** @deprecated Use sanitizeGoogleGeminiReplayHistoryAsync; removed at the next Plugin SDK major. */
+/** @deprecated Use sanitizeGoogleGeminiReplayHistoryAsync; final compatibility day: 2026-12-31. Removal in the first January 2027 stable release. */
 export function sanitizeGoogleGeminiReplayHistory(
   ctx: ProviderSanitizeReplayHistoryContext,
 ): AgentMessage[] {

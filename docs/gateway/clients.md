@@ -124,8 +124,10 @@ handshake does not report an error.
 </Warning>
 
 Capability-gated agent tools are a separate use of the same declaration. If an
-agent tool requires a client capability, the Gateway omits that tool unless the
-originating client advertised every required capability.
+agent tool requires a client capability, the Gateway lists it using the operator
+capabilities recorded for that session. Internal wakes and restart recovery retain
+that declaration. Current client capabilities still gate calls, and tools that
+act on a browser require their bound, connected recipient at execution.
 
 ## Validate attachments before sending
 
@@ -205,7 +207,7 @@ assistant, plan, tool, and other stream events.
 
 ## Render generated image artifacts
 
-Assistant-generated images arrive as canonical `type: "image"` content blocks.
+Assistant-generated images arrive as standard `type: "image"` content blocks.
 Managed blocks include a stable `artifactId`, a Gateway-relative `url`, MIME
 type, dimensions, size, and accessible alt text. Keep that reference in the
 transcript cache; do not persist downloaded bytes or temporary download URLs.
@@ -338,7 +340,7 @@ transition racing the list request is neither lost nor resurrected.
 
 The current wire version is `4`. General operator and WebChat clients must
 negotiate the exact current version with `minProtocol: 4` and `maxProtocol: 4`.
-Only authenticated node clients and lightweight probes have the N-1 acceptance
+Only authenticated node clients and lightweight checks have the N-1 acceptance
 window, currently protocol `3` through `4`.
 
 Protocol changes are additive first. `protocol.schema.json` includes `since`

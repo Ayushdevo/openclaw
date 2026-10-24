@@ -3,9 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
-import type { SessionTranscriptWriteLockContext } from "openclaw/plugin-sdk/session-transcript-runtime";
+import type { SessionTranscriptWriteContext } from "openclaw/plugin-sdk/session-transcript-runtime";
 import { withEnvAsync } from "openclaw/plugin-sdk/test-env";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createSessionCatalogContinuationStore } from "../test-support/session-catalog-continuation.test-support.js";
 
 type ResolveAcpSessionAvailability =
   (typeof import("openclaw/plugin-sdk/acp-runtime"))["resolveAcpSessionAvailability"];
@@ -45,9 +46,6 @@ type NodeHostCommand = Parameters<OpenClawPluginApi["registerNodeHostCommand"]>[
 type NodeInvokePolicy = Parameters<OpenClawPluginApi["registerNodeInvokePolicy"]>[0];
 type CatalogListParams = Parameters<SessionCatalogProvider["list"]>[0];
 type CatalogReadParams = Parameters<SessionCatalogProvider["read"]>[0];
-type CreateSessionEntryParams = Parameters<
-  OpenClawPluginApi["runtime"]["agent"]["session"]["createSessionEntry"]
->[0];
 
 function bindTestCatalogOwner(provider: RegisteredSessionCatalogProvider): SessionCatalogProvider {
   return {
@@ -70,9 +68,10 @@ function bindTestCatalogOwner(provider: RegisteredSessionCatalogProvider): Sessi
   } as SessionCatalogProvider;
 }
 
-const nodeHostMocks = vi.hoisted(() => ({
-  runNodePtyCommand: vi.fn(async () => ({ exitCode: 0 })),
-}));
+const nodeHostMocks = await vi.hoisted(async () => {
+  const { createNodeHostMocks } = await import("../test-support/node-host.test-support.js");
+  return createNodeHostMocks();
+});
 const acpRuntimeMocks = vi.hoisted(() => ({
   resolveAcpSessionAvailability: vi.fn<ResolveAcpSessionAvailability>(() => ({ available: true })),
 }));
@@ -99,9 +98,9 @@ vi.mock("openclaw/plugin-sdk/session-transcript-runtime", async (importOriginal)
     await importOriginal<typeof import("openclaw/plugin-sdk/session-transcript-runtime")>();
   return {
     ...actual,
-    withSessionTranscriptWriteLock: async (
+    withSessionTranscriptWrite: async (
       _params: unknown,
-      run: (context: Pick<SessionTranscriptWriteLockContext, "appendMessage">) => Promise<void>,
+      run: (context: Pick<SessionTranscriptWriteContext, "appendMessage">) => Promise<void>,
     ) => {
       await run({
         appendMessage: async ({ message, idempotencyLookup }) => {
@@ -121,29 +120,8 @@ vi.mock("openclaw/plugin-sdk/session-transcript-runtime", async (importOriginal)
   };
 });
 
-vi.mock("openclaw/plugin-sdk/node-host", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("openclaw/plugin-sdk/node-host")>();
-  return {
-    ...actual,
-    runNodePtyCommand: nodeHostMocks.runNodePtyCommand,
-    resolveNodeHostExecutable: (
-      command: string,
-      options: {
-        env?: NodeJS.ProcessEnv;
-        pathEnv?: string;
-        includeExtensionless?: boolean;
-      },
-    ) => {
-      const env = options.env ?? process.env;
-      return actual.resolveNodeHostExecutable(command, {
-        env,
-        pathEnv: options.pathEnv ?? env.PATH ?? env.Path ?? "",
-        includeExtensionless: options.includeExtensionless,
-        strategy: "direct",
-      });
-    },
-  };
-});
+// mock-isolation: Shared owner preserves real exports with fresh command-resolution mocks.
+vi.mock("openclaw/plugin-sdk/node-host", nodeHostMocks.mockRuntime);
 
 import { registerOpenCodeSessionCatalog } from "./session-catalog-plugin.js";
 import {
@@ -175,6 +153,7 @@ function captureOpenCodeSessionRegistrations(
       id: "opencode",
       pluginConfig,
       runtime: {
+        config: { current: () => ({}) },
         nodes: { list: vi.fn().mockResolvedValue({ nodes: [] }) },
       } as unknown as OpenClawPluginApi["runtime"],
       ...(overrides as Partial<OpenClawPluginApi>),
@@ -216,7 +195,7 @@ function capturePairedNodeCatalog(nodes: Array<Record<string, unknown>>, invoke:
   const { provider } = captureOpenCodeSessionRegistrations(
     {},
     {
-      runtime: { nodes: { list: listNodes, invoke } },
+      runtime: { config: { current: () => ({}) }, nodes: { list: listNodes, invoke } },
     },
   );
   return { listNodes, provider };
@@ -232,9 +211,8 @@ const readPairedNode = (
   params: Omit<CatalogReadParams, "hostId" | "threadId"> = {},
 ) => provider.read({ ...pairedNodeLocator, ...params });
 
-const readTestTranscript = (
-  params: Omit<Parameters<typeof readLocalOpenCodeTranscriptPage>[0], "threadId"> = {},
-) => readLocalOpenCodeTranscriptPage({ threadId: "ses_test", ...params });
+const readTestTranscript = (params: Record<string, unknown> = {}) =>
+  readLocalOpenCodeTranscriptPage({ threadId: "ses_test", ...params });
 
 async function expectRejects(promise: Promise<unknown>, message: string) {
   await expect(promise).rejects.toThrow(message);
@@ -260,39 +238,10 @@ async function expectPairedNodeListError(
 }
 
 function captureOpenCodeContinuationCatalog() {
-  const entries: Array<{ sessionKey: string; entry: Record<string, unknown> }> = [];
-  const createSessionEntry = vi.fn(async (params: CreateSessionEntryParams) => {
-    const sessionKey = `agent:${params.agentId ?? "main"}:${params.key}`;
-    const entry = {
-      sessionId: "adopted-opencode-session",
-      updatedAt: Date.now(),
-      pluginOwnerId: "opencode",
-      initializationPending: true as const,
-      ...(params.label ? { label: params.label } : {}),
-      ...(params.displayName ? { displayName: params.displayName } : {}),
-      ...(params.spawnedCwd ? { spawnedCwd: params.spawnedCwd } : {}),
-      pluginExtensions: params.initialEntry.pluginExtensions,
-    };
-    entries.push({ sessionKey, entry });
-    const created = {
-      key: sessionKey,
-      agentId: params.agentId ?? "main",
-      sessionId: entry.sessionId,
-      entry,
-    };
-    try {
-      const finalPatch = await params.afterCreate?.(created);
-      entry.pluginExtensions = finalPatch?.pluginExtensions ?? entry.pluginExtensions;
-      delete (entry as { initializationPending?: true }).initializationPending;
-      return created;
-    } catch (error) {
-      entries.splice(
-        entries.findIndex((candidate) => candidate.entry === entry),
-        1,
-      );
-      throw error;
-    }
-  });
+  const { entries, createSessionEntry } = createSessionCatalogContinuationStore(
+    "opencode",
+    "adopted-opencode-session",
+  );
   const session = { createSessionEntry, listSessionEntries: vi.fn(() => entries) };
   const runtime = {
     config: { current: () => ({}) },
@@ -638,36 +587,29 @@ describe("OpenCode session catalog", () => {
     });
   });
 
-  itWithCli(
-    "memoizes the CLI database query across cadence and invalidates by config identity",
-    async () => {
-      await installFakeOpenCode();
-      let now = 1_000;
-      const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
-      const configIdentity = {};
-      try {
-        await listLocalOpenCodeSessionPage({ limit: 20 }, { configIdentity });
-        await listLocalOpenCodeSessionPage({ limit: 20 }, { configIdentity });
-        expect(processRuntimeMocks.runCommandBuffered).toHaveBeenCalledTimes(2);
+  itWithCli("memoizes the CLI database query until explicit refresh or expiry", async () => {
+    await installFakeOpenCode();
+    let now = 1_000;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      await listLocalOpenCodeSessionPage({ limit: 20 });
+      await listLocalOpenCodeSessionPage({ limit: 20 });
+      expect(processRuntimeMocks.runCommandBuffered).toHaveBeenCalledTimes(2);
 
-        now += 31_999;
-        await listLocalOpenCodeSessionPage({ limit: 20 }, { configIdentity });
-        expect(processRuntimeMocks.runCommandBuffered).toHaveBeenCalledTimes(2);
+      now += 31_999;
+      await listLocalOpenCodeSessionPage({ limit: 20 });
+      expect(processRuntimeMocks.runCommandBuffered).toHaveBeenCalledTimes(2);
 
-        await listLocalOpenCodeSessionPage({ limit: 20 }, { configIdentity, forceRefresh: true });
-        expect(processRuntimeMocks.runCommandBuffered).toHaveBeenCalledTimes(3);
+      await listLocalOpenCodeSessionPage({ limit: 20 }, { forceRefresh: true });
+      expect(processRuntimeMocks.runCommandBuffered).toHaveBeenCalledTimes(3);
 
-        await listLocalOpenCodeSessionPage({ limit: 20 }, { configIdentity: {} });
-        expect(processRuntimeMocks.runCommandBuffered).toHaveBeenCalledTimes(4);
-
-        now += 32_001;
-        await listLocalOpenCodeSessionPage({ limit: 20 }, { configIdentity });
-        expect(processRuntimeMocks.runCommandBuffered).toHaveBeenCalledTimes(6);
-      } finally {
-        nowSpy.mockRestore();
-      }
-    },
-  );
+      now += 32_001;
+      await listLocalOpenCodeSessionPage({ limit: 20 });
+      expect(processRuntimeMocks.runCommandBuffered).toHaveBeenCalledTimes(5);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
 
   itWithCli("hides and rejects Continue when ACP cannot resume OpenCode", async () => {
     await installFakeOpenCode();

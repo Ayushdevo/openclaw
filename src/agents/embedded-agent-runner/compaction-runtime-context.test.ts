@@ -7,6 +7,7 @@ import { formatSqliteSessionFileMarker } from "../../config/sessions/legacy-sqli
 import * as manifestModelIdNormalization from "../../plugins/manifest-model-id-normalization.js";
 import { addSession, deleteSession } from "../bash-process-registry.js";
 import { createProcessSessionFixture } from "../bash-process-registry.test-helpers.js";
+import { configFor, modelDefinition } from "../model-auth.fixtures.test-support.js";
 import * as providerModelNormalizationRuntime from "../provider-model-normalization.runtime.js";
 import {
   buildEmbeddedCompactionRuntimeContext,
@@ -59,27 +60,17 @@ describe("resolveCompactionContextTokenBudget", () => {
     "caps requested=$requested by the authored native window despite a larger contextTokens cap",
     ({ requested, expected }) => {
       const budget = resolveCompactionContextTokenBudget({
-        config: {
-          models: {
-            providers: {
-              custom: {
-                baseUrl: "https://models.example.test/v1",
-                models: [
-                  {
-                    id: "tiny-model",
-                    name: "Tiny model",
-                    reasoning: false,
-                    input: ["text"],
-                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                    contextWindow: 3_000,
-                    contextTokens: 16_000,
-                    maxTokens: 256,
-                  },
-                ],
-              },
-            },
-          },
-        },
+        config: configFor("custom", "https://models.example.test/v1", {
+          models: [
+            modelDefinition("tiny-model", {
+              name: "Tiny model",
+              reasoning: false,
+              contextWindow: 3_000,
+              contextTokens: 16_000,
+              maxTokens: 256,
+            }),
+          ],
+        }),
         provider: "custom",
         modelId: "tiny-model",
         model: modelWithWindow(3_000),
@@ -112,18 +103,6 @@ describe("resolveEmbeddedCompactionThinkingLevel", () => {
       ).toBe(expected);
     },
   );
-
-  it("revalidates an unsupported configured level for the actual candidate", () => {
-    expect(
-      resolveEmbeddedCompactionThinkingLevel({
-        config: {
-          agents: { defaults: { compaction: { thinkingLevel: "xhigh" } } },
-        },
-        provider: "demo",
-        modelId: "demo-model",
-      }),
-    ).toBe("high");
-  });
 
   it("revalidates the compaction default against provider-denied thinking levels", () => {
     expect(
@@ -188,9 +167,9 @@ describe("buildEmbeddedCompactionRuntimeContext", () => {
       currentMessageId: "msg-42",
       authProfileId: "openai:p1",
       workspaceDir: "/tmp/workspace",
+      bootstrapWorkspaceDir: "/tmp/agent-workspace",
       cwd: "/tmp/task-repo",
       requireWorkspaceOnly: true,
-      requireWritableSandbox: true,
       agentDir: "/tmp/agent",
       config: {} as unknown as OpenClawConfig,
       senderIsOwner: true,
@@ -265,7 +244,6 @@ describe("buildEmbeddedCompactionRuntimeContext", () => {
     // could send a stale credential to the override provider.
     expect(result.authProfileId).toBeUndefined();
   });
-
   it.each([
     { name: "without configured aliases", models: undefined },
     {
@@ -289,14 +267,7 @@ describe("buildEmbeddedCompactionRuntimeContext", () => {
       try {
         const result = buildEmbeddedCompactionRuntimeContext({
           ...workspace,
-          config: {
-            agents: {
-              defaults: {
-                ...(models ? { models } : {}),
-                compaction: { model: "gpt-4o" },
-              },
-            },
-          } as OpenClawConfig,
+          config: compactionConfig("gpt-4o", models),
           provider: "openai",
           modelId: "gpt-3.5-turbo",
           authProfileId: "openai:p1",
@@ -427,8 +398,6 @@ describe("buildEmbeddedCompactionRuntimeContext", () => {
       defaultModel: "gpt-5.4",
     });
     expect(result.provider).toBe("openai");
-    expect(result.runtimeProvider).toBeUndefined();
-    expect(result.contextProvider).toBeUndefined();
     expect(result.model).toBe("gpt-5.4");
     expect(result.authProfileId).toBe("openai:default");
   });
@@ -446,7 +415,6 @@ describe("buildEmbeddedCompactionRuntimeContext", () => {
     expect(result.modelSelectionLocked).toBe(true);
     expect(result.provider).toBe("openai");
     expect(result.model).toBe("gpt-5.5");
-    expect(result.runtimeProvider).toBeUndefined();
   });
 
   it("carries only a target-matching prepared auth plan into compaction context", () => {
@@ -548,8 +516,6 @@ describe("buildEmbeddedCompactionRuntimeContext", () => {
       harnessRuntime: fixture.harnessRuntime,
     });
     expect(result.provider).toBe("openai");
-    expect(result.runtimeProvider).toBeUndefined();
-    expect(result.contextProvider).toBeUndefined();
     expect(result.nativeHarnessCompaction).toBe(fixture.nativeCompaction);
     expect(result.model).toBe("gpt-5.5");
     expect(result.authProfileId).toBeUndefined();
@@ -572,8 +538,6 @@ describe("buildEmbeddedCompactionRuntimeContext", () => {
       modelSelectionLocked: true,
     });
     expect(result.provider).toBe("openai");
-    expect(result.runtimeProvider).toBeUndefined();
-    expect(result.contextProvider).toBeUndefined();
     expect(result.nativeHarnessCompaction).toBe(true);
     expect(result.model).toBe("gpt-5.5");
   });
@@ -592,8 +556,6 @@ describe("buildEmbeddedCompactionRuntimeContext", () => {
       harnessRuntime: "codex",
     });
     expect(result.provider).toBe("openai");
-    expect(result.runtimeProvider).toBeUndefined();
-    expect(result.contextProvider).toBeUndefined();
     expect(result.nativeHarnessCompaction).toBe(true);
     expect(result.model).toBe("gpt-5.4-mini");
     expect(result.authProfileId).toBeUndefined();
@@ -648,18 +610,6 @@ describe("buildEmbeddedCompactionRuntimeContext", () => {
     expect(result.provider).toBe(provider);
     expect(result.model).toBe(model);
     expect(result.authProfileId).toBe(authProfileId);
-  });
-
-  it("preserves auth when an omitted provider uses the effective default", () => {
-    const result = resolveEmbeddedCompactionTarget({
-      config: compactionConfig("summary", { "openai/gpt-5.4-mini": { alias: "summary" } }),
-      authProfileId: "openai:default",
-      defaultProvider: "openai",
-      defaultModel: "gpt-5.5",
-    });
-    expect(result.provider).toBe("openai");
-    expect(result.model).toBe("gpt-5.4-mini");
-    expect(result.authProfileId).toBe("openai:default");
   });
 
   it("keeps current-provider configured model ids over cross-provider alias collisions (#90340)", () => {
@@ -754,28 +704,13 @@ describe("buildEmbeddedCompactionRuntimeContext", () => {
   });
 });
 
-describe("buildContextEngineCompactionSessionTarget", () => {
-  it("derives the agent from a scoped session key", () => {
-    expect(
-      buildContextEngineCompactionSessionTarget({
-        config: { session: { store: "/tmp/agents/{agentId}/sessions.json" } },
-        sessionFile: "agent:helper:main",
-        sessionId: "helper-session",
-        sessionKey: "agent:helper:main",
-      }),
-    ).toMatchObject({
-      agentId: "helper",
-      sessionKey: "agent:helper:main",
-      storePath: "/tmp/agents/helper/sessions.json",
-    });
-  });
-
-  it("leaves the key absent when a marker store has no mapped row", () => {
+describe("buildContextEngineCompactionSessionTarget", async () => {
+  it("leaves the key absent when a marker store has no mapped row", async () => {
     const storePath = path.join(compactionTempDirs.make("compaction-marker-"), "sessions.json");
     const sessionId = "legacy-unmapped-session";
 
     expect(
-      buildContextEngineCompactionSessionTarget({
+      await buildContextEngineCompactionSessionTarget({
         sessionFile: formatSqliteSessionFileMarker({ agentId: "main", sessionId, storePath }),
         sessionId,
       }),

@@ -71,7 +71,19 @@ function visibleDescriptors(
 export function listControlUiPluginDescriptors(
   scopes: readonly string[],
 ): WireControlUiDescriptor[] {
-  return visibleDescriptors(getPluginRegistryForContext()?.controlUiDescriptors ?? [], scopes)
+  const registry = getPluginRegistryForContext();
+  return visibleDescriptors(registry?.controlUiDescriptors ?? [], scopes)
+    .filter(
+      (entry) =>
+        entry.descriptor.surface !== "inline" ||
+        registry?.plugins.some(
+          (plugin) =>
+            plugin.id === entry.pluginId &&
+            plugin.enabled &&
+            plugin.status === "loaded" &&
+            isControlUiPluginAllowed(plugin),
+        ),
+    )
     .map(({ pluginId, pluginName, descriptor }) => ({
       pluginId,
       pluginName,
@@ -82,6 +94,7 @@ export function listControlUiPluginDescriptors(
       description: descriptor.description,
       placement: descriptor.placement,
       schema: descriptor.schema,
+      version: descriptor.version,
       requiredScopes: descriptor.requiredScopes,
       icon: descriptor.icon,
       path: descriptor.path,
@@ -102,7 +115,6 @@ export type ControlUiPluginTabAuthGrant = {
   profileId?: string;
 };
 
-/** Pure projection of tab descriptors visible to the presented scopes. */
 function projectControlUiPluginTabs(
   entries: Readonly<PluginRegistry["controlUiDescriptors"]>,
   scopes: readonly string[],
@@ -135,7 +147,6 @@ function projectControlUiPluginTabs(
   );
 }
 
-/** Lists active plugins' tab descriptors visible to the presented scopes. */
 export function listControlUiPluginTabs(
   scopes: readonly string[],
   opts: { requireGatewayAuthGrant?: boolean } = {},
@@ -170,7 +181,6 @@ export function listControlUiPluginTabs(
   });
 }
 
-/** Lists active plugins' trusted widget kinds visible to the presented scopes. */
 export function listControlUiPluginWidgetKinds(
   scopes: readonly string[],
 ): ControlUiPluginWidgetKind[] {

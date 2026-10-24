@@ -1,31 +1,21 @@
 // `openclaw plugins list`: builds registry reports and defers terminal-only formatting modules.
-import { getRuntimeConfig } from "../config/config.js";
-import type { PluginRecord } from "../plugins/registry.js";
+import { captureRuntimeConfigAsyncReader } from "../config/config.js";
 import { defaultRuntime, writeRuntimeJson, type RuntimeEnv } from "../runtime.js";
 import { quietPluginJsonLogger } from "./plugins-json-logger.js";
 
-/** Options accepted by the plugin list command. */
 export type PluginsListOptions = {
   json?: boolean;
   enabled?: boolean;
   verbose?: boolean;
 };
 
-function toPluginListJsonRecord(plugin: PluginRecord): Omit<PluginRecord, "agentHarnessIds"> {
-  // Snapshot listing never imports plugin runtimes, so it cannot observe harness registrations.
-  // Omit the field instead of serializing the registry-compatible empty placeholder.
-  const { agentHarnessIds: _agentHarnessIds, ...record } = plugin;
-  return record;
-}
-
-/** Render installed plugin discovery state as JSON, compact table, or verbose text. */
 export async function runPluginsListCommand(
   opts: PluginsListOptions,
   runtime: RuntimeEnv = defaultRuntime,
 ): Promise<void> {
   const { buildPluginRegistrySnapshotReport } = await import("../plugins/status-snapshot.js");
   // The inventory projector owns plugin metadata validation from the installed index.
-  const cfg = getRuntimeConfig({ skipPluginValidation: true });
+  const cfg = await captureRuntimeConfigAsyncReader({ skipPluginValidation: true })();
   const report = buildPluginRegistrySnapshotReport({
     config: cfg,
     ...(opts.json ? { logger: quietPluginJsonLogger } : {}),
@@ -40,7 +30,12 @@ export async function runPluginsListCommand(
         source: report.registrySource,
         diagnostics: report.registryDiagnostics,
       },
-      plugins: list.map(toPluginListJsonRecord),
+      plugins: list.map((plugin) => {
+        // Snapshot listing never imports plugin runtimes, so it cannot observe harness registrations.
+        // Omit the field instead of serializing the registry-compatible empty placeholder.
+        const { agentHarnessIds: _agentHarnessIds, ...record } = plugin;
+        return record;
+      }),
       diagnostics: report.diagnostics,
     };
     writeRuntimeJson(runtime, payload);

@@ -50,8 +50,10 @@ export function isMattermostSenderAllowed(params: {
   return match.allowed;
 }
 
-function mapMattermostChannelTypeToChatType(channelType?: string | null): ChatType {
-  const normalized = channelType?.trim().toUpperCase();
+export function resolveMattermostTrustedChatKind(params: {
+  channelType?: string | null;
+}): ChatType {
+  const normalized = params.channelType?.trim().toUpperCase();
   if (!normalized) {
     return "direct";
   }
@@ -64,46 +66,12 @@ function mapMattermostChannelTypeToChatType(channelType?: string | null): ChatTy
   return "channel";
 }
 
-export function resolveMattermostTrustedChatKind(params: {
-  channelType?: string | null;
-  fallback?: ChatType;
-}): ChatType {
-  const channelType = params.channelType?.trim();
-  return channelType
-    ? mapMattermostChannelTypeToChatType(channelType)
-    : (params.fallback ?? "direct");
-}
-
-type MattermostCommandAuthDecision = {
-  kind: "direct" | "group" | "channel";
-  chatType: "direct" | "group" | "channel";
-  channelName: string;
-  channelDisplay: string;
-  roomLabel: string;
-} & (
-  | {
-      ok: true;
-      commandAuthorized: boolean;
-      channelInfo: MattermostChannel;
-    }
-  | {
-      ok: false;
-      denyReason:
-        | "unknown-channel"
-        | "dm-disabled"
-        | "dm-pairing"
-        | "unauthorized"
-        | "channels-disabled"
-        | "channel-no-allowlist";
-      commandAuthorized: false;
-      channelInfo: MattermostChannel | null;
-    }
-);
-
-type MattermostCommandDenyReason = Extract<
-  MattermostCommandAuthDecision,
-  { ok: false }
->["denyReason"];
+type MattermostCommandDenyReason =
+  | "dm-disabled"
+  | "dm-pairing"
+  | "unauthorized"
+  | "channels-disabled"
+  | "channel-no-allowlist";
 
 export async function resolveMattermostMonitorInboundAccess(params: {
   account: ResolvedMattermostAccount;
@@ -139,7 +107,7 @@ export async function resolveMattermostMonitorInboundAccess(params: {
   const readStoreAllowFrom =
     params.readStoreAllowFrom ??
     (storeAllowFrom != null ? async () => [...storeAllowFrom] : undefined);
-  const ingress = await getMattermostRuntime().channel.inbound.ingress.resolveStable({
+  return await getMattermostRuntime().channel.inbound.ingress.resolveStable({
     channelId: "mattermost",
     accountId: account.accountId,
     identity: mattermostIngressIdentity,
@@ -173,7 +141,6 @@ export async function resolveMattermostMonitorInboundAccess(params: {
       directGroupAllowFrom: kind === "direct" ? "effective" : "none",
     },
   });
-  return ingress;
 }
 
 /** Live and recovered history share the same trigger-versus-visibility policy. */
@@ -240,7 +207,7 @@ export async function authorizeMattermostCommandInvocation(params: {
   readStoreAllowFrom?: () => Promise<Array<string | number>>;
   allowTextCommands: boolean;
   hasControlCommand: boolean;
-}): Promise<MattermostCommandAuthDecision> {
+}) {
   const {
     account,
     cfg,
@@ -256,19 +223,19 @@ export async function authorizeMattermostCommandInvocation(params: {
 
   if (!channelInfo?.type) {
     return {
-      ok: false,
-      denyReason: "unknown-channel",
-      commandAuthorized: false,
+      ok: false as const,
+      denyReason: "unknown-channel" as const,
+      commandAuthorized: false as const,
       channelInfo,
-      kind: "channel",
-      chatType: "channel",
+      kind: "channel" as const,
+      chatType: "channel" as const,
       channelName: "",
       channelDisplay: "",
       roomLabel: `#${channelId}`,
     };
   }
 
-  const kind = mapMattermostChannelTypeToChatType(channelInfo.type);
+  const kind = resolveMattermostTrustedChatKind({ channelType: channelInfo.type });
   const chatType = kind;
   const channelName = channelInfo.name ?? "";
   const channelDisplay = channelInfo.display_name ?? channelName;

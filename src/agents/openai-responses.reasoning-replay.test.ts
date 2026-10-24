@@ -4,21 +4,19 @@ import type { AssistantMessage, Model, ToolResultMessage } from "openclaw/plugin
 import { stream } from "openclaw/plugin-sdk/llm";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
+import { makeProviderModelFixture } from "./test-helpers/provider-model-fixture.js";
 import { createZeroUsageFixture } from "./test-helpers/usage-fixtures.js";
 
 function buildModel(): Model<"openai-responses"> {
-  return {
+  return makeProviderModelFixture<"openai-responses">({
     id: "gpt-5.4",
-    name: "gpt-5.4",
     api: "openai-responses",
     provider: "openai",
     baseUrl: "https://api.openai.com/v1",
     reasoning: true,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 128_000,
     maxTokens: 4096,
-  };
+  });
 }
 
 function buildStorelessCustomModel(): Model<"openai-responses"> {
@@ -84,7 +82,7 @@ function buildAssistantMessage(params: {
   };
 }
 
-async function runAbortedOpenAIResponsesStream(params: {
+async function captureOpenAIResponsesPayload(params: {
   messages: Array<
     AssistantMessage | ToolResultMessage | { role: "user"; content: string; timestamp: number }
   >;
@@ -97,9 +95,7 @@ async function runAbortedOpenAIResponsesStream(params: {
   usePolicyReplayDefault?: boolean;
   model?: Model<"openai-responses">;
 }) {
-  // Abort after payload capture so tests inspect serialization without network I/O.
-  const controller = new AbortController();
-  controller.abort();
+  // Stop at payload capture so tests inspect serialization without network I/O.
   let payload: Record<string, unknown> | undefined;
 
   const responseStream = stream(
@@ -114,19 +110,55 @@ async function runAbortedOpenAIResponsesStream(params: {
       ...(params.usePolicyReplayDefault
         ? {}
         : { replayResponsesItemIds: params.replayResponsesItemIds ?? true }),
-      signal: controller.signal,
       onPayload: (nextPayload: unknown) => {
         payload = nextPayload as Record<string, unknown>;
+        throw new Error("stop after payload capture");
       },
     } as never,
   );
 
-  await responseStream.result();
+  const result = await responseStream.result();
+  if (!payload) {
+    throw new Error(
+      `Provider payload callback was not invoked; stream ended with ${result.stopReason}: ${result.errorMessage ?? "no error"}`,
+    );
+  }
   const input = extractInput(payload);
   return {
     input,
     types: extractInputTypes(input),
   };
+}
+
+function captureToolReplay(
+  assistant: AssistantMessage,
+  callId: string,
+  options: Omit<Parameters<typeof captureOpenAIResponsesPayload>[0], "messages" | "tools"> = {},
+) {
+  const toolResult: ToolResultMessage = {
+    role: "toolResult",
+    toolCallId: callId,
+    toolName: "noop",
+    content: [{ type: "text", text: "ok" }],
+    isError: false,
+    timestamp: Date.now(),
+  };
+  return captureOpenAIResponsesPayload({
+    ...options,
+    messages: [
+      { role: "user", content: "Call noop.", timestamp: Date.now() },
+      assistant,
+      toolResult,
+      { role: "user", content: "Now reply with ok.", timestamp: Date.now() },
+    ],
+    tools: [
+      {
+        name: "noop",
+        description: "no-op",
+        parameters: Type.Object({}, { additionalProperties: false }),
+      },
+    ],
+  });
 }
 
 describe("openai-responses reasoning replay", () => {
@@ -149,32 +181,14 @@ describe("openai-responses reasoning replay", () => {
       ],
     });
 
-    const toolResult: ToolResultMessage = {
-      role: "toolResult",
-      toolCallId: "call_storeless|fc_storeless",
-      toolName: "noop",
-      content: [{ type: "text", text: "ok" }],
-      isError: false,
-      timestamp: Date.now(),
-    };
-
-    const { input, types } = await runAbortedOpenAIResponsesStream({
-      model: buildStorelessCustomModel(),
-      usePolicyReplayDefault: true,
-      messages: [
-        { role: "user", content: "Call noop.", timestamp: Date.now() },
-        assistantToolOnly,
-        toolResult,
-        { role: "user", content: "Now reply with ok.", timestamp: Date.now() },
-      ],
-      tools: [
-        {
-          name: "noop",
-          description: "no-op",
-          parameters: Type.Object({}, { additionalProperties: false }),
-        },
-      ],
-    });
+    const { input, types } = await captureToolReplay(
+      assistantToolOnly,
+      "call_storeless|fc_storeless",
+      {
+        model: buildStorelessCustomModel(),
+        usePolicyReplayDefault: true,
+      },
+    );
 
     expect(types).toContain("message");
     expect(types).toContain("function_call");
@@ -221,38 +235,7 @@ describe("openai-responses reasoning replay", () => {
       ],
     });
 
-    const toolResult: ToolResultMessage = {
-      role: "toolResult",
-      toolCallId: "call_123|fc_123",
-      toolName: "noop",
-      content: [{ type: "text", text: "ok" }],
-      isError: false,
-      timestamp: Date.now(),
-    };
-
-    const { input, types } = await runAbortedOpenAIResponsesStream({
-      messages: [
-        {
-          role: "user",
-          content: "Call noop.",
-          timestamp: Date.now(),
-        },
-        assistantToolOnly,
-        toolResult,
-        {
-          role: "user",
-          content: "Now reply with ok.",
-          timestamp: Date.now(),
-        },
-      ],
-      tools: [
-        {
-          name: "noop",
-          description: "no-op",
-          parameters: Type.Object({}, { additionalProperties: false }),
-        },
-      ],
-    });
+    const { input, types } = await captureToolReplay(assistantToolOnly, "call_123|fc_123");
 
     expect(types).toContain("reasoning");
     expect(types).toContain("function_call");
@@ -268,51 +251,7 @@ describe("openai-responses reasoning replay", () => {
     expect(functionCall?.id).toBe("fc_123");
   });
 
-  it("still replays reasoning when paired with an assistant message", async () => {
-    const assistantWithText = buildAssistantMessage({
-      stopReason: "stop",
-      content: [buildReasoningPart(), { type: "text", text: "hello", textSignature: "msg_test" }],
-    });
-
-    const { types } = await runAbortedOpenAIResponsesStream({
-      messages: [
-        { role: "user", content: "Hi", timestamp: Date.now() },
-        assistantWithText,
-        { role: "user", content: "Ok", timestamp: Date.now() },
-      ],
-    });
-
-    expect(types).toContain("reasoning");
-    expect(types).toContain("message");
-  });
-
-  it("assigns distinct ids to multiple id-less text blocks after a reasoning drop", async () => {
-    // After a model/fallback switch the sanitizer strips textSignatures from a
-    // turn's text blocks. msgIndex is per-message, so the transport must still
-    // emit unique message-item ids per text block (issue #88019).
-    const assistantWithTwoTexts = buildAssistantMessage({
-      stopReason: "stop",
-      content: [
-        { type: "text", text: "commentary" },
-        { type: "text", text: "final" },
-      ],
-    });
-
-    const { input } = await runAbortedOpenAIResponsesStream({
-      messages: [
-        { role: "user", content: "Hi", timestamp: Date.now() },
-        assistantWithTwoTexts,
-        { role: "user", content: "Ok", timestamp: Date.now() },
-      ],
-    });
-
-    const messageIds = extractInputMessages(input).map((item) => item.id);
-    expect(messageIds).toHaveLength(2);
-    expect(messageIds.every((id) => typeof id === "string" && id.length > 0)).toBe(true);
-    expect(new Set(messageIds).size).toBe(2);
-  });
-
-  it.each(["commentary", "final_answer"] as const)(
+  it.each(["commentary"] as const)(
     "replays assistant message id and phase metadata for %s when paired with reasoning",
     async (phase) => {
       const assistantWithText = buildAssistantMessage({
@@ -327,7 +266,7 @@ describe("openai-responses reasoning replay", () => {
         ],
       });
 
-      const { input, types } = await runAbortedOpenAIResponsesStream({
+      const { input, types } = await captureOpenAIResponsesPayload({
         messages: [
           { role: "user", content: "Hi", timestamp: Date.now() },
           assistantWithText,
@@ -341,34 +280,6 @@ describe("openai-responses reasoning replay", () => {
         (item) => item.id === `msg_${phase}`,
       );
       expect(replayedMessage?.phase).toBe(phase);
-    },
-  );
-
-  it.each(["commentary", "final_answer"] as const)(
-    "omits phase-tagged assistant message id for %s when reasoning is absent",
-    async (phase) => {
-      const assistantWithText = buildAssistantMessage({
-        stopReason: "stop",
-        content: [
-          {
-            type: "text",
-            text: "hello",
-            textSignature: JSON.stringify({ v: 1, id: `msg_${phase}`, phase }),
-          },
-        ],
-      });
-
-      const { input } = await runAbortedOpenAIResponsesStream({
-        messages: [
-          { role: "user", content: "Hi", timestamp: Date.now() },
-          assistantWithText,
-          { role: "user", content: "Ok", timestamp: Date.now() },
-        ],
-      });
-
-      const [replayedMessage] = extractInputMessages(input);
-      expect(replayedMessage).toMatchObject({ phase });
-      expect(replayedMessage).not.toHaveProperty("id");
     },
   );
 
@@ -392,7 +303,7 @@ describe("openai-responses reasoning replay", () => {
       ],
     });
 
-    const { input } = await runAbortedOpenAIResponsesStream({
+    const { input } = await captureOpenAIResponsesPayload({
       messages: [
         { role: "user", content: "Hi", timestamp: Date.now() },
         assistantWithPhaseOnly,

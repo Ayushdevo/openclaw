@@ -9,8 +9,10 @@ import {
 } from "@openclaw/normalization-core/number-coercion";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { sliceUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+import { formatChildRuntimeSpawnWarning } from "../../infra/child-runtime-viability.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { createLazyRuntimeModule } from "../../shared/lazy-runtime.js";
+import { watchChildMemory } from "../child-memory.js";
 import { setProcessTimeout } from "../process-deadline.js";
 import { createChildAdapter } from "./adapters/child.js";
 import { createPtyAdapter } from "./adapters/pty.js";
@@ -86,9 +88,9 @@ export function createProcessSupervisor(): ProcessSupervisor & {
   const ownedRuns = new Set<OwnedRun>();
   const scopeCleanupOwners = new Map<string, Set<ScopeCleanupOwner>>();
   const startingScopes = new Map<string, StartingScope>();
-  let shuttingDown = false;
   let shutdownPromise: Promise<void> | null = null;
   let cleanupFailure: { error: unknown } | undefined;
+  let staleRuntimeReported = false;
 
   const cancel = (runId: string, reason: TerminationReason = "manual-cancel") => {
     for (const current of ownedRuns) {
@@ -235,8 +237,29 @@ export function createProcessSupervisor(): ProcessSupervisor & {
       throw new Error("spawn argv cannot be empty");
     }
     const resolvedArgs = input.mode === "child" ? input.resolveArgs?.() : undefined;
+    const argv =
+      input.mode === "anchored-shell"
+        ? []
+        : resolvedArgs
+          ? [...input.argv, ...resolvedArgs]
+          : input.argv;
+    if (
+      argv.some((argument) => argument.includes("\0")) ||
+      (input.mode === "child" && input.argv0?.includes("\0")) ||
+      (input.mode === "anchored-shell" && input.command.includes("\0"))
+    ) {
+      throw new Error(
+        "Execution command and arguments must not contain NUL bytes. Remove them and retry.",
+      );
+    }
     if (owner.terminationReason) {
       return settleConstructionResult(owner.terminationReason);
+    }
+    if (input.prepareSpawn) {
+      await input.prepareSpawn();
+      if (owner.terminationReason) {
+        return settleConstructionResult(owner.terminationReason);
+      }
     }
     input.assertCurrent?.();
     input.beforeSpawn?.();
@@ -263,6 +286,7 @@ export function createProcessSupervisor(): ProcessSupervisor & {
       outputDetached = true;
     };
     let forceKillTimer: NodeJS.Timeout | null = null;
+    let stopMemoryWatch: (() => void) | undefined;
     let cancelRequested = false;
     const captureOutput = input.captureOutput !== false;
     const maxCapturedOutputChars = resolveIntegerOption(
@@ -366,6 +390,7 @@ export function createProcessSupervisor(): ProcessSupervisor & {
       const construction = {
         assertCurrent: input.assertCurrent,
         beforeSpawn: input.beforeSpawn,
+        initiateSpawn: input.initiateSpawn,
         cwd: input.cwd,
         env: input.env,
         abortSignal: constructionAbort.signal,
@@ -375,8 +400,8 @@ export function createProcessSupervisor(): ProcessSupervisor & {
         input.mode === "pty"
           ? createPtyAdapter({
               ...construction,
-              shell: expectDefined(input.argv[0], "spawn executable"),
-              args: input.argv.slice(1),
+              shell: expectDefined(argv[0], "spawn executable"),
+              args: argv.slice(1),
             }).then((adapter) => ({ adapter, ready: Promise.resolve() }))
           : input.mode === "anchored-shell"
             ? createChildAdapter({
@@ -385,12 +410,15 @@ export function createProcessSupervisor(): ProcessSupervisor & {
               })
             : createChildAdapter({
                 ...construction,
-                ...(requireProcessTree && !external ? { ownProcessTree: true as const } : {}),
-                argv: resolvedArgs ? [...input.argv, ...resolvedArgs] : input.argv,
+                ...((requireProcessTree || input.memoryLimitBytes !== undefined) && !external
+                  ? { ownProcessTree: true as const }
+                  : {}),
+                argv,
                 argv0: input.argv0,
                 exactEnv: input.exactEnv,
                 windowsVerbatimArguments: input.windowsVerbatimArguments,
                 input: input.input,
+                prepareInput: input.prepareInput,
                 stdinMode: input.stdinMode,
                 secretInput: input.secretInput,
               });
@@ -426,6 +454,7 @@ export function createProcessSupervisor(): ProcessSupervisor & {
         )
         .finally(() => {
           cleanupSettled = true;
+          stopMemoryWatch?.();
           if (forceKillTimer) {
             clearTimeout(forceKillTimer);
             forceKillTimer = null;
@@ -535,7 +564,9 @@ export function createProcessSupervisor(): ProcessSupervisor & {
       cancelAdapter = (reason: TerminationReason) => {
         if (
           cleanupSettled ||
-          (cancelRequested && (requireProcessTree || !(resultSettled && forceKillTimer)))
+          (cancelRequested &&
+            reason !== "memory-limit" &&
+            (requireProcessTree || !(resultSettled && forceKillTimer)))
         ) {
           return;
         }
@@ -554,8 +585,8 @@ export function createProcessSupervisor(): ProcessSupervisor & {
         // with asynchronous taskkill, so waiting the cleanup grace only delays an
         // already-expired deadline before the same forced tree termination.
         if (
-          process.platform === "win32" &&
-          (reason === "overall-timeout" || reason === "no-output-timeout")
+          reason === "memory-limit" ||
+          (process.platform === "win32" && isTimeoutReason(reason))
         ) {
           adapter.kill("SIGKILL");
           return;
@@ -569,31 +600,48 @@ export function createProcessSupervisor(): ProcessSupervisor & {
         forceKillTimer.unref?.();
       };
 
-      const waitOutcome = Promise.allSettled([
-        (async (): Promise<RunExit> => {
-          const result = await adapter.wait();
-          const terminalReason = forcedReason;
-          settleResult(adapter);
+      if (!external && !cleanupSettled) {
+        stopMemoryWatch = watchChildMemory({
+          pid: adapter.memoryRootPid ?? adapter.pid,
+          limitBytes: input.memoryLimitBytes,
+          onLimit: () => requestCancel("memory-limit"),
+          onDiagnostic: withOutputFence((chunk: string) => {
+            if (captureOutput) {
+              captured.stderr = appendCapturedOutput(
+                captured.stderr,
+                chunk,
+                "stderr",
+                maxCapturedOutputChars,
+              );
+            }
+            input.onStderr?.(chunk);
+          }, false),
+        });
+      }
 
-          const reason: TerminationReason =
-            terminalReason ?? (result.signal != null ? ("signal" as const) : ("exit" as const));
-          const exit: RunExit = {
-            reason,
-            exitCode: result.code,
-            exitSignal: result.signal,
-            oomScoreWrapperSelected: adapter.oomScoreWrapperSelected === true,
-            durationMs: Date.now() - startedAtMs,
-            ...captured,
-            timedOut: isTimeoutReason(reason),
-            noOutputTimedOut: terminalReason === "no-output-timeout",
-          };
-          return exit;
-        })().finally(() => {
-          if (!resultSettled) {
-            settleResult(adapter);
-          }
-        }),
-      ]);
+      const waitPromise = (async (): Promise<RunExit> => {
+        const result = await adapter.wait();
+        const terminalReason = forcedReason;
+        settleResult(adapter);
+
+        const reason: TerminationReason =
+          terminalReason ?? (result.signal != null ? ("signal" as const) : ("exit" as const));
+        return {
+          reason,
+          exitCode: result.code,
+          exitSignal: result.signal,
+          oomScoreWrapperSelected: adapter.oomScoreWrapperSelected === true,
+          durationMs: Date.now() - startedAtMs,
+          ...captured,
+          timedOut: isTimeoutReason(reason),
+          noOutputTimedOut: terminalReason === "no-output-timeout",
+        };
+      })().finally(() => {
+        if (!resultSettled) {
+          settleResult(adapter);
+        }
+      });
+      void waitPromise.catch(() => undefined);
 
       const managedRun: ManagedRun = {
         activity: Object.freeze({
@@ -613,14 +661,8 @@ export function createProcessSupervisor(): ProcessSupervisor & {
         pid: adapter.pid,
         startedAtMs,
         stdin: adapter.stdin,
-        wait: async () => {
-          const [outcome] = await waitOutcome;
-          if (outcome.status === "rejected") {
-            throw outcome.reason;
-          }
-          return outcome.value;
-        },
-        ...(adapter.waitForExtinction && { waitForExtinction: () => cleanup.promise }),
+        wait: () => waitPromise,
+        waitForExtinction: () => cleanup.promise,
         cancel: (reason = "manual-cancel") => {
           requestCancel(reason);
         },
@@ -633,14 +675,22 @@ export function createProcessSupervisor(): ProcessSupervisor & {
       return managedRun;
     } catch (err) {
       settleResult();
-      const { warnProcessSupervisorSpawnFailure } = await loadSupervisorLogRuntime();
-      warnProcessSupervisorSpawnFailure(`spawn failed: runId=${runId} reason=${String(err)}`);
+      const runtimeWarning = formatChildRuntimeSpawnWarning(err);
+      if (runtimeWarning && err instanceof Error) {
+        // Preserve errno/path for callers while returning the operator's recovery action.
+        err.message = runtimeWarning;
+      }
+      if (!runtimeWarning || !staleRuntimeReported) {
+        staleRuntimeReported ||= runtimeWarning !== undefined;
+        const { warnProcessSupervisorSpawnFailure } = await loadSupervisorLogRuntime();
+        warnProcessSupervisorSpawnFailure(`spawn failed: runId=${runId} reason=${String(err)}`);
+      }
       throw err;
     }
   };
 
   const spawn = (input: SpawnInput): Promise<ManagedRun> => {
-    if (shuttingDown) {
+    if (shutdownPromise) {
       return Promise.reject(new Error("process supervisor is shut down"));
     }
     const scopeKey = normalizeOptionalString(input.scopeKey);
@@ -703,7 +753,6 @@ export function createProcessSupervisor(): ProcessSupervisor & {
 
   const shutdown = (): Promise<void> => {
     // Publish the admission fence before cancellation can invoke owner callbacks.
-    shuttingDown = true;
     return (shutdownPromise ??= Promise.resolve().then(async () => {
       while (ownedRuns.size) {
         for (const owner of ownedRuns) {

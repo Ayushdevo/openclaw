@@ -38,6 +38,38 @@ const OPENCLAW_DEVICE_PLACEMENT: NonNullable<GatewayAgentRuntime["devicePlacemen
   consumesWorkerSlot: true,
 };
 
+const FILE_SECRETS: NonNullable<OpenClawConfig["secrets"]> = {
+  providers: {
+    "mounted-json": {
+      source: "file",
+      path: "/tmp/openclaw-test-secrets.json",
+      mode: "json",
+    },
+  },
+};
+
+const EXPECTED_IMPLICIT_CODEX_RUNTIME: GatewayAgentRuntime = {
+  id: "codex",
+  cloudPlacementSupported: false,
+  devicePlacementSupported: false,
+  source: "implicit",
+};
+
+const EXPECTED_IMPLICIT_OPENCLAW_RUNTIME: GatewayAgentRuntime = {
+  id: "openclaw",
+  cloudPlacementSupported: true,
+  cloudPlacementExecutionMode: "worker-turn",
+  devicePlacement: OPENCLAW_DEVICE_PLACEMENT,
+  devicePlacementSupported: true,
+  source: "implicit",
+};
+
+const EXPECTED_DEMO_IDENTITY = {
+  id: "demo-model",
+  name: "Demo Model",
+  provider: "demo-provider",
+};
+
 const modelPluginMetadataSnapshot = await vi.hoisted(async () => {
   const { createModelPluginMetadataSnapshot } = await import("./models-metadata.test-support.js");
   return createModelPluginMetadataSnapshot();
@@ -316,10 +348,10 @@ describe("models.list", () => {
       agentId: "writer",
       runtimeConfig: {
         agents: {
-          list: [
-            { id: "main", default: true },
-            { id: "writer", model: "test/writer-model" },
-          ],
+          entries: {
+            main: {},
+            writer: { model: "test/writer-model" },
+          },
         },
       },
       loadGatewayModelCatalog,
@@ -336,7 +368,7 @@ describe("models.list", () => {
     const runtimeConfig = {
       agents: {
         ownership: "explicit" as const,
-        list: [{ id: "ops" }, { id: "research" }],
+        entries: { ops: {}, research: {} },
       },
     };
     const missing = requestModelsList({
@@ -712,15 +744,7 @@ describe("models.list", () => {
           },
         },
       },
-      secrets: {
-        providers: {
-          "mounted-json": {
-            source: "file",
-            path: "/tmp/openclaw-test-secrets.json",
-            mode: "json",
-          },
-        },
-      },
+      secrets: FILE_SECRETS,
       models: {
         providers: {
           vllm: sourceProvider,
@@ -796,15 +820,7 @@ describe("models.list", () => {
 
   it("omits unknown provider-config availability", async () => {
     const config = {
-      secrets: {
-        providers: {
-          "mounted-json": {
-            source: "file",
-            path: "/tmp/openclaw-test-secrets.json",
-            mode: "json",
-          },
-        },
-      },
+      secrets: FILE_SECRETS,
       models: {
         providers: {
           vllm: {
@@ -885,14 +901,7 @@ describe("models.list", () => {
               id: "gpt-test",
               name: "GPT Test",
               provider: "openai",
-              agentRuntime: {
-                id: "openclaw",
-                cloudPlacementSupported: true,
-                cloudPlacementExecutionMode: "worker-turn",
-                devicePlacement: OPENCLAW_DEVICE_PLACEMENT,
-                devicePlacementSupported: true,
-                source: "implicit",
-              },
+              agentRuntime: EXPECTED_IMPLICIT_OPENCLAW_RUNTIME,
               available: false,
               unavailableReason: "missing-auth",
               tags: ["default"],
@@ -939,14 +948,7 @@ describe("models.list", () => {
               id: "gpt-test",
               name: "GPT Test",
               provider: "openai",
-              agentRuntime: {
-                id: "openclaw",
-                cloudPlacementSupported: true,
-                cloudPlacementExecutionMode: "worker-turn",
-                devicePlacement: OPENCLAW_DEVICE_PLACEMENT,
-                devicePlacementSupported: true,
-                source: "implicit",
-              },
+              agentRuntime: EXPECTED_IMPLICIT_OPENCLAW_RUNTIME,
               available: false,
               unavailableReason: "missing-auth",
               tags: ["default"],
@@ -1053,15 +1055,7 @@ describe("models.list", () => {
     const catalog = createDeferred<never>();
     const loadGatewayModelCatalog = vi.fn(() => catalog.promise);
     const runtimeConfig = {
-      secrets: {
-        providers: {
-          "mounted-json": {
-            source: "file",
-            path: "/tmp/openclaw-test-secrets.json",
-            mode: "json",
-          },
-        },
-      },
+      secrets: FILE_SECRETS,
       models: {
         providers: {
           vllm: {
@@ -1118,7 +1112,6 @@ describe("models.list", () => {
         expect(respond).not.toHaveBeenCalled();
 
         catalog.resolve([{ id: "gpt-test", name: "GPT Test", provider: "openai" }]);
-        await vi.runAllTimersAsync();
         await request;
 
         expect(respond).toHaveBeenCalledWith(
@@ -1129,12 +1122,7 @@ describe("models.list", () => {
                 id: "gpt-test",
                 name: "GPT Test",
                 provider: "openai",
-                agentRuntime: {
-                  id: "codex",
-                  cloudPlacementSupported: false,
-                  devicePlacementSupported: false,
-                  source: "implicit",
-                },
+                agentRuntime: EXPECTED_IMPLICIT_CODEX_RUNTIME,
                 available: false,
               },
             ],
@@ -1197,24 +1185,14 @@ describe("models.list", () => {
               id: "gpt-5.4",
               name: "GPT-5.4 Codex",
               provider: "openai",
-              agentRuntime: {
-                id: "codex",
-                cloudPlacementSupported: false,
-                devicePlacementSupported: false,
-                source: "implicit",
-              },
+              agentRuntime: EXPECTED_IMPLICIT_CODEX_RUNTIME,
               available: true,
             },
             {
               id: "gpt-codex-test",
               name: "GPT Codex Test",
               provider: "openai",
-              agentRuntime: {
-                id: "codex",
-                cloudPlacementSupported: false,
-                devicePlacementSupported: false,
-                source: "implicit",
-              },
+              agentRuntime: EXPECTED_IMPLICIT_CODEX_RUNTIME,
               available: true,
             },
             { id: "llama-local", name: "Llama Local", provider: "vllm", available: true },
@@ -1249,24 +1227,14 @@ describe("models.list", () => {
               id: "gpt-5.4",
               name: "GPT-5.4 Codex",
               provider: "openai",
-              agentRuntime: {
-                id: "codex",
-                cloudPlacementSupported: false,
-                devicePlacementSupported: false,
-                source: "implicit",
-              },
+              agentRuntime: EXPECTED_IMPLICIT_CODEX_RUNTIME,
               available: true,
             },
             {
               id: "gpt-codex-test",
               name: "GPT Codex Test",
               provider: "openai",
-              agentRuntime: {
-                id: "codex",
-                cloudPlacementSupported: false,
-                devicePlacementSupported: false,
-                source: "implicit",
-              },
+              agentRuntime: EXPECTED_IMPLICIT_CODEX_RUNTIME,
               available: true,
             },
             { id: "llama-local", name: "Llama Local", provider: "vllm", available: true },
@@ -1384,12 +1352,7 @@ describe("models.list", () => {
                 id: "gpt-5.4",
                 name: "GPT-5.4 Codex",
                 provider: "openai",
-                agentRuntime: {
-                  id: "codex",
-                  cloudPlacementSupported: false,
-                  devicePlacementSupported: false,
-                  source: "implicit",
-                },
+                agentRuntime: EXPECTED_IMPLICIT_CODEX_RUNTIME,
                 available: true,
               },
             ],
@@ -1456,9 +1419,7 @@ describe("models.list", () => {
                     },
                     available,
                     tags: ["configured"],
-                    ...(!authenticated && catalogComplete
-                      ? { unavailableReason: "missing-auth" }
-                      : {}),
+                    ...(authenticated ? {} : { unavailableReason: "missing-auth" }),
                   },
                 ],
               },
@@ -1475,15 +1436,7 @@ describe("models.list", () => {
   it("keeps file SecretRef provider availability unknown when read-only auth cannot resolve it", async () => {
     const catalog = [{ id: "llama-secure", name: "Llama Secure", provider: "vllm" }];
     const cfg = {
-      secrets: {
-        providers: {
-          "mounted-json": {
-            source: "file",
-            path: "/tmp/openclaw-test-secrets.json",
-            mode: "json",
-          },
-        },
-      },
+      secrets: FILE_SECRETS,
       agents: {
         defaults: {
           models: {
@@ -1568,15 +1521,7 @@ describe("models.list", () => {
     "$malformed-template",
   ])("uses an exact hydrated runtime snapshot with opaque key %s", async (apiKey) => {
     const sourceConfig: OpenClawConfig = {
-      secrets: {
-        providers: {
-          "mounted-json": {
-            source: "file",
-            path: "/tmp/openclaw-test-secrets.json",
-            mode: "json",
-          },
-        },
-      },
+      secrets: FILE_SECRETS,
       models: {
         providers: {
           vllm: {
@@ -1653,14 +1598,7 @@ describe("models.list", () => {
       expect(respond).toHaveBeenCalledWith(
         true,
         {
-          models: [
-            {
-              id: "demo-model",
-              name: "Demo Model",
-              provider: "demo-provider",
-              available: false,
-            },
-          ],
+          models: [{ ...EXPECTED_DEMO_IDENTITY, available: false }],
         },
         undefined,
       );
@@ -1698,14 +1636,7 @@ describe("models.list", () => {
         expect(respond).toHaveBeenCalledWith(
           true,
           {
-            models: [
-              {
-                id: "demo-model",
-                name: "Demo Model",
-                provider: "demo-provider",
-                available: false,
-              },
-            ],
+            models: [{ ...EXPECTED_DEMO_IDENTITY, available: false }],
           },
           undefined,
         );
@@ -1750,14 +1681,7 @@ describe("models.list", () => {
         expect(respond).toHaveBeenCalledWith(
           true,
           {
-            models: [
-              {
-                id: "demo-model",
-                name: "Demo Model",
-                provider: "demo-provider",
-                available: true,
-              },
-            ],
+            models: [{ ...EXPECTED_DEMO_IDENTITY, available: true }],
           },
           undefined,
         );
@@ -1786,15 +1710,7 @@ describe("models.list", () => {
       const { request, respond } = requestModelsList({
         view: "all",
         runtimeConfig: {
-          secrets: {
-            providers: {
-              "mounted-json": {
-                source: "file",
-                path: "/tmp/openclaw-test-secrets.json",
-                mode: "json",
-              },
-            },
-          },
+          secrets: FILE_SECRETS,
         } as OpenClawConfig,
         loadGatewayModelCatalog: catalogLoader([
           { id: "demo-model", name: "Demo Model", provider: "demo-provider" },
@@ -1805,14 +1721,7 @@ describe("models.list", () => {
       expect(respond).toHaveBeenCalledWith(
         true,
         {
-          models: [
-            {
-              id: "demo-model",
-              name: "Demo Model",
-              provider: "demo-provider",
-              available: false,
-            },
-          ],
+          models: [{ ...EXPECTED_DEMO_IDENTITY, available: false }],
         },
         undefined,
       );
@@ -1932,15 +1841,7 @@ describe("models.list", () => {
         const { request, respond } = requestModelsList({
           view: "all",
           runtimeConfig: {
-            secrets: {
-              providers: {
-                "mounted-json": {
-                  source: "file",
-                  path: "/tmp/openclaw-test-secrets.json",
-                  mode: "json",
-                },
-              },
-            },
+            secrets: FILE_SECRETS,
           } as OpenClawConfig,
           loadGatewayModelCatalog: catalogLoader([
             { id: "demo-model", name: "Demo Model", provider: "demo-provider" },
@@ -1951,14 +1852,7 @@ describe("models.list", () => {
         expect(respond).toHaveBeenCalledWith(
           true,
           {
-            models: [
-              {
-                id: "demo-model",
-                name: "Demo Model",
-                provider: "demo-provider",
-                available: true,
-              },
-            ],
+            models: [{ ...EXPECTED_DEMO_IDENTITY, available: true }],
           },
           undefined,
         );
@@ -1979,15 +1873,7 @@ describe("models.list", () => {
     {
       name: "unhydrated file SecretRef",
       apiKey: { source: "file", provider: "mounted-json", id: "/providers/vllm/apiKey" },
-      secrets: {
-        providers: {
-          "mounted-json": {
-            source: "file",
-            path: "/tmp/openclaw-test-secrets.json",
-            mode: "json",
-          },
-        },
-      },
+      secrets: FILE_SECRETS,
       available: false,
       unavailableReason: undefined,
     },
@@ -2164,13 +2050,9 @@ describe("models.list", () => {
           defaults: {
             models: { "openai/gpt-5.6-luna": { params: { fastMode: modelDefault } } },
           },
-          list: [
-            {
-              id: "main",
-              default: true,
-              ...(agentDefault === undefined ? {} : { fastModeDefault: agentDefault }),
-            },
-          ],
+          entries: {
+            main: agentDefault === undefined ? {} : { fastModeDefault: agentDefault },
+          },
         },
       },
       loadGatewayModelCatalog: catalogLoader([
@@ -2183,7 +2065,7 @@ describe("models.list", () => {
     expect(payload.models[0]).toMatchObject({ effectiveFastMode: expected });
   });
 
-  it("does not reinterpret context tokens or expose model input metadata", async () => {
+  it("projects the effective context budget without exposing model input metadata", async () => {
     const { request, respond } = requestModelsList({
       view: "all",
       loadGatewayModelCatalog: catalogLoader([
@@ -2210,6 +2092,7 @@ describe("models.list", () => {
             available: false,
             unavailableReason: "missing-auth",
             contextWindow: 128_000,
+            contextTokens: 96_000,
           },
         ],
       },
