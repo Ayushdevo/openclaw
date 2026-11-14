@@ -7,43 +7,40 @@ permissions:
 jobs:
   focused-proof:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 4c4a62241aa04514abfccaa07f656cf1d4add2ab
+          ref: 007066d9291d70ef821c900cc011705f5d47552c
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: 24.19.0
+          node-version: 24.22.1
+          package-manager-cache: false
       - name: Install pinned dependencies without repository lifecycle scripts
         run: |
           corepack enable
           pnpm install --frozen-lockfile --ignore-scripts
-      - name: Verify repaired public action and real callback registry
+      - name: Verify component edits and ordinary messaging consumers
         run: |
           mkdir -p "$RUNNER_TEMP/discord-proof-home"
-          env -i HOME="$RUNNER_TEMP/discord-proof-home" PATH="$PATH" CI=1 NO_COLOR=1 pnpm test extensions/discord/src/actions/handle-action.test.ts extensions/discord/src/actions/runtime.test.ts --maxWorkers=1
-      - name: Demonstrate original callback-identity defect
+          env -i HOME="$RUNNER_TEMP/discord-proof-home" PATH="$PATH" CI=1 NO_COLOR=1 pnpm test extensions/discord/src/actions/handle-action.test.ts extensions/discord/src/actions/runtime.test.ts extensions/discord/src/actions/message-bodies.test.ts extensions/discord/src/channel-actions.test.ts --maxWorkers=1
+      - name: Check touched formatting
+        run: pnpm format:check extensions/discord/src/actions/handle-action.ts extensions/discord/src/actions/message-bodies.test.ts extensions/discord/src/actions/runtime.messaging.messages.ts extensions/discord/src/actions/runtime.test.ts extensions/discord/src/channel-actions.test.ts extensions/discord/src/channel-actions.ts
+      - name: Lint touched files
+        run: node scripts/run-oxlint.mjs --tsconfig extensions/tsconfig.json extensions/discord/src/actions/handle-action.ts extensions/discord/src/actions/message-bodies.test.ts extensions/discord/src/actions/runtime.messaging.messages.ts extensions/discord/src/actions/runtime.test.ts extensions/discord/src/channel-actions.test.ts extensions/discord/src/channel-actions.ts
+      - name: Typecheck Discord production code
+        run: node scripts/run-tsgo.mjs -p extensions/discord/tsconfig.json --noEmit
+      - name: Demonstrate original missing-components defect on current main
         shell: bash
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path("extensions/discord/src/actions/handle-action.ts")
-          text = path.read_text()
-          for old, new in [
-              ("__sessionKey: ctx.sessionKey,", '__sessionKey: readStringParam(params, "__sessionKey"),'),
-              ("__agentId: ctx.agentId,", '__agentId: readStringParam(params, "__agentId"),'),
-          ]:
-              assert text.count(old) == 1, old
-              text = text.replace(old, new)
-          path.write_text(text)
-          PY
+          git fetch --depth=1 https://github.com/openclaw/openclaw.git 0daab29f77cab03cf551c60761138585dd0b49d9
+          git restore --source=FETCH_HEAD -- extensions/discord/src/actions/handle-action.ts extensions/discord/src/actions/runtime.messaging.messages.ts extensions/discord/src/channel-actions.ts
           set +e
           env -i HOME="$RUNNER_TEMP/discord-proof-home" PATH="$PATH" CI=1 NO_COLOR=1 pnpm test extensions/discord/src/actions/runtime.test.ts --maxWorkers=1 -t "edits Components V2 through the public action" > "$RUNNER_TEMP/discord-negative-control.log" 2>&1
           status=$?
           set -e
           cat "$RUNNER_TEMP/discord-negative-control.log"
           test "$status" -ne 0
-          grep -q '"agentId": "research"' "$RUNNER_TEMP/discord-negative-control.log"
-          echo "Original source fails the same public-action callback registry assertion."
+          grep -iEq 'content.*required|required.*content' "$RUNNER_TEMP/discord-negative-control.log"
+          echo "Current main fails the public component-only edit at its required-content guard."
