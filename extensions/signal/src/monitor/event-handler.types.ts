@@ -9,7 +9,7 @@ import type { HistoryEntry } from "openclaw/plugin-sdk/reply-history";
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 
-export type SignalEnvelope = {
+type SignalEnvelope = {
   sourceNumber?: string | null;
   sourceUuid?: string | null;
   sourceName?: string | null;
@@ -60,7 +60,7 @@ export type SignalReactionMessage = {
   } | null;
 };
 
-export type SignalAttachment = {
+type SignalAttachment = {
   id?: string | null;
   contentType?: string | null;
   filename?: string | null;

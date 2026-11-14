@@ -2,18 +2,23 @@
 // the captured incarnation against the fake committed rows, as the real owner's
 // publication-updated facts do, without SQLite or worker threads.
 import { ok, type Result } from "@openclaw/normalization-core/result";
-import type { SessionEntry } from "../config/sessions/types.js";
+import type { InternalSessionEntry } from "../config/sessions/types.js";
 
-export type FakeSessionRow = Partial<SessionEntry> & { sessionId: string; updatedAt: number };
+export type FakeSessionRow = Partial<InternalSessionEntry> & {
+  sessionId: string;
+  updatedAt: number;
+};
 
 export const fakeSessionOwner = {
   rows: new Map<string, FakeSessionRow>(),
   pendingKeys: new Set<string>(),
+  publications: new Map<string, Promise<void>>(),
   workerReads: [] as string[],
   activeLeases: 0,
   reset() {
     this.rows.clear();
     this.pendingKeys.clear();
+    this.publications.clear();
     this.workerReads.length = 0;
     this.activeLeases = 0;
   },
@@ -54,6 +59,12 @@ export const fakeSessionGenerationModule = {
           throw new Error("Session delivery generation is unavailable");
         }
         assertGeneration(input);
+      },
+      prepareRead: () => {
+        if (!active) {
+          throw new Error("Session delivery generation is unavailable");
+        }
+        return fakeSessionOwner.publications.get(input.sessionKey);
       },
       release: () => {
         if (active) {

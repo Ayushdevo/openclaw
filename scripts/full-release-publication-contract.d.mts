@@ -1,4 +1,6 @@
 import type { ClawHubPublicationState } from "./lib/clawhub-publication-state.mjs";
+import type { ClawHubPackageObservation } from "./lib/plugin-clawhub-release.ts";
+import type { observeNpmPackage } from "./lib/plugin-npm-release.ts";
 export const FULL_RELEASE_SOURCE_ADMISSION_CONTRACT: "1";
 export const FULL_RELEASE_PUBLICATION_ADMISSION_CONTRACT: "1";
 export type ValidationPurpose =
@@ -15,6 +17,10 @@ export interface PublicationSelection {
   windowsNodeTag?: string;
   windowsNodeInstallerDigests?: Record<string, string>;
 }
+export function validatePublicationVersionSelection(
+  version: string,
+  selection: PublicationSelection,
+): NonNullable<ReturnType<typeof import("./lib/release-version.mjs").parseReleaseVersion>>;
 export interface PublicationIntent {
   validationPurpose: ValidationPurpose;
   publicationSelection: PublicationSelection | null;
@@ -100,12 +106,7 @@ export type PublicationNpmObservation = {
 } & (
   | {
       outcome: "observed";
-      state: {
-        packageExists: boolean;
-        hasVersionHistory: boolean;
-        selectedVersionExists: boolean;
-        latestVersion: string | null;
-      };
+      state: Awaited<ReturnType<typeof observeNpmPackage>>;
     }
   | { outcome: "unavailable"; error: string }
 );
@@ -113,18 +114,8 @@ export interface PublicationClawHubObservation {
   name: string;
   version: string;
   observedAt: string;
-  state: {
-    packageExists: boolean;
-    alreadyPublished: boolean;
-    publication?: ClawHubPublicationState;
-    hasTrustedPublisher: boolean;
-    trustedPublisher: {
-      provider: string | null;
-      repository: string | null;
-      workflowFilename: string | null;
-      environment: string | null;
-    } | null;
-  };
+  state: Omit<ClawHubPackageObservation, "publication"> &
+    Partial<Pick<ClawHubPackageObservation, "publication">>;
 }
 export interface PublicationPlanningSummary {
   all: Array<{
@@ -208,6 +199,9 @@ export function createPublicationAdmission(
   observations: PublicationObservations,
   artifact: PublicationObservationArtifact,
   admittedAt: string,
+  options?: {
+    workflowPath?: string;
+  },
 ): PublicationAdmission;
 export function validatePublicationAdmissionBinding(
   record: Record<string, unknown>,

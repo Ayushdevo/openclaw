@@ -18,8 +18,10 @@ export type PackageActivationOptions = {
 /** The orchestrator owns schema safety and service verification before confirming or restoring. */
 export type PackageUpdateTransaction = {
   backupRoot: string;
-  /** Migration snapshots must outlive the journal's package-only retirement. */
+  /** Capture root outside journal retirement; cleared when snapshots must be retained. */
   databaseBackupRoot?: string;
+  /** Drops server-side captures; retirement calls it before removing the snapshot root. */
+  discardDatabaseCaptures?: () => Promise<void>;
   assertRollbackSafe?: () => Promise<void>;
   rollback: (
     assertCurrent: () => void,

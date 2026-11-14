@@ -52,7 +52,28 @@ function names(value, label, allowEmpty = false) {
 // This is data validation, never candidate-code evaluation. P reads this document
 // from immutable Q, seals the selected coverage, then verifies the same literals.
 export function validateQualificationCoverage(value) {
-  object(value, ["schema", "profile", "children", "requiredParentJobs"], "qualification coverage");
+  object(
+    value,
+    [
+      "schema",
+      "profile",
+      "children",
+      "requiredParentJobs",
+      ...(value?.exemptions === undefined ? [] : ["exemptions"]),
+    ],
+    "qualification coverage",
+  );
+  if (
+    value.exemptions !== undefined &&
+    (!Array.isArray(value.exemptions) ||
+      value.exemptions.length !== 1 ||
+      value.exemptions[0]?.childRole !== "productPerformance" ||
+      value.exemptions[0]?.disposition !== "waived-not-run" ||
+      !Array.isArray(value.children) ||
+      value.children.some((child) => child.key === "productPerformance"))
+  ) {
+    throw new Error("Invalid explicit qualification exemption");
+  }
   if (value.schema !== SCHEMA || !["beta", "stable", "full"].includes(value.profile)) {
     throw new Error("Unsupported qualification coverage schema or profile");
   }
@@ -91,6 +112,7 @@ export function validateQualificationCoverage(value) {
     profile: value.profile,
     children,
     requiredParentJobs: names(value.requiredParentJobs, "qualification requiredParentJobs"),
+    ...(value.exemptions === undefined ? {} : { exemptions: value.exemptions }),
   };
   if (Buffer.byteLength(canonicalAsciiJson(coverage)) > 32 * 1024) {
     throw new Error("Qualification coverage exceeds 32 KiB");
@@ -133,7 +155,6 @@ export function resolveQualificationCoverage(policy, inputs) {
   for (const key of [
     "live_suite_filter",
     "cross_os_suite_filter",
-    "telegram_waiver",
     "release_package_spec",
     "npm_telegram_package_spec",
     "package_acceptance_package_spec",
@@ -176,7 +197,12 @@ export function resolveQualificationCoverage(policy, inputs) {
   return { ...inventory, children };
 }
 
-export function validateQualificationJobs(jobs, requiredNames, label = "Qualification") {
+export function validateQualificationJobs(
+  jobs,
+  requiredNames,
+  label = "Qualification",
+  waivedJobNames = new Set(),
+) {
   if (!Array.isArray(jobs)) {
     throw new Error(label + " job inventory is missing");
   }
@@ -185,7 +211,8 @@ export function validateQualificationJobs(jobs, requiredNames, label = "Qualific
     if (
       matches.length !== 1 ||
       matches[0].status !== "completed" ||
-      matches[0].conclusion !== "success"
+      (matches[0].conclusion !== "success" &&
+        !(matches[0].conclusion === "failure" && waivedJobNames.has(name)))
     ) {
       throw new Error(label + " required job did not succeed exactly once: " + name);
     }
