@@ -716,6 +716,41 @@ const brokenTool: Tool = {
 };
 
 describe("OpenAI completions compatibility and tools", () => {
+  it("keeps compatible tools strict beside an incompatible union on both OpenAI transports", () => {
+    const context: Context = {
+      ...emptyContext(),
+      tools: [
+        {
+          name: "lookup",
+          description: "Lookup",
+          parameters: objectSchema(
+            { key: { type: "string" } },
+            { required: ["key"], additionalProperties: false },
+          ),
+        },
+        {
+          name: "union",
+          description: "Union",
+          parameters: objectSchema({ key: { oneOf: [{ type: "string" }, { type: "integer" }] } }),
+        },
+      ],
+    };
+    const completions = request(toolsNative, undefined, context).tools;
+    expect(completions?.map((entry) => [entry.function.name, entry.function.strict])).toEqual([
+      ["lookup", true],
+      ["union", false],
+    ]);
+    const responses = buildOpenAIResponsesParams(
+      { ...toolsNative, api: "openai-responses" },
+      context,
+      undefined,
+    ).tools;
+    expect(responses).toMatchObject([
+      { name: "lookup", strict: true },
+      { name: "union", strict: false },
+    ]);
+  });
+
   it.each(["direct", "managed"] as const)(
     "types Moonshot union branches in outgoing tools without changing other providers (%s)",
     (mode) => {

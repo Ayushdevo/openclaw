@@ -7,6 +7,7 @@ import { sortPromptCacheToolsByName } from "../utils/prompt-cache-stability.js";
 import { prepareOpenAIFunctionTool } from "./openai-function-tool.js";
 import { prepareOpenAITools } from "./openai-tool-projection.js";
 import {
+  isStrictOpenAIJsonSchemaCompatible,
   normalizeOpenAIStrictToolParameters,
   resolveOpenAIProjectedToolsStrictToolFlag,
 } from "./openai-tool-schema.js";
@@ -63,15 +64,17 @@ function convertPreparedResponsesTools(
       : resolveOpenAIProjectedToolsStrictToolFlag(projection, strictSetting);
     // Sort tools before request construction so prompt-cache bytes stay deterministic.
     return sortPromptCacheToolsByName(projection.tools).map((tool) => {
+      const toolStrict =
+        strictSetting === true ? isStrictOpenAIJsonSchemaCompatible(tool.parameters) : strict;
       const result = prepareOpenAIFunctionTool(
         tool.name,
         tool.description,
         normalizeOpenAIStrictToolParameters(
           tool.parameters,
-          strict === true,
+          toolStrict === true,
           model?.compat as Parameters<typeof normalizeOpenAIStrictToolParameters>[2],
         ),
-        strict,
+        toolStrict,
         mutableParameters,
       ).responses;
       // Compatible endpoints can require strict to be absent; the SDK declares it required.
